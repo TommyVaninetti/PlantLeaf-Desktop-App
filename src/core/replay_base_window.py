@@ -151,7 +151,12 @@ class ReplayBaseWindow(FileHandlerMixin, QMainWindow):
         analysis_menu.addActions([self.actionStart, self.actionStop, 
                                 #self.actionAddBookmark
                                 ])
-        
+        # SOLO AUDIO
+        if hasattr(self, 'plot_widget_fft'):
+            analysis_menu.addSeparator()
+            self.actionNormalizeFFT = QAction("Normalize FFT window", self)
+            analysis_menu.addAction(self.actionNormalizeFFT)
+
         self.actionMath = QAction("Select Region for Analysis", self)
         self.actionMath.setToolTip("Select a region in the plot to perform mathematical analysis")
         # Azione per aprire popup per aprire analisi salvate
@@ -244,6 +249,11 @@ class ReplayBaseWindow(FileHandlerMixin, QMainWindow):
         self.actionMath.triggered.connect(self.prepare_for_math_dialog)
         self.actionMathDialog.triggered.connect(self.open_math_dialog)
         self.actionOpenSavedAnalysis.triggered.connect(self.on_open_saved_analysis_triggered)
+
+        #SOLO AUDIO
+        if hasattr(self, 'plot_widget_fft'):
+            self.actionNormalizeFFT.triggered.connect(self.normalize_fft_window)
+
 
     ###### AZIONI MENUBAR ######
 

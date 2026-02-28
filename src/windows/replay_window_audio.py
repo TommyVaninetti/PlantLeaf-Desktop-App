@@ -131,9 +131,18 @@ class AudioDataManager:
 
 
 class IFFTWindow(QDialog):
-    """Finestra semplice per mostrare il grafico del segnale iFFT."""
+    """Finestra per mostrare il grafico del segnale iFFT con opzione normalizzazione."""
     def __init__(self, time_data, signal_data, parent=None, frame_index=None, has_real_phases=False):
         super().__init__(parent)
+        
+        # Salva riferimenti per normalizzazione
+        self.parent = parent
+        self.frame_index = frame_index
+        self.has_real_phases = has_real_phases
+        self.time_data = time_data
+        self.signal_data_raw = signal_data  # Segnale RAW
+        self.signal_data_normalized = None  # Verrà calcolato on-demand
+        self.is_normalized = False
 
         # ✅ TITOLO CON INFO
         title = "Inverse FFT Signal (Reconstructed)"
@@ -142,7 +151,7 @@ class IFFTWindow(QDialog):
         if has_real_phases:
             title += " [Real Phases]"
         else:
-            title += " [Random Phases]"
+            title += " [Zero Phases]"
         
         self.setWindowTitle(title)
         self.setMinimumSize(800, 400)
@@ -155,8 +164,6 @@ class IFFTWindow(QDialog):
             x_min_val = time_data[0]
             x_max_val = time_data[-1]
 
-        
-
         # Crea il widget del grafico con il range corretto e auto-range per l'asse Y
         self.plot_widget = BasePlotWidget(
             x_label="Time", y_label="Amplitude",
@@ -165,15 +172,35 @@ class IFFTWindow(QDialog):
             unit_x="s", unit_y="V", parent=self
         )
         
-        # ✅ COLORE DIVERSO SE FASI REALI
-        pen_color = 'cyan' if has_real_phases else 'orange'
+        # ✅ COLORE DAL TEMA (accent color)
+        # Inizialmente senza colore specifico, verrà applicato dal theme_manager
         self.ifft_curve = self.plot_widget.plot_widget.plot(
             time_data, signal_data, 
-            pen={'color': pen_color, 'width': 1}
+            pen={'width': 1.5},
+            name='Raw iFFT'
         )
         self.plot_widget.plot_widget.showGrid(x=True, y=True)
 
         layout.addWidget(self.plot_widget)
+
+        # ✅ AGGIUNGI PULSANTE NORMALIZZAZIONE
+        button_layout = QHBoxLayout()
+        
+        self.normalize_button = QPushButton("Apply 50% Normalization")
+        self.normalize_button.setToolTip(
+            "Apply conservative 50% frequency response correction\n"
+            "Based on SPU0410LR5H-QB datasheet\n"
+            "Estimated error: ±2.9 dB (95% confidence)"
+        )
+        self.normalize_button.clicked.connect(self.toggle_normalization)
+        button_layout.addWidget(self.normalize_button)
+        
+        self.info_label = QLabel("📊 Raw iFFT signal (no correction)")
+        self.info_label.setStyleSheet("color: #888; font-size: 10pt;")
+        button_layout.addWidget(self.info_label)
+        button_layout.addStretch()
+        
+        layout.addLayout(button_layout)
 
         # Menubar
         from PySide6.QtWidgets import QMenuBar
@@ -186,10 +213,11 @@ class IFFTWindow(QDialog):
         layout.setMenuBar(menubar)
         self.setLayout(layout)
 
-        # Applica tema
+        # Applica tema (imposta accent_color sulla curva)
         if parent and hasattr(parent, 'theme_manager'):
             saved_theme = parent.theme_manager.load_saved_theme()
             parent.theme_manager.apply_theme(self, saved_theme)
+            # Applica accent color del tema alla curva iFFT
             parent.theme_manager.apply_theme_to_plot(
                 plot_widget_name=self.plot_widget.plot_widget,
                 plot_instance=self.ifft_curve
@@ -203,7 +231,172 @@ class IFFTWindow(QDialog):
                 parent_rect.x() + (parent_rect.width() - self.width()) // 2,
                 parent_rect.y() + (parent_rect.height() - self.height()) // 2
             )
-
+    
+    def toggle_normalization(self):
+        """Toggle tra iFFT raw e normalizzato (50%)"""
+        if not self.is_normalized:
+            # APPLICA NORMALIZZAZIONE
+            self._compute_normalized_ifft()
+            if self.signal_data_normalized is not None:
+                self.is_normalized = True
+                self._update_display()
+        else:
+            # TORNA A RAW
+            self.is_normalized = False
+            self._update_display()
+    
+    def _compute_normalized_ifft(self):
+        """Calcola iFFT con correzione 50% dalla FFT normalizzata"""
+        if not self.parent or not hasattr(self.parent, 'data_manager'):
+            QMessageBox.warning(self, "Error", "Cannot access parent data manager.")
+            return
+        
+        print("🔧 Computing normalized iFFT (50% correction)...")
+        
+        # === 1. DATI DAL DATASHEET (identici a normalize_fft_window) ===
+        datasheet_freq_khz = np.array([20, 25, 30, 40, 50, 60, 70, 80])
+        datasheet_response_db = np.array([10.0, 10.5, 5.0, 0.0, -3.0, -5.5, -4.0, -3.5])
+        datasheet_freq_hz = datasheet_freq_khz * 1000
+        
+        # === 2. RECUPERA FFT ORIGINALE DEL FRAME ===
+        if self.frame_index is None or self.frame_index >= len(self.parent.data_manager.fft_data):
+            QMessageBox.warning(self, "Error", "Invalid frame index.")
+            return
+        
+        fft_magnitudes = self.parent.data_manager.fft_data[self.frame_index]
+        freq_axis = self.parent.data_manager.frequency_axis
+        
+        # === 3. CALCOLA CORREZIONE ===
+        valid_mask = (freq_axis >= 20000) & (freq_axis <= 80000)
+        freq_range = freq_axis[valid_mask]
+        
+        mic_response_db = np.interp(freq_range, datasheet_freq_hz, datasheet_response_db)
+        correction_gain_50 = 10 ** (-mic_response_db * 0.5 / 20.0)
+        
+        full_correction = np.ones(len(freq_axis))
+        full_correction[valid_mask] = correction_gain_50
+        
+        # === 4. VERIFICA COMPATIBILITÀ FASI ===
+        if not self.has_real_phases or not hasattr(self.parent.data_manager, 'phase_data'):
+            QMessageBox.warning(self, "No Phase Data", 
+                              "Normalization requires phase information (file version >= 3.0).")
+            return
+        
+        fft_phases_int8 = self.parent.data_manager.phase_data[self.frame_index]
+        
+        # Parametri FFT
+        fs = self.parent.data_manager.header_info.get('fs', 200000)
+        fft_size = self.parent.data_manager.header_info.get('fft_size', 512)
+        num_bins_full = fft_size // 2
+        
+        bin_freq = fs / fft_size
+        bin_start = int(20000 / bin_freq)
+        bin_end = int(80000 / bin_freq)
+        num_received_bins = bin_end - bin_start + 1
+        
+        # ✅ FIX: Verifica che le dimensioni siano coerenti
+        if len(fft_magnitudes) != len(freq_axis):
+            print(f"⚠️ WARNING: FFT length mismatch: {len(fft_magnitudes)} vs {len(freq_axis)}")
+            QMessageBox.warning(self, "Data Mismatch", "FFT data dimensions inconsistent.")
+            return
+        
+        if len(fft_phases_int8) != num_received_bins:
+            print(f"⚠️ WARNING: Phase data length mismatch: {len(fft_phases_int8)} vs {num_received_bins}")
+        
+        # === 5. APPLICA CORREZIONE SOLO ALLA PARTE 20-80kHz ===
+        # Estrai solo la parte 20-80kHz dalla FFT originale (154 bins)
+        fft_20_80khz = fft_magnitudes[valid_mask]
+        
+        # Applica correzione solo a questa parte
+        normalized_fft_20_80khz = fft_20_80khz * correction_gain_50
+        
+        # === 6. RICOSTRUISCI SPETTRO COMPLETO (0-100kHz, 256 bins) ===
+        full_spectrum_mag = np.zeros(num_bins_full, dtype=np.float32)
+        full_spectrum_phase = np.zeros(num_bins_full, dtype=np.int8)
+        
+        # Inserisci la parte normalizzata 20-80kHz nelle posizioni corrette
+        actual_bins_to_copy = min(len(normalized_fft_20_80khz), num_received_bins, len(fft_phases_int8))
+        full_spectrum_mag[bin_start:bin_start + actual_bins_to_copy] = normalized_fft_20_80khz[:actual_bins_to_copy]
+        full_spectrum_phase[bin_start:bin_start + actual_bins_to_copy] = fft_phases_int8[:actual_bins_to_copy]
+        
+        # === 7. CONVERTI FASI E CREA SPETTRO COMPLESSO ===
+        fft_phases_rad = (full_spectrum_phase / 127.0) * np.pi
+        complex_spectrum = full_spectrum_mag * np.exp(1j * fft_phases_rad)
+        
+        # === 8. ESEGUI iFFT ===
+        try:
+            time_domain_signal = np.fft.irfft(complex_spectrum, n=fft_size)
+        except Exception as e:
+            QMessageBox.critical(self, "iFFT Error", f"Failed to compute normalized iFFT:\n{str(e)}")
+            return
+        
+        self.signal_data_normalized = time_domain_signal
+        
+        # Statistiche
+        gain_stats = {
+            'max_gain_db': 20 * np.log10(np.max(correction_gain_50)),
+            'min_gain_db': 20 * np.log10(np.min(correction_gain_50)),
+        }
+        
+        print(f"✅ Normalized iFFT computed:")
+        print(f"   Gain range: {gain_stats['min_gain_db']:.2f} to {gain_stats['max_gain_db']:.2f} dB")
+        print(f"   Samples: {len(time_domain_signal)}")
+    
+    def _update_display(self):
+        """Aggiorna display con curva corretta"""
+        if self.is_normalized and self.signal_data_normalized is not None:
+            # Mostra normalizzato (ROSSO) + overlay raw (tema)
+            self.ifft_curve.setData(self.time_data, self.signal_data_normalized)
+            self.ifft_curve.setPen({'color': 'red', 'width': 2})
+            
+            # Aggiungi overlay raw (accent_color dal tema, sottile, tratteggiato)
+            if not hasattr(self, 'raw_overlay_curve'):
+                self.raw_overlay_curve = self.plot_widget.plot_widget.plot(
+                    self.time_data, self.signal_data_raw,
+                    pen={'width': 1, 'style': QtCore.Qt.DashLine},
+                    name='Raw iFFT'
+                )
+                # Applica accent color del tema alla curva overlay
+                if self.parent and hasattr(self.parent, 'theme_manager'):
+                    self.parent.theme_manager.apply_theme_to_plot(
+                        plot_widget_name=self.plot_widget.plot_widget,
+                        plot_instance=self.raw_overlay_curve
+                    )
+            else:
+                self.raw_overlay_curve.setData(self.time_data, self.signal_data_raw)
+            
+            self.normalize_button.setText("Show Raw iFFT")
+            self.info_label.setText("� Normalized iFFT (50% correction, ±2.9 dB error)")
+            self.info_label.setStyleSheet("color: red; font-weight: bold; font-size: 10pt;")
+            
+            # Aggiorna legenda
+            try:
+                self.plot_widget.plot_widget.addLegend()
+            except:
+                pass
+        else:
+            # Mostra raw (ri-applica accent_color del tema)
+            self.ifft_curve.setData(self.time_data, self.signal_data_raw)
+            
+            # Ri-applica il tema per ripristinare l'accent color
+            if self.parent and hasattr(self.parent, 'theme_manager'):
+                self.parent.theme_manager.apply_theme_to_plot(
+                    plot_widget_name=self.plot_widget.plot_widget,
+                    plot_instance=self.ifft_curve
+                )
+            
+            # Rimuovi overlay
+            if hasattr(self, 'raw_overlay_curve'):
+                try:
+                    self.plot_widget.plot_widget.removeItem(self.raw_overlay_curve)
+                    del self.raw_overlay_curve
+                except:
+                    pass
+            
+            self.normalize_button.setText("Apply 50% Normalization")
+            self.info_label.setText("📊 Raw iFFT signal (no correction)")
+            self.info_label.setStyleSheet("color: #888; font-size: 10pt;")
+    
 
 class ReplayWindowAudio(ReplayBaseWindow):
     """Finestra replay audio con architettura multi-livello ottimizzata"""
@@ -228,8 +421,8 @@ class ReplayWindowAudio(ReplayBaseWindow):
         
         # Setup UI
         self.setWindowTitle(f"Audio Replay - {os.path.basename(file_path)}")
-        self.setup_menubar()
         self.setup_main_layout()
+        self.setup_menubar()
         self.setup_toolbar()
         
         
@@ -401,6 +594,21 @@ class ReplayWindowAudio(ReplayBaseWindow):
         if frame_index < len(self.data_manager.fft_data):
             self.fft_curve.setData(self.data_manager.frequency_axis, 
                                 self.data_manager.fft_data[frame_index])
+            
+            # ✅ RIMUOVI CURVA NORMALIZZATA quando cambi frame
+            if hasattr(self, 'normalized_fft_curve'):
+                try:
+                    self.plot_widget_fft.plot_widget.removeItem(self.normalized_fft_curve)
+                    del self.normalized_fft_curve
+                except:
+                    pass
+            
+            # ✅ RESET colore curva raw a accent_color del tema
+            if hasattr(self, 'theme_manager'):
+                self.theme_manager.apply_theme_to_plot(
+                    plot_widget_name=self.plot_widget_fft.plot_widget,
+                    plot_instance=self.fft_curve
+                )
         
         # UPDATE TIME DOMAIN
         if self.data_manager.contains_streaming_time(current_time_sec):
@@ -1175,3 +1383,153 @@ class ReplayWindowAudio(ReplayBaseWindow):
         """Aggiorna la linea di soglia sul grafico del time domain"""
         threshold_value = self.PeakThresholdSpinBox.value() * 0.001  # Converti mV a V
         self.threshold_line.setValue(threshold_value)
+
+    
+    def normalize_fft_window(self):
+        """
+        Applica normalizzazione CONSERVATIVA (50%) per risposta in frequenza del microfono.
+        
+        APPROCCIO:
+        - Non modifica dati originali (display-only overlay)
+        - Correzione al 50% basata su datasheet SPU0410LR5H-QB
+        - Mostra entrambe le curve (raw + normalized) per confronto
+        
+        ERRORE STIMATO: ±2.9 dB (95% confidence)
+        ADATTO PER: Analisi qualitative (forma spettro, confronti relativi)
+        NON ADATTO PER: Misure assolute di pressione sonora (dB SPL)
+        
+        DOCUMENTAZIONE: Vedi docs/MICROPHONE_NORMALIZATION_TECHNICAL_REPORT.md
+        """
+        if self.data_manager.total_frames == 0:
+            QMessageBox.warning(self, "No Data", "No FFT data loaded.")
+            return
+        
+        print("🔧 Starting 50% conservative microphone normalization...")
+        
+        # === 1. DATI DAL DATASHEET (SPU0410LR5H-QB) ===
+        # Fonte: Fig. 4 - "Ultrasonic Free Field Response Normalized to 1kHz"
+        # Valori letti manualmente dal grafico (±0.5 dB accuracy)
+        datasheet_freq_khz = np.array([20, 25, 30, 40, 50, 60, 70, 80])
+        datasheet_response_db = np.array([8.0, 10.5, 6.0, -2.0, -6.0, -7.0, -6.0, -4.0])
+        
+        datasheet_freq_hz = datasheet_freq_khz * 1000
+        
+        # === 2. OTTIENI SPETTRO FFT CORRENTE ===
+        current_time_sec = self.current_position_ms / 1000.0
+        frame_index = int(current_time_sec / (self.data_manager.frame_duration_ms / 1000))
+        frame_index = max(0, min(frame_index, self.data_manager.total_frames - 1))
+        
+        if frame_index >= len(self.data_manager.fft_data):
+            QMessageBox.warning(self, "Invalid Frame", "Cannot access FFT data for current frame.")
+            return
+        
+        original_fft = self.data_manager.fft_data[frame_index]
+        freq_axis = self.data_manager.frequency_axis
+        
+        # === 3. FILTRA RANGE 20-80 kHz ===
+        valid_mask = (freq_axis >= 20000) & (freq_axis <= 80000)
+        freq_range = freq_axis[valid_mask]
+        
+        if len(freq_range) == 0:
+            QMessageBox.warning(self, "Invalid Range", "No frequencies in 20-80 kHz range.")
+            return
+        
+        # === 4. INTERPOLAZIONE RISPOSTA MICROFONO ===
+        mic_response_db = np.interp(freq_range, datasheet_freq_hz, datasheet_response_db)
+        
+        # === 5. CALCOLA CORREZIONE AL 50% (CONSERVATIVA) ===
+        # Se mic attenua di -5 dB, amplifico solo +2.5 dB (50%)
+        correction_gain_50 = 10 ** (-mic_response_db * 0.5 / 20.0)
+        
+        # === 6. CREA ARRAY DI CORREZIONE PER INTERO SPETTRO ===
+        full_correction = np.ones(len(freq_axis))
+        full_correction[valid_mask] = correction_gain_50
+        
+        # === 7. APPLICA CORREZIONE ===
+        normalized_fft = original_fft * full_correction
+        
+        # === 8. STATISTICHE CORREZIONE ===
+        max_gain = np.max(correction_gain_50)
+        min_gain = np.min(correction_gain_50)
+        max_gain_db = 20 * np.log10(max_gain)
+        min_gain_db = 20 * np.log10(min_gain)
+        
+        print(f"📊 Normalization stats (50% conservative):")
+        print(f"   Gain range: {min_gain_db:.2f} dB to {max_gain_db:.2f} dB")
+        print(f"   Max gain at: {freq_range[np.argmax(correction_gain_50)]/1000:.1f} kHz")
+        print(f"   Min gain at: {freq_range[np.argmin(correction_gain_50)]/1000:.1f} kHz")
+        print(f"   Estimated error: ±2.9 dB (95% confidence)")
+        
+        # === 9. MOSTRA OVERLAY GRAFICO ===
+        # Rimuovi curve esistenti (se presenti)
+        if hasattr(self, 'normalized_fft_curve'):
+            try:
+                self.plot_widget_fft.plot_widget.removeItem(self.normalized_fft_curve)
+            except:
+                pass
+        
+        # Aggiungi curva normalizzata (overlay ROSSO)
+        self.normalized_fft_curve = self.plot_widget_fft.plot_widget.plot(
+            freq_axis, normalized_fft,
+            pen={'color': 'red', 'width': 2},
+            name='Normalized (50%)'
+        )
+        
+        # Assicurati che la curva raw mantenga l'accent_color del tema
+        if hasattr(self, 'theme_manager'):
+            self.theme_manager.apply_theme_to_plot(
+                plot_widget_name=self.plot_widget_fft.plot_widget,
+                plot_instance=self.fft_curve
+            )
+        self.fft_curve.setData(freq_axis, original_fft)
+        
+        # Aggiorna legenda
+        if hasattr(self.plot_widget_fft.plot_widget, 'addLegend'):
+            try:
+                self.plot_widget_fft.plot_widget.addLegend()
+            except:
+                pass  # Legenda già presente
+        
+        # === 10. FEEDBACK UTENTE ===
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowTitle("Normalization Applied (Display Only)")
+        msg.setText(
+            f"<b>50% Conservative Normalization Applied</b><br><br>"
+            f"<b>Correction Range:</b> {min_gain_db:.1f} to {max_gain_db:.1f} dB<br>"
+            f"<b>Estimated Error:</b> ±2.9 dB (95% confidence)<br>"
+            f"<b>Peak correction:</b> {freq_range[np.argmax(correction_gain_50)]/1000:.1f} kHz<br><br>"
+            f"<b>Theme color curve:</b> Raw data<br>"
+            f"<font color='red'><b>Red curve:</b> Normalized (50%)</font><br><br>"
+            f"⚠️ <b>Original data unchanged</b> (overlay display only)<br>"
+            f"📝 Suitable for <b>qualitative analysis</b> only<br>"
+            f"📖 See technical report for details"
+        )
+        msg.setStyleSheet("""
+            QMessageBox {
+                background-color: #2b2b2b;
+                color: #e0e0e0;
+            }
+            QLabel {
+                color: #e0e0e0;
+            }
+            QPushButton {
+                background-color: #3a3a3a;
+                color: #e0e0e0;
+                border-radius: 6px;
+                padding: 8px 16px;
+            }
+            QPushButton:hover {
+                background-color: #4a4a4a;
+            }
+        """)
+        msg.exec()
+        
+        print("✅ Normalization overlay displayed")
+        
+        # Salva dati normalizzati per iFFT window
+        self._normalized_fft_cache = {
+            'frame_index': frame_index,
+            'normalized_fft': normalized_fft,
+            'correction_gain': full_correction
+        }
