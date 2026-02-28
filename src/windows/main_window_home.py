@@ -168,7 +168,7 @@ class MainWindowHome(BaseWindow):
         
         # Logo - LOGO PIÙ GRANDE
         logo_label = QLabel()
-        AppConfig.load_application_logo(logo_label, target_width=240)
+        AppConfig.load_application_logo(logo_label, target_width=215)
         logo_label.setContentsMargins(0, 10, 0, 5)
         header_layout.addWidget(logo_label)
 

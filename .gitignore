@@ -2,3 +2,6 @@
 old/
 build/
 dist/
+# Python bytecode
+__pycache__/
+*.pyc
