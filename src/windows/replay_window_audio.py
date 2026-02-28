@@ -92,6 +92,9 @@ class AudioDataManager:
         memory_mb = (self.fft_means.nbytes + self.fft_timestamps.nbytes) / 1024 / 1024
         print(f"✅ Medie precalcolate: {len(means)} punti, {memory_mb:.1f} MB")
 
+        # calcola la media globale e la deviazione standard per impostare threshold automatico
+        self.fft_mean = np.mean(self.fft_means) if len(self.fft_means) > 0 else 0
+        self.fft_std = np.std(self.fft_means) if len(self.fft_means) > 0 else 0
 
     def get_memory_usage_mb(self):
         """Calcola uso memoria corrente in MB"""
@@ -253,9 +256,9 @@ class IFFTWindow(QDialog):
         
         print("🔧 Computing normalized iFFT (50% correction)...")
         
-        # === 1. DATI DAL DATASHEET (identici a normalize_fft_window) ===
+        # === 1. DATI DAL DATASHEET (IDENTICI a normalize_fft_window) ===
         datasheet_freq_khz = np.array([20, 25, 30, 40, 50, 60, 70, 80])
-        datasheet_response_db = np.array([10.0, 10.5, 5.0, 0.0, -3.0, -5.5, -4.0, -3.5])
+        datasheet_response_db = np.array([8.0, 10.5, 6.0, -2.0, -6.0, -7.0, -6.0, -4.0])
         datasheet_freq_hz = datasheet_freq_khz * 1000
         
         # === 2. RECUPERA FFT ORIGINALE DEL FRAME ===
@@ -443,7 +446,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
 
         # mostra a tutto schermo mantenendo le grafiche
         self.showMaximized()
-    
+
     # === PLAYBACK CONTROL METHODS ===
     
     def start_playback(self):
@@ -819,6 +822,18 @@ class ReplayWindowAudio(ReplayBaseWindow):
             self.time_position_line.setPos(0)
 
         self._update_time_labels()
+    
+        # ✅ AGGIUNGI QUI: Imposta threshold automatico DOPO che i dati sono stati caricati
+        if hasattr(self.data_manager, 'fft_mean') and hasattr(self.data_manager, 'fft_std'):
+            self.automatic_click_threshold = self.data_manager.fft_mean + 3 * self.data_manager.fft_std
+            # Converti V in mV per lo spinbox
+            self.PeakThresholdSpinBox.setValue(self.automatic_click_threshold * 1000.0)
+            # Applica il filtro automaticamente
+            self._apply_threshold_filter()
+            print(f"✅ Auto-threshold impostato a: {self.automatic_click_threshold*1000:.3f} mV")
+        else:
+            print("⚠️ WARNING: fft_mean/fft_std non disponibili, usando threshold di default")
+            self.PeakThresholdSpinBox.setValue(10.0)  # Default 10 mV
     
     
     def _populate_click_table(self):
