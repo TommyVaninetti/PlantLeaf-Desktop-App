@@ -138,10 +138,14 @@ class ReplayBaseWindow(FileHandlerMixin, QMainWindow):
         self.actionNewFile.setShortcut("Ctrl+N")
         self.actionOpenFile = QAction("Open...", self)
         self.actionOpenFile.setShortcut("Ctrl+O")
-        #self.actionSave = QAction("Save As...", self)
-        file_menu.addActions([self.actionNewFile, self.actionOpenFile,
-                              #self.actionSave
-                              ])
+        
+        # ✅ NUOVO: Export Trimmed Region
+        self.actionExportTrimmed = QAction("Export Trimmed Region...", self)
+        self.actionExportTrimmed.setShortcut("Ctrl+T")
+        
+        file_menu.addActions([self.actionNewFile, self.actionOpenFile])
+        file_menu.addSeparator()
+        file_menu.addAction(self.actionExportTrimmed)
 
         # === ANALYSIS ===
         analysis_menu = menubar.addMenu("Analysis")
@@ -224,6 +228,7 @@ class ReplayBaseWindow(FileHandlerMixin, QMainWindow):
         self.actionHome.triggered.connect(self.go_to_home)
         self.actionNewFile.triggered.connect(self.new_file_action)
         self.actionOpenFile.triggered.connect(self.open_file_action)
+        self.actionExportTrimmed.triggered.connect(self.open_trim_dialog)  # ✅ NUOVO
         #self.actionSave.triggered.connect(self.save_file_action)
         self.actionStart.triggered.connect(self.toggle_state_playing)
         self.actionStop.triggered.connect(self.clear_history)
@@ -1102,6 +1107,60 @@ class ReplayBaseWindow(FileHandlerMixin, QMainWindow):
         
         # ✅ Trigger display update (implementato nelle sottoclassi)
         self.update_display()
+    
+    def open_trim_dialog(self):
+        """Apre il dialog per l'export di una regione trimmed"""
+        from windows.trim_region_dialog import TrimRegionDialog
+        
+        # Determina il tipo di file
+        if hasattr(self, 'voltage_plot'):
+            file_type = 'voltage'
+        elif hasattr(self, 'plot_widget_fft'):
+            file_type = 'audio'
+        else:
+            QMessageBox.warning(self, "Error", "Cannot determine file type")
+            return
+        
+        # Ottieni durata totale
+        if hasattr(self, 'data_manager') and hasattr(self.data_manager, 'total_duration_sec'):
+            total_duration = self.data_manager.total_duration_sec
+        elif hasattr(self, 'total_duration_ms'):
+            total_duration = self.total_duration_ms / 1000.0
+        else:
+            QMessageBox.warning(self, "Error", "Cannot determine file duration")
+            return
+        
+        # Verifica che ci sia un file caricato
+        if not hasattr(self, 'file_path') or not self.file_path:
+            QMessageBox.warning(self, "No File", "Please open a file first")
+            return
+        
+        # Apri il dialog
+        dialog = TrimRegionDialog(
+            parent=self,
+            file_path=self.file_path,
+            file_type=file_type,
+            total_duration_sec=total_duration
+        )
+        
+        if dialog.exec():
+            # Utente ha confermato → avvia export
+            export_params = dialog.get_export_parameters()
+            print(f"✅ Export parameters: {export_params}")
+            self._execute_trim_export(export_params)
+    
+    def _execute_trim_export(self, params):
+        """
+        Esegue l'export della regione trimmed.
+        Chiamato dalle sottoclassi (voltage/audio specific).
+        """
+        # Implementazione di default (override nelle sottoclassi)
+        QMessageBox.information(
+            self,
+            "Export",
+            f"Export not yet implemented for this file type.\n"
+            f"Parameters: {params}"
+        )
 
 
 

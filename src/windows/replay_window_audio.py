@@ -823,13 +823,15 @@ class ReplayWindowAudio(ReplayBaseWindow):
 
         self._update_time_labels()
     
-        # ✅ AGGIUNGI QUI: Imposta threshold automatico DOPO che i dati sono stati caricati
+        # Imposta threshold automatico DOPO che i dati sono stati caricati
         if hasattr(self.data_manager, 'fft_mean') and hasattr(self.data_manager, 'fft_std'):
-            self.automatic_click_threshold = self.data_manager.fft_mean + 3 * self.data_manager.fft_std
+            self.automatic_click_threshold = self.data_manager.fft_mean + 4 * self.data_manager.fft_std
             # Converti V in mV per lo spinbox
             self.PeakThresholdSpinBox.setValue(self.automatic_click_threshold * 1000.0)
             # Applica il filtro automaticamente
             self._apply_threshold_filter()
+            # Aggiorna lo step della spinbox per cambiare di deviazioni standard (convertito in mV)
+            self.PeakThresholdSpinBox.setSingleStep(self.data_manager.fft_std * 1000.0)
             print(f"✅ Auto-threshold impostato a: {self.automatic_click_threshold*1000:.3f} mV")
         else:
             print("⚠️ WARNING: fft_mean/fft_std non disponibili, usando threshold di default")
@@ -1057,7 +1059,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
         self.PeakThresholdSpinBox.setObjectName(u"PeakThresholdSpinBox")
         self.PeakThresholdSpinBox.setDecimals(3)
         self.PeakThresholdSpinBox.setRange(0, 3300) # Valori in mV = 0-3.3V
-        self.PeakThresholdSpinBox.setSingleStep(0.001)
+        self.PeakThresholdSpinBox.setSingleStep(0.001) #dopo viene sovrascritto con valore della deviazione standard
         self.PeakThresholdSpinBox.setValue(10) # Valore di default
         self.PeakThresholdSpinBox.setSuffix(" mV")
         self.PeakThresholdSpinBox.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
