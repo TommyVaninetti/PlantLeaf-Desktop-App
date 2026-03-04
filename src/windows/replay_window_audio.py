@@ -23,6 +23,7 @@ from PySide6 import QtCore
 
 from core.replay_base_window import ReplayBaseWindow
 from plotting.plot_manager import BasePlotWidget
+from core.audio_trim_export import AudioTrimExporter
 
 
 
@@ -1550,3 +1551,21 @@ class ReplayWindowAudio(ReplayBaseWindow):
             'normalized_fft': normalized_fft,
             'correction_gain': full_correction
         }
+    
+    def _execute_trim_export(self, params):
+        """
+        Esegue l'export trimmed del file audio.
+        Chiamato da ReplayBaseWindow.open_trim_dialog()
+        
+        Args:
+            params: dict con parametri da TrimRegionDialog
+        """
+        # Crea exporter con metadata del file
+        exporter = AudioTrimExporter(
+            parent=self,
+            file_path=self.file_path,
+            metadata=self.data_manager.header_info
+        )
+        
+        # Esegui export
+        return exporter.execute_trim_export(params)

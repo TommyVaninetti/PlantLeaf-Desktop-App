@@ -189,6 +189,13 @@ class TrimRegionDialog(QDialog):
         self.output_mode_group.addButton(self.overwrite_radio, 1)
         layout.addWidget(self.overwrite_radio)
         
+        # ✅ DISABILITA OVERWRITE PER AUDIO (file troppo grandi)
+        if self.file_type == 'audio':
+            self.overwrite_radio.setEnabled(False)
+            self.overwrite_radio.setToolTip(
+                "Overwrite mode disabled for audio files (file sizes too large for safe backup)"
+            )
+        
         # Connetti radio buttons
         self.new_file_radio.toggled.connect(self._on_output_mode_changed)
         
@@ -505,16 +512,19 @@ class TrimRegionDialog(QDialog):
         total_clicks = len(click_events)
         
         # Filtra click COMPLETAMENTE nel range
-        clicks_in_range = [
-            c for c in click_events
-            if start <= c['time'] <= end and start <= (c['time'] + c['duration']) <= end
-        ]
+        # Click event format: {'time': timestamp_sec, 'frequency': Hz, 'amplitude': V, 'duration_us': microsec}
+        clicks_in_range = []
+        for c in click_events:
+            click_time = c.get('time', c.get('timestamp', 0))  # Supporta entrambi i nomi
+            # Per ora consideriamo solo il tempo del click, non la durata
+            if start <= click_time <= end:
+                clicks_in_range.append(c)
         
         count = len(clicks_in_range)
         self.click_count_label.setText(f"📊 {count} of {total_clicks} clicks in range")
     
     def _count_analyses_in_range(self, start, end):
-        """Conta le analisi COMPLETAMENTE nel range"""
+        """Conta le analisi COMPLETAMENTE nel range e verifica pre-data"""
         # Leggi analisi dal file
         analyses = self.parent_window._read_analyses_from_file() if hasattr(self.parent_window, '_read_analyses_from_file') else {}
         total_analyses = len(analyses)
@@ -524,14 +534,34 @@ class TrimRegionDialog(QDialog):
             return
         
         # Filtra analisi COMPLETAMENTE nel range
-        analyses_in_range = [
-            a for a_id, a in analyses.items()
-            if (start <= a['parameters']['general']['start_time'] and
-                a['parameters']['general']['end_time'] <= end)
-        ]
+        analyses_in_range = []
+        analyses_with_issues = []
+        
+        for a_id, a in analyses.items():
+            a_start = a['parameters']['general']['start_time']
+            a_end = a['parameters']['general']['end_time']
+            
+            if start <= a_start and a_end <= end:
+                analyses_in_range.append(a)
+                
+                # ⚠️ Verifica se l'analisi avrà abbastanza pre-data nel file trimmed
+                new_start_in_trimmed = a_start - start
+                if new_start_in_trimmed < 1.0:
+                    analyses_with_issues.append({
+                        'name': a.get('metadata', {}).get('name', 'Unnamed'),
+                        'start': new_start_in_trimmed
+                    })
         
         count = len(analyses_in_range)
-        self.analyses_count_label.setText(f"📊 {count} of {total_analyses} analyses in range")
+        
+        # Costruisci messaggio con warning se necessario
+        msg = f"📊 {count} of {total_analyses} analyses in range"
+        
+        if analyses_with_issues:
+            msg += f"\n⚠️  {len(analyses_with_issues)} may not open correctly"
+            msg += f"\n   (start < 1.0s in trimmed file)"
+        
+        self.analyses_count_label.setText(msg)
     
     def _validate_export(self):
         """Validazione finale prima dell'export"""

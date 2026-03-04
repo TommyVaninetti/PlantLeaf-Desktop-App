@@ -11,6 +11,7 @@ from PySide6.QtCore import QTimer
 
 from plotting.plot_manager import BasePlotWidget
 from core.replay_base_window import ReplayBaseWindow
+from core.voltage_trim_export import VoltageTrimExporter
 
 class ReplayVoltageWindow(ReplayBaseWindow):
     def __init__(self, file_path):
@@ -454,4 +455,11 @@ class ReplayVoltageWindow(ReplayBaseWindow):
         graph_layout.addWidget(self.voltage_plot)
         layout.addLayout(graph_layout)
 
+    def _execute_trim_export(self, params):
+        """
+        Override del metodo base per eseguire l'export trimmed di file voltage.
+        Utilizza VoltageTrimExporter per la logica di export.
+        """
+        exporter = VoltageTrimExporter(self)
+        return exporter.execute_trim_export(params)
 

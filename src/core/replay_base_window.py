@@ -860,12 +860,20 @@ class ReplayBaseWindow(FileHandlerMixin, QMainWindow):
             print(f"Opening math dialog for region: {start:.3f}s to {end:.3f}s")
             x_data = np.concatenate([c[0] for c in self._data_chunks if c is not None])
             y_data = np.concatenate([c[1] for c in self._data_chunks if c is not None])
-            mask = (x_data >= start - 1) & (x_data <= end) # passa la regione selezionata con 1s PRIMA per fare la media
+            
+            # ✅ FIX: Calcola start_with_pre in modo sicuro (massimo 1s prima, minimo inizio file)
+            time_before = min(1.0, start)  # Non andare mai sotto 0
+            start_with_pre = max(0, start - time_before)
+            
+            mask = (x_data >= start_with_pre) & (x_data <= end)
             x_region = x_data[mask] 
             y_region = y_data[mask]
             if len(x_region) == 0 or len(y_region) == 0:
                 self.show_error_dialog("No Data", "No data found in the selected region.")
                 return
+            
+            print(f"   Data range: {start_with_pre:.3f}s to {end:.3f}s ({time_before:.3f}s before selection)")
+            
             self.math_dialog = MathOperations(
                 x_region, 
                 y_region, 
@@ -996,14 +1004,19 @@ class ReplayBaseWindow(FileHandlerMixin, QMainWindow):
         x_data = np.concatenate([c[0] for c in self._data_chunks if c is not None])
         y_data = np.concatenate([c[1] for c in self._data_chunks if c is not None])
         
-        # Usa un buffer più ampio per assicurare che la baseline sia calcolabile
-        mask = (x_data >= start - 1) & (x_data <= end)
+        # ✅ FIX: Usa un buffer più ampio per la baseline, ma gestisci start < 1s
+        time_before = min(1.0, start)
+        start_with_pre = max(0, start - time_before)
+        
+        mask = (x_data >= start_with_pre) & (x_data <= end)
         x_region = x_data[mask]
         y_region = y_data[mask]
 
         if len(x_region) == 0:
             self.show_error_dialog("Data Error", "Could not find the signal data for the selected analysis region.")
             return
+        
+        print(f"   Loading saved analysis: {start_with_pre:.3f}s to {end:.3f}s ({time_before:.3f}s before)")
 
         self.math_dialog = MathOperations(
             x_region, 
@@ -1110,7 +1123,7 @@ class ReplayBaseWindow(FileHandlerMixin, QMainWindow):
     
     def open_trim_dialog(self):
         """Apre il dialog per l'export di una regione trimmed"""
-        from windows.trim_region_dialog import TrimRegionDialog
+        from components.trim_region_dialog import TrimRegionDialog
         
         # Determina il tipo di file
         if hasattr(self, 'voltage_plot'):
@@ -1661,22 +1674,57 @@ class MathOperations(QDialog, Ui_QDialogMath):
 
     #0. prendi gli array di cui hai bisogno
     def get_arrays(self):
-        # Calcola quanti punti equivalgono a 1 secondo
+        # ✅ FIX: Calcola dinamicamente quanti campioni "pre" abbiamo
+        # Invece di assumere sempre 1 secondo, usa quello che effettivamente c'è
+        
+        first_time = self.total_time_data[0]
+        # Trova l'indice dove iniziano i "veri" dati selezionati
+        # (tutto prima è considerato "pre" per la baseline)
+        
+        # Calcola quanti punti equivalgono a 1 secondo (per riferimento)
         n_samples_per_second = int(self.sampling_rate)
-
-        #se non ci sono abbastanza dati per fare 1s + 50 campioni prima allora esci
-        if len(self.total_time_data) < n_samples_per_second + 50:
-            self.show_error_dialog("Data Error", "Not enough data for analysis. Please select a larger region.")
+        
+        # Trova il primo punto che è >= al tempo di inizio della selezione vera
+        # Assumiamo che i primi ~1s (o meno) siano "pre"
+        # Cerca il punto dove il tempo fa un "salto" maggiore (transizione pre->main)
+        
+        # Strategia semplice: prendi gli ultimi 50 campioni prima del punto di 1s (se esiste)
+        # altrimenti prendi i primi 50 campioni disponibili come "pre"
+        
+        if len(self.total_time_data) < 50:
+            self.show_error_dialog("Data Error", "Not enough data for analysis (minimum 50 samples required).")
             self.close()
             return
-
-        # Gli array passati includono i dati selezionati + 1s prima.
-        # Quindi estrai le due parti:
-        self.time_data_pre = self.total_time_data[n_samples_per_second-50:n_samples_per_second]         # 50 campioni prima
-        self.signal_data_pre = self.total_signal_data[n_samples_per_second-50:n_samples_per_second]
-
-        self.time_data = self.total_time_data[n_samples_per_second:]             # dati selezionati
-        self.signal_data = self.total_signal_data[n_samples_per_second:]
+        
+        # Trova dove iniziano i dati "principali" (dopo ~1s dall'inizio dati)
+        # Se abbiamo meno di n_samples_per_second campioni, usa tutti come "main"
+        if len(self.total_time_data) >= n_samples_per_second + 50:
+            # Caso normale: abbastanza dati per 1s pre + 50 campioni baseline
+            split_idx = n_samples_per_second
+            self.time_data_pre = self.total_time_data[split_idx-50:split_idx]
+            self.signal_data_pre = self.total_signal_data[split_idx-50:split_idx]
+            self.time_data = self.total_time_data[split_idx:]
+            self.signal_data = self.total_signal_data[split_idx:]
+        else:
+            # Caso bordo: pochi dati (es. regione 0-0.5s)
+            # Usa i primi 50 campioni come "pre", il resto come "main"
+            if len(self.total_time_data) > 50:
+                self.time_data_pre = self.total_time_data[:50]
+                self.signal_data_pre = self.total_signal_data[:50]
+                self.time_data = self.total_time_data[50:]
+                self.signal_data = self.total_signal_data[50:]
+            else:
+                # Caso estremo: meno di 50 campioni totali
+                # Usa i primi 10 come "pre" (se possibile), il resto come "main"
+                pre_samples = min(10, len(self.total_time_data) // 3)
+                self.time_data_pre = self.total_time_data[:pre_samples]
+                self.signal_data_pre = self.total_signal_data[:pre_samples]
+                self.time_data = self.total_time_data[pre_samples:]
+                self.signal_data = self.total_signal_data[pre_samples:]
+        
+        print(f"   Array split: {len(self.time_data_pre)} pre-samples, {len(self.time_data)} main samples")
+        print(f"   Time range: pre={self.time_data_pre[0]:.3f}-{self.time_data_pre[-1]:.3f}s, "
+              f"main={self.time_data[0]:.3f}-{self.time_data[-1]:.3f}s")
 
     #1. inizializzo variabili
     def initialize_default_variables(self):
