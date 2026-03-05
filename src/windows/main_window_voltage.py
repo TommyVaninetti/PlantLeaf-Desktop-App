@@ -38,20 +38,25 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
 
         # Inizializza linea che separa start e stop
         self.pause_markers = []
+        self.max_pause_markers = 50  # Limite massimo di pause markers
 
-        # Inizializza array per i dati
-        self.data_x_buffer = np.array([])
-        self.data_y_buffer = np.array([])
-        #INIZIALIZZA ARRAY PER VALORI DA PLOTTARE
-        self.data_x_plot = np.array([], dtype=float)
-        self.data_y_plot = np.array([], dtype=float)
+        # 🔥 CIRCULAR BUFFER per i dati di salvataggio
+        self.save_buffer_size = 10000  # Buffer di salvataggio (salvato ogni 1000 campioni)
+        self.data_x_buffer = np.zeros(self.save_buffer_size, dtype=np.float64)
+        self.data_y_buffer = np.zeros(self.save_buffer_size, dtype=np.float32)
+        self.save_buffer_index = 0
+        
+        # 🔥 CIRCULAR BUFFER per il plot (ottimizzato per memoria)
+        self.max_points = 60000  # Ultimi 60000 campioni visibili (~2 minuti a 500 Hz)
+        self.plot_buffer_size = self.max_points * 2  # Doppia dimensione per sicurezza
+        self.data_x_plot = np.zeros(self.plot_buffer_size, dtype=np.float64)
+        self.data_y_plot = np.zeros(self.plot_buffer_size, dtype=np.float32)
+        self.plot_buffer_index = 0
+        self.plot_buffer_full = False  # Flag per sapere se abbiamo riempito il buffer
 
         # Inizializza timer con tempo assoluto
         self.total_elapsed_time = 0
         self.chrono_start_time = 0
-
-        # Visualizzazione ultimi x campioni
-        self.max_points = 60000  # Limite di campioni da visualizzare
 
 
         # Sostituzione pulsante start/stop
@@ -126,6 +131,9 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
 
         self.is_acquiring = False
 
+        # 🔥 SETUP WORKER DI SALVATAGGIO PERSISTENTE (Soluzione 3)
+        self._setup_persistent_save_worker()
+
         # mostra a tutto schermo mantenendo le grafiche
         self.showMaximized()
 
@@ -133,43 +141,136 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
 
     ##### GESTIONE GRAFICO #####
     
+    def _setup_persistent_save_worker(self):
+        """Inizializza worker di salvataggio persistente per evitare memory leak"""
+        self.save_worker = VoltageSaveWorker()
+        self.save_thread = QThread()
+        self.save_worker.moveToThread(self.save_thread)
+        
+        # Connetti segnali
+        self.save_worker.finished.connect(self._on_save_finished)
+        self.save_worker.error.connect(self._on_save_error)
+        
+        # Avvia il thread UNA VOLTA (resta attivo per tutta la sessione)
+        self.save_thread.start()
+        
+        print("✅ Persistent save worker initialized")
+    
+    def _on_save_finished(self, filename):
+        """Callback per salvataggio completato"""
+        pass  # Silent success
+    
+    def _on_save_error(self, error_msg):
+        """Callback per errore salvataggio"""
+        print(f"❌ Save error: {error_msg}")
+    
     #connesso a dati raccolti dalla seriale
     def on_new_voltage_data(self, value):
+        """
+        🔥 OTTIMIZZATO: Usa circular buffer invece di np.append()
+        Elimina il memory leak O(n²) con approccio O(1)
+        """
         if not getattr(self, "is_acquiring", False):
             return
+        
         elapsed = self.total_elapsed_time + (time.time() - self.chrono_start_time)
         value *= float(self.multiplier)
-        # Aggiungi ai buffer di salvataggio
-        self.data_x_buffer = np.append(self.data_x_buffer, elapsed)
-        self.data_y_buffer = np.append(self.data_y_buffer, value)
-        # Aggiungi ai dati per il plot (mantieni solo gli ultimi max_points)
-        self.data_x_plot = np.append(self.data_x_plot, elapsed)
-        self.data_y_plot = np.append(self.data_y_plot, value)
-        if len(self.data_x_plot) > self.max_points:
-            self.data_x_plot = self.data_x_plot[-self.max_points:]
-            self.data_y_plot = self.data_y_plot[-self.max_points:]
-        self.update_plot()
-        # se la finestra temporale è abilitata, aggiorna la visualizzazione
-        if self.time_window_enabled:
-            if len(self.data_x_plot) > 0:
-                xmin = self.data_x_plot[0]
-            else:
-                xmin = 0
-            self.plot_widget.update_time_window(x_data_seconds=self.data_x_plot, xmin=xmin)
-
-
-        if len(self.data_x_buffer) >= 1000:
+        
+        # 🔥 CIRCULAR BUFFER per salvataggio (10000 campioni)
+        self.data_x_buffer[self.save_buffer_index] = elapsed
+        self.data_y_buffer[self.save_buffer_index] = value
+        self.save_buffer_index += 1
+        
+        # Salva quando raggiungi 1000 campioni
+        if self.save_buffer_index >= 1000:
             self.save_voltage_data()
+        
+        # 🔥 CIRCULAR BUFFER per plot (60000 campioni)
+        idx = self.plot_buffer_index % self.plot_buffer_size
+        self.data_x_plot[idx] = elapsed
+        self.data_y_plot[idx] = value
+        self.plot_buffer_index += 1
+        
+        # Segna quando riempiamo il buffer per la prima volta
+        if self.plot_buffer_index >= self.plot_buffer_size:
+            self.plot_buffer_full = True
+        
+        # Aggiorna plot (ogni N campioni per performance)
+        if self.plot_buffer_index % 10 == 0:  # Aggiorna ogni 10 campioni
+            self.update_plot()
+        
+        # Aggiorna finestra temporale se abilitata
+        if self.time_window_enabled and self.plot_buffer_index % 50 == 0:  # Ogni 50 campioni
+            self._update_time_window()
     
+    def _update_time_window(self):
+        """Aggiorna la finestra temporale del plot"""
+        visible_data_x, visible_data_y = self._get_visible_plot_data()
+        if len(visible_data_x) > 0:
+            xmin = visible_data_x[0]
+            self.plot_widget.update_time_window(x_data_seconds=visible_data_x, xmin=xmin)
+    
+    def _get_visible_plot_data(self):
+        """
+        🔥 Estrae i dati visibili dal circular buffer
+        Gestisce correttamente wrapping e limiti
+        Restituisce SEMPRE gli ultimi max_points campioni
+        """
+        if self.plot_buffer_index == 0:
+            return np.array([]), np.array([])
+        
+        if not self.plot_buffer_full:
+            # Buffer non ancora pieno: restituisci gli ultimi max_points (o tutti se meno)
+            valid_count = min(self.plot_buffer_index, self.max_points)
+            start_idx = max(0, self.plot_buffer_index - valid_count)
+            return (self.data_x_plot[start_idx:self.plot_buffer_index].copy(), 
+                    self.data_y_plot[start_idx:self.plot_buffer_index].copy())
+        else:
+            # Buffer pieno: mostra ultimi max_points campioni con wrapping
+            start_idx = self.plot_buffer_index % self.plot_buffer_size
+            
+            # Se start_idx == 0, il buffer è perfettamente pieno
+            if start_idx == 0:
+                end_slice = self.plot_buffer_size
+            else:
+                end_slice = start_idx
+            
+            # Calcola quanti campioni prendere
+            count = min(self.max_points, self.plot_buffer_size)
+            
+            # Estrai gli ultimi count campioni (gestendo wrapping)
+            if count <= end_slice:
+                # Dati contigui alla fine
+                x_data = self.data_x_plot[end_slice - count:end_slice].copy()
+                y_data = self.data_y_plot[end_slice - count:end_slice].copy()
+            else:
+                # Dati wrappati: prendi dalla fine e dall'inizio
+                first_part = count - end_slice
+                x_data = np.concatenate([
+                    self.data_x_plot[-first_part:],
+                    self.data_x_plot[:end_slice]
+                ])
+                y_data = np.concatenate([
+                    self.data_y_plot[-first_part:],
+                    self.data_y_plot[:end_slice]
+                ])
+            
+            return x_data, y_data
 
     def update_plot(self):
-        if len(self.data_x_plot) > 0:
-            self.plot_widget.plot.setData(self.data_x_plot, self.data_y_plot)
-            # Imposta i limiti degli assi in base ai dati correnti SOLO se è passato un intervallo di tempo sufficiente
+        """Aggiorna il grafico con i dati dal circular buffer"""
+        visible_data_x, visible_data_y = self._get_visible_plot_data()
+        
+        if len(visible_data_x) > 0:
+            self.plot_widget.plot.setData(visible_data_x, visible_data_y)
+            
+            # Imposta i limiti degli assi SOLO se abbiamo abbastanza dati
             interval = self.max_points / self.sampling_rate
-            if self.total_elapsed_time > interval:
-            # Calcola l'intervallo di tempo da visualizzare
-                x_max = self.data_x_plot[-1]
+            current_time = self.total_elapsed_time + (time.time() - self.chrono_start_time)
+            
+            if current_time > interval:
+                # Calcola l'intervallo di tempo da visualizzare
+                x_max = visible_data_x[-1]
                 x_min = x_max - interval
                 self.plot_widget.set_axis_limits(x_min=x_min, x_max=x_max, y_min=-1.7, y_max=1.7)
 
@@ -180,14 +281,9 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
         self.chrono_timer.timeout.connect(self.on_chrono_tick)
 
     def on_chrono_tick(self):
-        # Aggiorna solo la finestra temporale del plot, se serve
-        if self.time_window_enabled and len(self.data_x_plot) > 0:
-            max_points = self.max_points  # 60000
-            if len(self.data_x_plot) > max_points:
-                xmin = self.data_x_plot[-max_points]
-            else:
-                xmin = self.data_x_plot[0]
-            self.plot_widget.update_time_window(x_data_seconds=self.data_x_plot, xmin=xmin)
+        """Aggiorna solo la finestra temporale del plot"""
+        if self.time_window_enabled:
+            self._update_time_window()
 
 
     #sovrascrive il metodo di voltage_plot
@@ -249,6 +345,9 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
 
 
     def on_stop(self):
+        """
+        🔥 OTTIMIZZATO: Gestione pause markers con limite massimo
+        """
         if not self.isVisible():  # Se la finestra sta chiudendosi, non salvare
             return
         self.is_acquiring = False
@@ -269,26 +368,25 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
                 self.actionSerialPort.setEnabled(True)
                 self.set_buttons_enabled(False)
         
-        if len(self.data_x_plot) > 0:
-            pause_x = self.data_x_plot[-1]
+        # 🔥 Aggiungi pause marker CON LIMITE per evitare accumulo
+        visible_data_x, _ = self._get_visible_plot_data()
+        if len(visible_data_x) > 0:
+            pause_x = visible_data_x[-1]
             vline = pg.InfiniteLine(pos=pause_x, angle=90, pen=pg.mkPen('r', width=2, style=Qt.DashLine))
             self.plot_widget.plot_widget.addItem(vline)
             self.pause_markers.append(vline)
-            self.data_x_plot = np.append(self.data_x_plot, np.nan)
-            self.data_y_plot = np.append(self.data_y_plot, np.nan)
-            self.plot_widget.plot.setData(self.data_x_plot, self.data_y_plot)
+            
+            # 🔥 LIMITA numero di pause markers (rimuovi i più vecchi)
+            if len(self.pause_markers) > self.max_pause_markers:
+                old_marker = self.pause_markers.pop(0)
+                self.plot_widget.plot_widget.removeItem(old_marker)
+                del old_marker  # Explicit cleanup
+        
+        # Salva dati rimanenti nel buffer
+        self.save_voltage_data()
 
-
-        self.remove_data_after_stop()
-
-        max_points = self.max_points  # 60000
-        if len(self.data_x_plot) > max_points:
-            xmin = self.data_x_plot[-max_points]
-        elif len(self.data_x_plot) > 0:
-            xmin = self.data_x_plot[0]
-        else:
-            xmin = 0
-        self.plot_widget.update_time_window(x_data_seconds=self.data_x_plot, xmin=xmin)
+        # Aggiorna vista
+        self._update_time_window()
         
         self.actionClear.setEnabled(True)
         if not self.definetly_saved:
@@ -454,32 +552,39 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
 
 
     def remove_data_after_stop(self):
-        """Rimuove tutti i dati raccolti dopo lo stop (cioè dopo total_elapsed_time)."""
-        mask = self.data_x_plot <= self.total_elapsed_time
-        self.data_x_plot = self.data_x_plot[mask]
-        self.data_y_plot = self.data_y_plot[mask]
-        self.plot_widget.plot.setData(self.data_x_plot, self.data_y_plot)
+        """
+        🔥 DEPRECATO: Non più necessario con circular buffer
+        Il circular buffer gestisce automaticamente il limite di memoria
+        """
+        pass  # Metodo mantenuto per compatibilità ma non fa nulla
 
 
 
 
     # SALVATAGGIO DATI
     def save_voltage_data(self):
-        """Salva i dati nel file giusto: temporaneo o definitivo, in un thread separato."""
+        """
+        🔥 OTTIMIZZATO: Usa worker persistente invece di creare nuovi thread
+        Elimina il memory leak da thread accumulation
+        """
         import tempfile, os
 
+        # Determina quanti dati salvare dal buffer
+        count_to_save = min(self.save_buffer_index, 1000)
+        
+        if count_to_save == 0:
+            return None  # Niente da salvare
+        
         # Scegli il file di destinazione
         if self._last_saved_file is not None:
             filename = self._last_saved_file
-            #print(f"Salvataggio dati in: {filename}")
         else:
             if self._last_temp_file and os.path.dirname(self._last_temp_file) == tempfile.gettempdir():
                 filename = self._last_temp_file
-                #print(f"Salvataggio dati in: {filename}")
             else:
                 filename = tempfile.mktemp(prefix='plantvolt_', suffix='.pvolt')
                 self._last_temp_file = filename
-                print(f"Creazione nuovo file temporaneo: {filename}")
+                print(f"📄 Creazione nuovo file temporaneo: {filename}")
 
         # Prepara header solo se il file non esiste
         is_new_file = not os.path.exists(filename)
@@ -487,34 +592,31 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
         if is_new_file:
             header = self._create_header()
 
-        # Copia i buffer e svuota subito (così non perdi dati se arrivano nuovi)
-        x_buffer = self.data_x_buffer.copy()
-        y_buffer = self.data_y_buffer.copy()
-        self.data_x_buffer = np.array([])
-        self.data_y_buffer = np.array([])
+        # 🔥 Copia SOLO i dati validi dal buffer circolare
+        x_buffer = self.data_x_buffer[:count_to_save].copy()
+        y_buffer = self.data_y_buffer[:count_to_save].copy()
+        
+        # Reset indice buffer di salvataggio
+        self.save_buffer_index = 0
 
-        # Avvia il worker in un thread separato
-        self.save_thread = QThread()
-        self.save_worker = VoltageSaveWorker(filename, header, x_buffer, y_buffer, is_new_file)
-        self.save_worker.moveToThread(self.save_thread)
-        self.save_thread.started.connect(self.save_worker.run)
-        self.save_worker.finished.connect(self.save_thread.quit)
-        self.save_worker.finished.connect(self.save_worker.deleteLater)
-        self.save_thread.finished.connect(self.save_thread.deleteLater)
-        self.save_worker.error.connect(lambda msg: print(f"Errore salvataggio: {msg}"))
-        self.save_thread.start()
+        # 🔥 USA IL WORKER PERSISTENTE (invece di crearne uno nuovo)
+        try:
+            # Invia richiesta di salvataggio al worker esistente
+            self.save_worker.save_data_signal.emit(filename, header, x_buffer, y_buffer, is_new_file)
+        except Exception as e:
+            print(f"❌ Errore invio dati a save_worker: {e}")
 
         # Aggiorna il riferimento al file temporaneo solo se stai usando il temporaneo
         if not self._last_saved_file:
             self._last_temp_file = filename
+        
         return filename
 
 
     def _create_header(self, header_data=None):
         """Crea un header garantendo il magic number corretto e dimensione 128 byte"""
         if header_data is None: 
-            # Calcola data_points escludendo i NaN
-            valid_points = len(self.data_x_buffer[~np.isnan(self.data_x_buffer)])
+            # 🔥 Calcola data_points dal buffer circolare
             header = {
                 'magic': b'PLANTVOLT',  # 9 byte
                 'version': 2.0,         # 4 byte
@@ -524,7 +626,7 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
                 'amplified': self.amplified_data_state, # 1 byte
                 'start_time': getattr(self, 'start_datetime', 0.0), # 8 byte
                 'end_time': getattr(self, 'end_datetime', 0.0),     # 8 byte
-                'data_points': valid_points,           # 4 byte
+                'data_points': self.save_buffer_index,  # 4 byte (conta buffer corrente)
                 'acquisition_count': self._acquisition_count, # 4 byte
                 'reserved': b'\x00' * 62              # 62 byte
             }
@@ -555,8 +657,10 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
 
       
     def save_file_action(self, ask_filename=True):
+        """
+        � OTTIMIZZATO: Salvataggio con supporto circular buffer
+        """
         print("💾 Salvataggio manuale o finale...")
-        """Salvataggio manuale o finale: scrive header e TUTTI i dati raccolti (file temporaneo + buffer)"""
         from PySide6.QtWidgets import QFileDialog, QMessageBox
 
         # --- Selezione file ---
@@ -579,13 +683,13 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
                 filename = self._last_saved_file
                 print(f"Salvataggio finale in file definitivo {filename}")
             else:
-                if self.is_closing and not self.is_cleaning:  # Se la finestra sta chiudendosi, non salvare
+                if self.is_closing and not self.is_cleaning:
                     print("La finestra sta chiudendosi, salvataggio automatico annullato.")
                     return False
                 elif not self.is_cleaning:
                     self.save_file_action(ask_filename=True)
                     print("richiedo con salvataggio manuale")
-                    return True  # Dopo il salvataggio manuale, esci
+                    return True
                 else:
                     print("Stato di pulizia attivo, salvataggio automatico annullato.")
                     return False
@@ -595,17 +699,19 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
             progress = self.get_progress_widget("Saving Voltage Data...")
             progress.setValue(0)
             progress.show()
-            # Ricostruisci tutti i dati dal file temporaneo + buffer attuale
+            
+            # 🔥 Raccogli TUTTI i dati (file + buffer circolare)
             all_x = []
             all_y = []
 
-            # Scegli il file di origine dati: se hai già un file definitivo, usa quello!
+            # Scegli il file di origine dati
             source_file = None
             if self._last_saved_file and os.path.exists(self._last_saved_file):
                 source_file = self._last_saved_file
             elif self._last_temp_file and os.path.exists(self._last_temp_file):
                 source_file = self._last_temp_file
 
+            # Leggi dati esistenti
             if source_file:
                 with open(source_file, 'rb') as f:
                     f.seek(128)  # Salta header
@@ -616,12 +722,16 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
                         x, y = struct.unpack('<ff', chunk)
                         all_x.append(x)
                         all_y.append(y)
-            # Aggiungi i dati attualmente nel buffer
-            all_x.extend(self.data_x_buffer)
-            all_y.extend(self.data_y_buffer)
-            print(f"Totale punti da salvare: {len(all_x)}")
+            
+            # 🔥 Aggiungi dati dal buffer di salvataggio (solo i validi)
+            if self.save_buffer_index > 0:
+                all_x.extend(self.data_x_buffer[:self.save_buffer_index])
+                all_y.extend(self.data_y_buffer[:self.save_buffer_index])
+            
+            print(f"💾 Totale punti da salvare: {len(all_x)}")
+            progress.setValue(30)
 
-            # Scrivi sempre tutti i dati (anche se non è final save)
+            # Scrivi file completo
             with open(filename, 'wb') as f:
                 # Calcola i punti validi (escludi NaN)
                 valid_points = np.sum(~np.isnan(all_x) & ~np.isnan(all_y))
@@ -639,9 +749,9 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
                     'reserved': b'\x00' * 62
                 })
                 f.write(header)
-                print(f"Header scritto con punti validi: {valid_points}")
+                progress.setValue(50)
 
-
+                # Scrivi tutti i dati
                 total_points = len(all_x)
                 for i, (x, y) in enumerate(zip(all_x, all_y)):
                     try:
@@ -650,46 +760,43 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
                         else:
                             f.write(struct.pack('<ff', x, y))
                     except Exception as e:
-                        print(f"Errore nel salvataggio del punto ({x}, {y}): {e}")
-                    # Aggiorna progress ogni 500 punti
-                    if i % 500 == 0 or i == total_points - 1:
-                        percent = int((i + 1) / total_points * 100)
-                        progress.setValue(percent)
+                        print(f"⚠️ Errore salvataggio punto: {e}")
+                    
+                    # Update progress
+                    if i % 1000 == 0:
+                        progress.setValue(50 + int((i / total_points) * 45))
                         from PySide6.QtWidgets import QApplication
                         QApplication.processEvents()
                         if progress.wasCanceled():
-                            print("Salvataggio annullato dall'utente")
+                            print("❌ Salvataggio annullato dall'utente")
                             progress.close()
                             return False
-
+            
             progress.setValue(100)
-            print(f"Dati salvati in: {filename}")
+            print(f"✅ Dati salvati in: {filename}")
             progress.close()
 
-
-            # Dopo il salvataggio manuale, cancella il file temporaneo
+            # Cancella file temporaneo se presente
             if ask_filename and self._last_temp_file and os.path.exists(self._last_temp_file):
                 try:
                     os.remove(self._last_temp_file)
                     self._last_temp_file = None
-                    print(f"File temporaneo {self._last_temp_file} cancellato con successo.")
+                    print(f"🗑️ File temporaneo cancellato")
                 except Exception as e:
-                    print(f"⚠️ Impossibile cancellare il file temporaneo: {e}")
+                    print(f"⚠️ Impossibile cancellare file temporaneo: {e}")
 
-            # Svuota i buffer dopo il salvataggio definitivo
-            self.data_x_buffer = np.array([])
-            self.data_y_buffer = np.array([])
+            # 🔥 Reset buffer di salvataggio
+            self.save_buffer_index = 0
 
-            self.is_cleaning = False  # Reset flag di pulizia
-
-            self._last_temp_file = None  # Resetta il temp file
-            self.actionSave.setEnabled(False)  # Disabilita salvataggio multiplo
+            self.actionSave.setEnabled(False)
             self.actionSave.setToolTip(f"File already saved in {filename}")
             self.definetly_saved = True
 
+            print(f"✅ File finalizzato: {os.path.basename(filename)} ({valid_points} punti)")
             return True
+            
         except Exception as e:
-            print(f"Errore durante il salvataggio: {e}")
+            print(f"❌ Errore durante il salvataggio: {e}")
             if 'progress' in locals():
                 progress.close()
             QMessageBox.critical(self, "Errore di Salvataggio", f"Impossibile salvare il file:\n{str(e)}")
@@ -699,4 +806,32 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
     def _finalize_file_data(self, last_saved_file):
         self.save_file_action(ask_filename=False)
         print(f"File finalizzato in: {last_saved_file}")
+    
+    def closeEvent(self, event):
+        """
+        🔥 Override per cleanup thread persistente prima della chiusura
+        """
+        # Cleanup worker persistente
+        if hasattr(self, 'save_worker') and hasattr(self, 'save_thread'):
+            try:
+                if self.save_thread.isRunning():
+                    print("🧹 Fermando save_thread persistente...")
+                    self.save_thread.quit()
+                    self.save_thread.wait(2000)  # Aspetta max 2 secondi
+                    print("✅ Save_thread fermato")
+            except Exception as e:
+                print(f"⚠️ Errore fermando save_thread: {e}")
+        
+        # 🔥 Cleanup pause markers per evitare leak di oggetti grafici
+        if hasattr(self, 'pause_markers'):
+            for marker in self.pause_markers:
+                try:
+                    self.plot_widget.plot_widget.removeItem(marker)
+                except:
+                    pass
+            self.pause_markers.clear()
+            print("🧹 Pause markers puliti")
+        
+        # Chiama il closeEvent della classe base
+        super().closeEvent(event)
     ##### 
