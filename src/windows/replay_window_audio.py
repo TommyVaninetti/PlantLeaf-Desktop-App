@@ -21,10 +21,11 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QFont
 from PySide6 import QtCore
 
-from core.replay_base_window import ReplayBaseWindow
+from core.replay_base_window import ReplayBaseWindow, compute_fft_energy, SpectralEnergyDialog
+from core.replay_base_window import ReplayBaseWindow, compute_fft_energy, SpectralEnergyDialog
 from plotting.plot_manager import BasePlotWidget
 from core.audio_trim_export import AudioTrimExporter
-
+from scipy.signal import hilbert
 
 
 class AudioDataManager:
@@ -171,7 +172,7 @@ class IFFTWindow(QDialog):
         # Crea il widget del grafico con il range corretto e auto-range per l'asse Y
         self.plot_widget = BasePlotWidget(
             x_label="Time", y_label="Amplitude",
-            x_range=(x_min_val, x_max_val), y_range=(-0.03, 0.03),
+            x_range=(x_min_val, x_max_val), y_range=(-0.002, 0.002),
             x_min=x_min_val, x_max=x_max_val, y_min=-1.7, y_max=1.7,
             unit_x="s", unit_y="V", parent=self
         )
@@ -199,12 +200,36 @@ class IFFTWindow(QDialog):
         self.normalize_button.clicked.connect(self.toggle_normalization)
         button_layout.addWidget(self.normalize_button)
         
+        # ✅ AGGIUNGI PULSANTE ENVELOPE ANALYSIS
+        self.envelope_button = QPushButton("Show Hilbert Envelope")
+        self.envelope_button.setToolTip(
+            "Calculate and display instantaneous amplitude envelope\n"
+            "using Hilbert transform (red thick line)"
+        )
+        self.envelope_button.clicked.connect(self.toggle_envelope)
+        button_layout.addWidget(self.envelope_button)
+        
+        # ✅ AGGIUNGI PULSANTE DECAY ANALYSIS
+        self.decay_button = QPushButton("Analyze Decay")
+        self.decay_button.setToolTip(
+            "Check if signal shows exponential decay typical of ultrasonic clicks\n"
+            "Analyzes 0.6 ms post-peak window (120 samples @ 200 ksps)"
+        )
+        self.decay_button.clicked.connect(self.analyze_decay)
+        button_layout.addWidget(self.decay_button)
+        
         self.info_label = QLabel("📊 Raw iFFT signal (no correction)")
         self.info_label.setStyleSheet("color: #888; font-size: 10pt;")
         button_layout.addWidget(self.info_label)
         button_layout.addStretch()
         
         layout.addLayout(button_layout)
+        
+        # Variabili per envelope analysis
+        self.envelope_data = None
+        self.envelope_curve = None
+        self.peak_line = None
+        self.show_envelope = False
 
         # Menubar
         from PySide6.QtWidgets import QMenuBar
@@ -244,10 +269,20 @@ class IFFTWindow(QDialog):
             if self.signal_data_normalized is not None:
                 self.is_normalized = True
                 self._update_display()
+                
+                # ✅ RICALCOLA ENVELOPE SE GIÀ VISUALIZZATO
+                if self.show_envelope:
+                    print("🔄 Recalculating envelope for normalized signal...")
+                    self._compute_and_show_envelope()
         else:
             # TORNA A RAW
             self.is_normalized = False
             self._update_display()
+            
+            # ✅ RICALCOLA ENVELOPE SE GIÀ VISUALIZZATO
+            if self.show_envelope:
+                print("🔄 Recalculating envelope for raw signal...")
+                self._compute_and_show_envelope()
     
     def _compute_normalized_ifft(self):
         """Calcola iFFT con correzione 50% dalla FFT normalizzata"""
@@ -401,6 +436,695 @@ class IFFTWindow(QDialog):
             self.info_label.setText("📊 Raw iFFT signal (no correction)")
             self.info_label.setStyleSheet("color: #888; font-size: 10pt;")
     
+    def toggle_envelope(self):
+        """Toggle visualizzazione inviluppo di Hilbert"""
+        self.show_envelope = not self.show_envelope
+        
+        if self.show_envelope:
+            # CALCOLA E MOSTRA ENVELOPE
+            self._compute_and_show_envelope()
+        else:
+            # NASCONDI ENVELOPE
+            if self.envelope_curve is not None:
+                self.plot_widget.plot_widget.removeItem(self.envelope_curve)
+                self.envelope_curve = None
+            if self.peak_line is not None:
+                self.plot_widget.plot_widget.removeItem(self.peak_line)
+                self.peak_line = None
+            self.envelope_button.setText("Show Hilbert Envelope")
+    
+    def _compute_and_show_envelope(self):
+        """Calcola e visualizza l'inviluppo di Hilbert"""
+        # Usa il segnale corrente (raw o normalized)
+        current_signal = self.signal_data_normalized if self.is_normalized else self.signal_data_raw
+        
+        print("🔧 Computing Hilbert envelope...")
+        
+        # Calcola inviluppo
+        self.envelope_data = compute_hilbert_envelope(current_signal)
+        
+        # Trova picco
+        peak_idx, peak_amp = find_peak(current_signal)
+        peak_time = self.time_data[peak_idx]
+        
+        print(f"✅ Envelope computed:")
+        print(f"   Peak at t = {peak_time:.6f} s (sample {peak_idx})")
+        print(f"   Peak amplitude: {peak_amp:.6f} V")
+        
+        # Visualizza inviluppo (ROSSO, SPESSO)
+        if self.envelope_curve is None:
+            self.envelope_curve = self.plot_widget.plot_widget.plot(
+                self.time_data, self.envelope_data,
+                pen={'color': 'red', 'width': 3},
+                name='Hilbert Envelope'
+            )
+        else:
+            self.envelope_curve.setData(self.time_data, self.envelope_data)
+        
+        # Mostra linea verticale al picco
+        if self.peak_line is None:
+            self.peak_line = self.plot_widget.plot_widget.addLine(
+                x=peak_time,
+                pen={'color': 'yellow', 'width': 2, 'style': QtCore.Qt.DashLine},
+                label='Peak'
+            )
+        else:
+            self.peak_line.setValue(peak_time)
+        
+        self.envelope_button.setText("Hide Hilbert Envelope")
+    
+    def analyze_decay(self):
+        """Analizza il decadimento post-picco per rilevare click ultrasonici"""
+        # Usa il segnale corrente (raw o normalized)
+        current_signal = self.signal_data_normalized if self.is_normalized else self.signal_data_raw
+        
+        # ✅ RICALCOLA SEMPRE ENVELOPE per assicurare coerenza con segnale corrente
+        self.envelope_data = compute_hilbert_envelope(current_signal)
+        
+        # Trova picco
+        peak_idx, peak_amp = find_peak(current_signal)
+        peak_time = self.time_data[peak_idx]
+        
+        # ✅ GESTIONE SPILL: Recupera frame successivo se necessario
+        next_frame_signal = None
+        if peak_idx > 380:  # Picco vicino a fine frame
+            # Verifica se esiste frame successivo
+            if (self.frame_index is not None and 
+                self.parent and hasattr(self.parent, 'data_manager') and
+                self.frame_index + 1 < len(self.parent.data_manager.fft_data)):
+                
+                try:
+                    # Recupera FFT e fasi del frame successivo
+                    next_fft = self.parent.data_manager.fft_data[self.frame_index + 1]
+                    
+                    if self.is_normalized and self.has_real_phases:
+                        # Se in modalità normalizzata, calcola iFFT normalizzato del prossimo frame
+                        print("   🔧 Computing normalized iFFT for next frame (spill handling)...")
+                        next_frame_signal = self._compute_ifft_for_frame(self.frame_index + 1, normalized=True)
+                    elif self.has_real_phases:
+                        # Se in modalità raw con fasi reali
+                        next_frame_signal = self._compute_ifft_for_frame(self.frame_index + 1, normalized=False)
+                    else:
+                        # Fallback: usa solo dati FFT (senza fasi, qualità ridotta)
+                        print("   ⚠️ Next frame has no phase data, decay analysis may be inaccurate")
+                        next_frame_signal = None
+                        
+                except Exception as e:
+                    print(f"   ⚠️ Failed to load next frame: {e}")
+                    next_frame_signal = None
+        
+        # Analizza decadimento (con o senza frame successivo)
+        print(f"\n🔍 Decay Analysis {'(NORMALIZED)' if self.is_normalized else '(RAW)'}:")
+        print(f"   Peak at t = {peak_time:.6f} s (sample {peak_idx}/{len(current_signal)})")
+        print(f"   Peak amplitude: {peak_amp:.6f} V")
+        
+        decay_results = check_decay(self.envelope_data, peak_idx, next_frame_signal=next_frame_signal)
+        
+        # Stampa risultati
+        print(f"\n📊 Decay Metrics (120-Sample Logarithmic Fit):")
+        print(f"   Window analyzed: {decay_results['n_samples']} samples ({decay_results['n_samples']/200:.3f} ms)")
+        if decay_results.get('used_next_frame', False):
+            print(f"   ✅ Extended analysis using next frame data")
+        
+        # Legacy info (4 sub-windows per reference)
+        print(f"\n   📋 Legacy Sub-window Energies (reference only):")
+        for i, E in enumerate(decay_results['energies'], 1):
+            print(f"      W{i}: {E:.9f} V² = {E*1e6:.3f} mV²")
+        
+        print(f"\n   📈 PRIMARY ANALYSIS: 120-Sample Logarithmic Fit")
+        print(f"      Method: Sample-by-sample on Hilbert envelope")
+        print(f"      Slope (log): {decay_results['slope_log']:.6f}")
+        print(f"      R² (log): {decay_results['r_squared_log']:.4f}  ⭐ MAIN QUALITY METRIC")
+        print(f"      τ (tau): {decay_results['tau_ms']:.3f} ms" if decay_results['tau_ms'] > 0 else "      τ (tau): N/A (invalid slope)")
+        print(f"      Valid: {'✅ YES' if decay_results['decaying'] else '❌ NO'}")
+        print(f"      Reason: {decay_results.get('reason', 'Valid')}")
+        
+        print(f"\n   ✅ Quality checks:")
+        print(f"      Exponential decay: {'✅ YES' if decay_results['decaying'] else '❌ NO'}")
+        print(f"      Near frame end: {'⚠️ YES (possible spill)' if decay_results['near_end'] else '✅ NO'}")
+        
+        # Valutazione finale (AGGIORNATA PER 120 CAMPIONI)
+        r2_log = decay_results['r_squared_log']
+        if decay_results['decaying'] and r2_log >= 0.70:
+            verdict = "✅ IDENTIFIED ULTRASONIC CLICK (R²_log ≥ 0.70, HIGH confidence)"
+            color = "green"
+        elif decay_results['decaying'] and r2_log >= 0.60:
+            verdict = "⚠️ POSSIBLE CLICK (0.60 ≤ R²_log < 0.70, borderline)"
+            color = "orange"
+        else:
+            verdict = "❌ NOT A TYPICAL CLICK (R²_log < 0.60)"
+            color = "red"
+        
+        print(f"\n🎯 Verdict: {verdict}")
+        
+        # Mostra popup con risultati (CUSTOM DIALOG per temi corretti)
+        self._show_decay_results_dialog(
+            frame_index=self.frame_index,
+            is_normalized=self.is_normalized,
+            peak_time=peak_time,
+            peak_idx=peak_idx,
+            peak_amp=peak_amp,
+            decay_results=decay_results,
+            verdict=verdict,
+            verdict_color=color
+        )
+    
+    def _compute_ifft_for_frame(self, frame_index, normalized=False):
+        """
+        Calcola iFFT per un frame specifico (helper per gestione spill).
+        
+        Parameters:
+        -----------
+        frame_index : int
+            Indice del frame da processare
+        normalized : bool
+            Se True, applica correzione 50% microfono
+        
+        Returns:
+        --------
+        np.ndarray : Segnale time-domain (512 samples)
+        """
+        if not self.parent or not hasattr(self.parent, 'data_manager'):
+            return None
+        
+        dm = self.parent.data_manager
+        
+        if frame_index >= len(dm.fft_data):
+            return None
+        
+        # Recupera dati
+        fft_magnitudes = dm.fft_data[frame_index]
+        freq_axis = dm.frequency_axis
+        
+        # Parametri FFT
+        fs = dm.header_info.get('fs', 200000)
+        fft_size = dm.header_info.get('fft_size', 512)
+        num_bins_full = fft_size // 2
+        
+        bin_freq = fs / fft_size
+        bin_start = int(20000 / bin_freq)
+        bin_end = int(80000 / bin_freq)
+        
+        # Inizializza spettro completo
+        full_spectrum_mag = np.zeros(num_bins_full, dtype=np.float32)
+        full_spectrum_phase = np.zeros(num_bins_full, dtype=np.int8)
+        
+        # Se normalizzato, applica correzione
+        if normalized:
+            datasheet_freq_khz = np.array([20, 25, 30, 40, 50, 60, 70, 80])
+            datasheet_response_db = np.array([8.0, 10.5, 6.0, -2.0, -6.0, -7.0, -6.0, -4.0])
+            datasheet_freq_hz = datasheet_freq_khz * 1000
+            
+            valid_mask = (freq_axis >= 20000) & (freq_axis <= 80000)
+            freq_range = freq_axis[valid_mask]
+            
+            mic_response_db = np.interp(freq_range, datasheet_freq_hz, datasheet_response_db)
+            correction_gain_50 = 10 ** (-mic_response_db * 0.5 / 20.0)
+            
+            fft_corrected = fft_magnitudes[valid_mask] * correction_gain_50
+        else:
+            valid_mask = (freq_axis >= 20000) & (freq_axis <= 80000)
+            fft_corrected = fft_magnitudes[valid_mask]
+        
+        # Inserisci magnitude
+        actual_bins = min(len(fft_corrected), bin_end - bin_start + 1)
+        full_spectrum_mag[bin_start:bin_start + actual_bins] = fft_corrected[:actual_bins]
+        
+        # Inserisci fasi (se disponibili)
+        if len(dm.phase_data) > frame_index:
+            phase_data = dm.phase_data[frame_index]
+            actual_phase_bins = min(len(phase_data), actual_bins)
+            full_spectrum_phase[bin_start:bin_start + actual_phase_bins] = phase_data[:actual_phase_bins]
+        
+        # Converti fasi e crea spettro complesso
+        fft_phases_rad = (full_spectrum_phase / 127.0) * np.pi
+        complex_spectrum = full_spectrum_mag * np.exp(1j * fft_phases_rad)
+        
+        # iFFT
+        try:
+            time_domain_signal = np.fft.irfft(complex_spectrum, n=fft_size)
+            return time_domain_signal
+        except Exception as e:
+            print(f"   ❌ iFFT error for frame {frame_index}: {e}")
+            return None
+    
+    def _show_decay_results_dialog(self, frame_index, is_normalized, peak_time, peak_idx, 
+                                   peak_amp, decay_results, verdict, verdict_color):
+        """Mostra dialog personalizzato con risultati decay analysis (tema-aware)"""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QTextEdit, QPushButton, QHBoxLayout
+        from PySide6.QtCore import Qt
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Decay Analysis Results")
+        dialog.setMinimumSize(600, 735)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # TITOLO
+        title_label = QLabel(f"<b style='font-size:16pt;'>Frame {frame_index if frame_index is not None else '?'}</b>")
+        title_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title_label)
+        
+        mode_label = QLabel(f"<i>{'50% Normalized iFFT' if is_normalized else 'Raw iFFT (no correction)'}</i>")
+        mode_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(mode_label)
+        
+        # CONTENUTO TESTUALE (QTextEdit per scrolling e temi corretti)
+        text_widget = QTextEdit()
+        text_widget.setReadOnly(True)
+        
+        # Costruisci testo HTML formattato
+        html_content = f"""
+<div style='font-family: monospace; font-size: 11pt; line-height: 1.6;'>
+
+<p><b style='font-size: 13pt; text-decoration: underline;'>Peak Information:</b></p>
+<table style='margin-left: 20px; border-collapse: collapse;'>
+<tr><td style='padding: 4px;'>Time:</td><td style='padding: 4px;'><b>{peak_time:.6f} s</b> (sample {peak_idx})</td></tr>
+<tr><td style='padding: 4px;'>Amplitude:</td><td style='padding: 4px;'><b>{peak_amp:.6f} V</b> = {peak_amp*1000:.3f} mV</td></tr>
+</table>
+
+<p><b style='font-size: 13pt; text-decoration: underline;'>Decay Metrics (0.6 ms post-peak):</b></p>
+<table style='margin-left: 20px; border-collapse: collapse; width: 80%;'>
+<tr style='background-color: rgba(128,128,128,0.2);'>
+    <th style='padding: 6px; text-align: left;'>Sub-Window</th>
+    <th style='padding: 6px; text-align: right;'>Energy (V²)</th>
+    <th style='padding: 6px; text-align: right;'>Energy (mV²)</th>
+</tr>
+<tr><td style='padding: 4px;'>W1 (0-150 μs):</td><td style='padding: 4px; text-align: right;'>{decay_results['energies'][0]:.9f}</td><td style='padding: 4px; text-align: right;'><b>{decay_results['energies'][0]*1e6:.3f}</b></td></tr>
+<tr style='background-color: rgba(128,128,128,0.1);'><td style='padding: 4px;'>W2 (150-300 μs):</td><td style='padding: 4px; text-align: right;'>{decay_results['energies'][1]:.9f}</td><td style='padding: 4px; text-align: right;'><b>{decay_results['energies'][1]*1e6:.3f}</b></td></tr>
+<tr><td style='padding: 4px;'>W3 (300-450 μs):</td><td style='padding: 4px; text-align: right;'>{decay_results['energies'][2]:.9f}</td><td style='padding: 4px; text-align: right;'><b>{decay_results['energies'][2]*1e6:.3f}</b></td></tr>
+<tr style='background-color: rgba(128,128,128,0.1);'><td style='padding: 4px;'>W4 (450-600 μs):</td><td style='padding: 4px; text-align: right;'>{decay_results['energies'][3]:.9f}</td><td style='padding: 4px; text-align: right;'><b>{decay_results['energies'][3]*1e6:.3f}</b></td></tr>
+</table>
+
+<p><b style='font-size: 13pt; text-decoration: underline;'>Statistical Analysis:</b></p>
+<table style='margin-left: 20px; border-collapse: collapse; width: 90%;'>
+<tr style='background-color: rgba(100,100,100,0.15);'>
+    <th colspan='3' style='padding: 6px; text-align: left;'>LINEAR FIT (legacy - less selective)</th>
+</tr>
+<tr><td style='padding: 4px; width: 200px;'>Slope:</td><td style='padding: 4px;'><b>{decay_results['slope']:.6e}</b></td><td style='padding: 4px; color: gray;'>(trend only)</td></tr>
+<tr><td style='padding: 4px;'>R² (linear):</td><td style='padding: 4px;'><b>{decay_results['r_squared']:.4f}</b></td><td style='padding: 4px; color: gray;'>(reference)</td></tr>
+<tr style='background-color: rgba(0,150,0,0.1);'>
+    <th colspan='3' style='padding: 6px; text-align: left;'>⭐ LOGARITHMIC FIT (physical model E=E₀·exp(-2t/τ))</th>
+</tr>
+<tr><td style='padding: 4px;'>Slope (log):</td><td style='padding: 4px;'><b>{decay_results['slope_log']:.6f}</b></td><td style='padding: 4px;'>{"✅ decay" if decay_results['slope_log'] < 0 else "❌ growth"}</td></tr>
+<tr><td style='padding: 4px;'>R² (log): <b>MAIN CRITERION</b></td><td style='padding: 4px;'><b style='font-size: 12pt;'>{decay_results['r_squared_log']:.4f}</b></td><td style='padding: 4px;'>{"✅ excellent (≥0.85)" if decay_results['r_squared_log'] >= 0.85 else "✅ good (≥0.70)" if decay_results['r_squared_log'] >= 0.70 else "⚠️ fair (≥0.50)" if decay_results['r_squared_log'] >= 0.50 else "❌ poor (<0.50)"}</td></tr>
+<tr><td style='padding: 4px;'>τ (decay time):</td><td style='padding: 4px;'><b>{decay_results['tau_ms']:.3f} ms</b></td><td style='padding: 4px;'>{f"{'⚡ very fast' if decay_results['tau_ms'] < 0.1 else '📊 typical' if decay_results['tau_ms'] < 0.5 else '🔊 slow/resonant'}" if decay_results['tau_ms'] > 0 else "N/A (invalid)"}</td></tr>
+<tr><td style='padding: 4px;'>Window analyzed:</td><td colspan='2' style='padding: 4px;'>{decay_results['window_samples']} samples ({decay_results['window_samples']/200:.3f} ms)</td></tr>
+{'<tr><td style="padding: 4px;">Multi-frame analysis:</td><td colspan="2" style="padding: 4px;"><b>✅ YES (extended to next frame)</b></td></tr>' if decay_results.get('used_next_frame', False) else ''}
+</table>
+
+<p><b style='font-size: 13pt; text-decoration: underline;'>Classification Criteria:</b></p>
+<table style='margin-left: 20px; border-collapse: collapse;'>
+<tr><td style='padding: 4px;'>Monotone decay (E1&gt;E2&gt;E3&gt;E4):</td><td style='padding: 4px;'><b>{'✅ YES' if decay_results['monotone'] else '❌ NO'}</b></td></tr>
+<tr><td style='padding: 4px;'>Exponential decay (slope&lt;0):</td><td style='padding: 4px;'><b>{'✅ YES' if decay_results['decaying'] else '❌ NO'}</b></td></tr>
+<tr><td style='padding: 4px;'>Near frame end (&gt;74%):</td><td style='padding: 4px;'><b>{'⚠️ YES (possible spill)' if decay_results['near_end'] else '✅ NO'}</b></td></tr>
+</table>
+
+<br>
+<p style='text-align: center; font-size: 14pt; font-weight: bold; padding: 10px; background-color: rgba({self._verdict_color_to_rgb(verdict_color)}, 0.3); border-radius: 5px;'>
+{verdict}
+</p>
+
+</div>
+"""
+        
+        text_widget.setHtml(html_content)
+        layout.addWidget(text_widget)
+        
+        # PULSANTE CHIUDI
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        close_button = QPushButton("Close")
+        close_button.setMinimumWidth(100)
+        close_button.clicked.connect(dialog.accept)
+        button_layout.addWidget(close_button)
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+        
+        # Applica tema
+        if self.parent and hasattr(self.parent, 'theme_manager'):
+            saved_theme = self.parent.theme_manager.load_saved_theme()
+            self.parent.theme_manager.apply_theme(dialog, saved_theme)
+            
+            # ✅ FIX TEMI LIGHT: Imposta sfondo bianco E testo nero per leggibilità
+            if 'light' in saved_theme.lower():
+                dialog.setStyleSheet("""
+                    QDialog {
+                        background-color: white;
+                        color: black;
+                    }
+                    QLabel {
+                        color: black;
+                    }
+                    QTextEdit {
+                        background-color: white;
+                        color: black;
+                    }
+                    QPushButton {
+                        background-color: #f0f0f0;
+                        color: black;
+                        border: 1px solid #ccc;
+                        padding: 5px;
+                        border-radius: 3px;
+                    }
+                    QPushButton:hover {
+                        background-color: #e0e0e0;
+                    }
+                """)
+
+        dialog.exec()
+    
+    def _verdict_color_to_rgb(self, color_name):
+        """Converti nome colore in RGB per HTML"""
+        color_map = {
+            'green': '0, 200, 0',
+            'orange': '255, 165, 0',
+            'red': '255, 0, 0'
+        }
+        return color_map.get(color_name, '128, 128, 128')
+    
+
+# ============================================================================
+# HILBERT ENVELOPE ANALYSIS FUNCTIONS (CLICK DETECTION)
+# ============================================================================
+
+def compute_hilbert_envelope(signal: np.ndarray) -> np.ndarray:
+    """
+    Calcola l'inviluppo istantaneo del segnale usando la trasformata di Hilbert.
+    
+    Per un click ultrasonico (sinusoide smorzata), l'inviluppo mostra il decadimento
+    esponenziale che lo caratterizza.
+    
+    Parameters:
+    -----------
+    signal : np.ndarray
+        Segnale time-domain (es: output di iFFT)
+    
+    Returns:
+    --------
+    np.ndarray : Instantaneous amplitude envelope A[n] = |analytic_signal[n]|
+    """
+    # Segnale analitico = signal + j*hilbert(signal)
+    analytic_signal = hilbert(signal)
+    
+    # Inviluppo = modulo del segnale analitico
+    envelope = np.abs(analytic_signal)
+    
+    return envelope
+
+
+def find_peak(signal: np.ndarray) -> tuple:
+    """
+    Trova il picco massimo nel segnale (in valore assoluto).
+    
+    Parameters:
+    -----------
+    signal : np.ndarray
+        Segnale time-domain o inviluppo
+    
+    Returns:
+    --------
+    tuple : (peak_index, peak_amplitude)
+        - peak_index: Indice del massimo assoluto
+        - peak_amplitude: Valore assoluto del picco
+    """
+    abs_signal = np.abs(signal)
+    peak_index = int(np.argmax(abs_signal))
+    peak_amplitude = float(abs_signal[peak_index])
+    
+    return peak_index, peak_amplitude
+
+
+def compute_decay_r2(post_peak_window: np.ndarray, fs=200000) -> dict:
+    """
+    Calcola R² del fit logaritmico SAMPLE-BY-SAMPLE sull'envelope post-picco.
+    
+    ⭐ NUOVO METODO: Usa 120 campioni individuali invece di 4 sub-windows aggregate.
+    
+    **Motivazione**: Le oscillazioni della portante del segnale smorzato causano
+    fluttuazioni locali nell'envelope. Con solo 4 punti aggregati, una singola
+    sub-window può essere dominata da un minimo/massimo locale, rendendo il fit
+    instabile. Con 120 campioni sample-by-sample, le oscillazioni si mediano
+    automaticamente nella regressione.
+    
+    Modello fisico: A(t) = A₀·exp(-t/τ)
+    Log-linearizzazione: log(A(t)) = log(A₀) - t/τ
+    
+    Parameters:
+    -----------
+    post_peak_window : np.ndarray
+        Finestra di envelope POST-PICCO (già estratta dal chiamante)
+        Tipicamente 120 campioni (0.6 ms @ 200 ksps)
+    fs : int
+        Sampling rate (default: 200000 Hz)
+    
+    Returns:
+    --------
+    dict : {
+        'r2_log': float,          # R² del fit logaritmico su N campioni
+        'slope': float,           # Pendenza fit (deve essere < 0 per decay)
+        'tau_ms': float,          # Costante di tempo in ms (0.05-1.0 ms atteso)
+        'n_samples': int,         # Numero campioni effettivamente usati
+        'valid': bool,            # True se slope<0 AND r2>0.80 AND tau in range
+        'reason': str,            # Motivo se valid=False
+    }
+    """
+    n_samples = len(post_peak_window)
+    
+    # Guard: campioni insufficienti
+    if n_samples < 20:
+        return {
+            'r2_log': 0.0,
+            'slope': 0.0,
+            'tau_ms': -1.0,
+            'n_samples': n_samples,
+            'valid': False,
+            'reason': 'insufficient_samples (< 20)',
+        }
+    
+    # Guard: sostituisci valori zero/negativi con epsilon piccolo
+    # IMPORTANTE: Usiamo epsilon = 1e-9 per evitare log(0) o log(negativo)
+    # Questo influenza minimamente il fit se i valori zero sono rari
+    epsilon = 1e-9
+    post_peak_safe = np.maximum(post_peak_window, epsilon)
+    
+    # Log-transform
+    log_envelope = np.log(post_peak_safe)
+    
+    # Array indici campioni: n = [0, 1, 2, ..., n_samples-1]
+    n_array = np.arange(n_samples, dtype=float)
+    
+    try:
+        # Fit lineare: log(A[n]) = intercept + slope · n
+        slope, intercept = np.polyfit(n_array, log_envelope, deg=1)
+        
+        # R² su scala logaritmica
+        log_pred = slope * n_array + intercept
+        ss_res = np.sum((log_envelope - log_pred) ** 2)
+        ss_tot = np.sum((log_envelope - np.mean(log_envelope)) ** 2)
+        r2_log = float(1 - (ss_res / ss_tot)) if ss_tot > 0 else 0.0
+        
+        # Estrazione τ
+        # slope = -1/τ_samples  →  τ_samples = -1/slope
+        # τ_ms = τ_samples / (fs/1000) = τ_samples · 1000/fs
+        if slope < 0:
+            tau_samples = -1.0 / slope
+            tau_ms = tau_samples * 1000.0 / fs  # Converti in ms
+        else:
+            tau_ms = -1.0  # Invalido (crescita invece di decay)
+        
+        # Validazione: SOLO slope e R², NON τ (τ anomalo è warning, non esclusione)
+        valid = (
+            slope < 0 and                    # Decadimento (non crescita) - OBBLIGATORIO
+            r2_log > 0.60                    # Fit buono - SOGLIA MINIMA
+        )
+        
+        reason = ""
+        if not valid:
+            if slope >= 0:
+                reason = "slope >= 0 (growth, not decay)"
+            elif r2_log <= 0.60:
+                reason = f"r2_log = {r2_log:.3f} <= 0.60 (poor fit)"
+        
+        # τ warning (NON invalida il click, solo segnalazione)
+        tau_warning = ""
+        if valid and (tau_ms < 0.05 or tau_ms > 1.0):
+            tau_warning = f" | ⚠️ τ={tau_ms:.3f}ms unusual (expected 0.05-1.0)"
+            reason = f"valid but {tau_warning}"
+        
+    except Exception as e:
+        # Fallback in caso di errore numerico
+        slope = 0.0
+        r2_log = 0.0
+        tau_ms = -1.0
+        valid = False
+        reason = f"numerical_error: {str(e)}"
+    
+    return {
+        'r2_log': float(r2_log),
+        'slope': float(slope),
+        'tau_ms': float(tau_ms),
+        'n_samples': int(n_samples),
+        'valid': valid,
+        'reason': reason if not valid else "OK",
+    }
+
+
+def check_decay(envelope: np.ndarray, peak_idx: int, fs=200000, next_frame_signal=None) -> dict:
+    """
+    Verifica se l'inviluppo mostra un decadimento tipico di un click ultrasonico.
+    
+    Click ultrasonici = sinusoidi smorzate con decadimento esponenziale in 0.1-0.6 ms.
+    
+    ⭐ METODO AGGIORNATO (v2.1): Fit logaritmico su 120 campioni sample-by-sample
+    invece di 4 sub-windows aggregate, per robustezza contro oscillazioni della portante.
+    
+    ✅ GESTIONE SPILL: Se il picco cade vicino alla fine del frame e next_frame_signal
+    è fornito, concatena i dati dal frame successivo per analisi completa.
+    
+    Parameters:
+    -----------
+    envelope : np.ndarray
+        Inviluppo di Hilbert del segnale
+    peak_idx : int
+        Indice del picco massimo
+    fs : int
+        Sampling rate (default: 200000 Hz = 200 ksps)
+    next_frame_signal : np.ndarray, optional
+        Segnale del frame successivo per concatenazione in caso di spill
+    
+    Returns:
+    --------
+    dict : {
+        'r_squared_log': float,              # R² del fit logaritmico (CRITERIO PRINCIPALE)
+        'slope_log': float,                  # Pendenza fit log (deve essere < 0)
+        'tau_ms': float,                     # Costante di decadimento in ms
+        'n_samples': int,                    # Numero campioni usati nel fit
+        'decaying': bool,                    # True se slope<0 AND r2>0.80 AND tau valid
+        'near_end': bool,                    # True se picco vicino a fine frame
+        'used_next_frame': bool,             # True se usati dati dal frame successivo
+        'reason': str,                       # Motivo se decaying=False
+        # LEGACY (per compatibilità con codice esistente):
+        'energies': [E1, E2, E3, E4],       # Energie medie 4 sub-windows (reference)
+        'slope': float,                      # Slope fit lineare (reference)
+        'r_squared': float,                  # R² fit lineare (reference)
+        'monotone': bool,                    # E1>E2>E3>E4 strictly
+        'window_samples': int,               # = n_samples (alias)
+    }
+    """
+    # Parametri finestra: 0.6 ms a 200 ksps = 120 samples
+    window_samples = 120
+    
+    # ✅ GESTIONE SPILL: Controlla se serve concatenare frame successivo
+    near_end = (peak_idx > 380)  # 380/512 samples = 74% del frame
+    used_next_frame = False
+    
+    # Finestra post-picco
+    start_idx = peak_idx
+    end_idx = peak_idx + window_samples
+    
+    # ✅ SE PICCO VICINO A FINE FRAME E DATI INSUFFICIENTI
+    if end_idx > len(envelope) and near_end and next_frame_signal is not None:
+        # Calcola quanti samples mancano
+        missing_samples = end_idx - len(envelope)
+        
+        print(f"   🔗 SPILL DETECTED: Peak at sample {peak_idx}/{len(envelope)}, need {missing_samples} samples from next frame")
+        
+        # Calcola envelope del frame successivo
+        try:
+            next_envelope = compute_hilbert_envelope(next_frame_signal)
+            
+            # Concatena: envelope corrente + primi N samples del prossimo
+            extended_envelope = np.concatenate([
+                envelope[start_idx:],
+                next_envelope[:missing_samples]
+            ])
+            
+            decay_window = extended_envelope
+            used_next_frame = True
+            
+            print(f"   ✅ Extended analysis window: {len(envelope[start_idx:])} + {missing_samples} = {len(decay_window)} samples")
+            
+        except Exception as e:
+            print(f"   ⚠️ Failed to extend window: {e}")
+            # Fallback: usa solo dati disponibili
+            decay_window = envelope[start_idx:]
+            used_next_frame = False
+    else:
+        # Caso normale: finestra completamente nel frame corrente
+        end_idx_clipped = min(end_idx, len(envelope))
+        decay_window = envelope[start_idx:end_idx_clipped]
+    
+    # ========================================================================
+    # FIT LOGARITMICO SAMPLE-BY-SAMPLE (120 CAMPIONI)
+    # ========================================================================
+    # IMPORTANTE: compute_decay_r2 riceve la finestra GIÀ ESTRATTA (post-picco)
+    decay_r2_results = compute_decay_r2(decay_window, fs=fs)
+    
+    # ========================================================================
+    # LEGACY: Calcola anche energie sub-windows per compatibilità
+    # ========================================================================
+    actual_samples = len(decay_window)
+    quarter = actual_samples // 4
+    
+    if quarter >= 5:
+        w1 = decay_window[0:quarter]
+        w2 = decay_window[quarter:2*quarter]
+        w3 = decay_window[2*quarter:3*quarter]
+        w4 = decay_window[3*quarter:4*quarter]
+        
+        E1 = float(np.mean(w1 ** 2))
+        E2 = float(np.mean(w2 ** 2))
+        E3 = float(np.mean(w3 ** 2))
+        E4 = float(np.mean(w4 ** 2))
+        
+        energies = [E1, E2, E3, E4]
+        
+        # Fit lineare legacy (solo per reference)
+        x_fit = np.array([0, 1, 2, 3])
+        y_fit = np.array(energies)
+        
+        try:
+            slope_legacy, _ = np.polyfit(x_fit, y_fit, deg=1)
+            y_pred = slope_legacy * x_fit + np.mean(y_fit)
+            ss_res = np.sum((y_fit - y_pred) ** 2)
+            ss_tot = np.sum((y_fit - np.mean(y_fit)) ** 2)
+            r2_legacy = float(1 - (ss_res / ss_tot)) if ss_tot > 0 else 0.0
+        except:
+            slope_legacy = 0.0
+            r2_legacy = 0.0
+        
+        monotone = (E1 > E2 > E3 > E4)
+    else:
+        energies = [0.0, 0.0, 0.0, 0.0]
+        slope_legacy = 0.0
+        r2_legacy = 0.0
+        monotone = False
+    
+    # ========================================================================
+    # RISULTATO FINALE: Usa fit 120-campioni come criterio principale
+    # ========================================================================
+    return {
+        # NUOVO CRITERIO PRINCIPALE (120 campioni)
+        'r_squared_log': decay_r2_results['r2_log'],
+        'slope_log': decay_r2_results['slope'],
+        'tau_ms': decay_r2_results['tau_ms'],
+        'n_samples': decay_r2_results['n_samples'],
+        'decaying': decay_r2_results['valid'],
+        'reason': decay_r2_results['reason'],
+        
+        # GESTIONE SPILL
+        'near_end': near_end,
+        'used_next_frame': used_next_frame,
+        
+        # LEGACY (4 sub-windows per compatibilità)
+        'energies': energies,
+        'slope': slope_legacy,
+        'r_squared': r2_legacy,
+        'monotone': monotone,
+        'window_samples': actual_samples,
+    }
+
 
 class ReplayWindowAudio(ReplayBaseWindow):
     """Finestra replay audio con architettura multi-livello ottimizzata"""
@@ -429,6 +1153,9 @@ class ReplayWindowAudio(ReplayBaseWindow):
         self.setup_menubar()
         self.setup_toolbar()
         
+        # ✅ CONNETTI AZIONI AUDIO-SPECIFIC
+        if hasattr(self, 'actionClickDetector'):
+            self.actionClickDetector.triggered.connect(self.open_click_detector_dialog)
         
         # Applica tema
         self._load_saved_settings()
@@ -447,6 +1174,51 @@ class ReplayWindowAudio(ReplayBaseWindow):
 
         # mostra a tutto schermo mantenendo le grafiche
         self.showMaximized()
+
+    def show_spectral_energy_analysis(self):
+        """Show spectral energy analysis for the current frame (OVERRIDE)"""
+        if self.data_manager.total_frames == 0:
+            QMessageBox.warning(self, "No Data", "No FFT data available for analysis.")
+            return
+        
+        # Get current frame index
+        current_time_sec = self.current_position_ms / 1000.0
+        frame_index = int(current_time_sec / (self.data_manager.frame_duration_ms / 1000))
+        frame_index = max(0, min(frame_index, self.data_manager.total_frames - 1))
+        
+        if frame_index >= len(self.data_manager.fft_data):
+            QMessageBox.warning(self, "Error", f"Invalid frame index: {frame_index}")
+            return
+        
+        # Get FFT magnitudes for current frame
+        fft_magnitudes = self.data_manager.fft_data[frame_index]
+        
+        # Compute energy
+        try:
+            energies = compute_fft_energy(fft_magnitudes)
+        except Exception as e:
+            QMessageBox.critical(self, "Analysis Error", f"Failed to compute energy:\n{str(e)}")
+            print(f"❌ Energy computation error: {e}")
+            import traceback
+            traceback.print_exc()
+            return
+        
+        # Show results in dialog
+        dialog = SpectralEnergyDialog(energies, frame_index=frame_index, parent=self)
+        dialog.exec()
+        
+        # Print to console for reference (includi ratio)
+        ratio_raw = energies['low'] / energies['high'] if energies['high'] > 0 else 0.0
+        print(f"\n📊 Spectral Energy Analysis - Frame {frame_index}")
+        print(f"   Time: {current_time_sec:.3f}s")
+        print(f"   Total (20-80 kHz):  {energies['total']:.6f} V² = {energies['total']*1e6:.3f} mV²")
+        print(f"   Low   (20-40 kHz):  {energies['low']:.6f} V² = {energies['low']*1e6:.3f} mV²")
+        print(f"   High  (40-80 kHz):  {energies['high']:.6f} V² = {energies['high']*1e6:.3f} mV²")
+        print(f"   Ratio R (E_low/E_high): {ratio_raw:.3f}")
+        print(f"   Band 1 (20-30 kHz): {energies['b1']:.6f} V² = {energies['b1']*1e6:.3f} mV²")
+        print(f"   Band 2 (30-40 kHz): {energies['b2']:.6f} V² = {energies['b2']*1e6:.3f} mV²")
+        print(f"   Band 3 (40-60 kHz): {energies['b3']:.6f} V² = {energies['b3']*1e6:.3f} mV²")
+        print(f"   Band 4 (60-80 kHz): {energies['b4']:.6f} V² = {energies['b4']*1e6:.3f} mV²")
 
     # === PLAYBACK CONTROL METHODS ===
     
@@ -906,7 +1678,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
         
         self.plot_widget_fft = BasePlotWidget(
             x_label="Frequency", y_label="Amplitude",
-            x_range=(20000, 80000), y_range=(0, 0.125),
+            x_range=(20000, 80000), y_range=(0, 0.02),
             x_min=19000, x_max=81000, y_min=0, y_max=1.7,
             unit_x="Hz", unit_y="V", parent=self
         )
@@ -934,7 +1706,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
         
         self.plot_widget_time = BasePlotWidget(
             x_label="Time", y_label="Average Amplitude per FFT",
-            x_range=(0, 20), y_range=(0, 0.03),
+            x_range=(0, 20), y_range=(0, 0.003),
             x_min=0, x_max=None, y_min=0, y_max=3.3,
             unit_x="s", unit_y="V", parent=self
         )
@@ -1569,3 +2341,39 @@ class ReplayWindowAudio(ReplayBaseWindow):
         
         # Esegui export
         return exporter.execute_trim_export(params)
+    
+    def open_click_detector_dialog(self):
+        """
+        Apre il dialog per l'algoritmo di rilevamento automatico dei click.
+        
+        Pipeline a 4 stadi:
+        1. Energy threshold (μ + Nσ)
+        2. Spectral ratio check (broadband test)
+        3. Decay analysis (Hilbert envelope)
+        4. Deduplication (frame consecutivi)
+        """
+        if self.data_manager.total_frames == 0:
+            QMessageBox.warning(self, "No Data", "No audio data loaded.\nPlease open a .paudio file first.")
+            return
+        
+        # Verifica che le fasi siano disponibili (necessarie per iFFT)
+        file_version = self.data_manager.header_info.get('version', 0)
+        has_phases = (file_version >= 3.0) and hasattr(self.data_manager, 'phase_data') and len(self.data_manager.phase_data) > 0
+        
+        if not has_phases:
+            QMessageBox.warning(
+                self, 
+                "Phase Data Required", 
+                "Automatic click detection requires phase information for iFFT reconstruction.\n\n"
+                "File version must be ≥ 3.0 with phase data included."
+            )
+            return
+        
+        # Importa dialog
+        from components.click_detector_dialog import ClickDetectorDialog
+        
+        # Crea e mostra dialog
+        dialog = ClickDetectorDialog(self.data_manager, parent=self)
+        dialog.exec()
+        
+        print("✅ Click Detector Dialog closed")

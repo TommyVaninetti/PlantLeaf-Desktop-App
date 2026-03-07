@@ -1,5 +1,5 @@
-from PySide6.QtWidgets import QMainWindow, QMenu, QPushButton, QMessageBox, QSlider, QDoubleSpinBox, QLabel, QSizePolicy, QWidget, QHBoxLayout, QProgressDialog, QDialog, QVBoxLayout, QHBoxLayout, QMenuBar, QComboBox, QLayout, QFrame
-from PySide6.QtGui import QIcon, QAction
+from PySide6.QtWidgets import QMainWindow, QMenu, QPushButton, QMessageBox, QSlider, QDoubleSpinBox, QLabel, QSizePolicy, QWidget, QHBoxLayout, QProgressDialog, QDialog, QVBoxLayout, QHBoxLayout, QMenuBar, QComboBox, QLayout, QFrame, QTableWidget, QTableWidgetItem, QHeaderView
+from PySide6.QtGui import QIcon, QAction, QFont
 from PySide6.QtCore import Qt, QSize, Signal
 
 
@@ -160,6 +160,19 @@ class ReplayBaseWindow(FileHandlerMixin, QMainWindow):
             analysis_menu.addSeparator()
             self.actionNormalizeFFT = QAction("Normalize FFT window", self)
             analysis_menu.addAction(self.actionNormalizeFFT)
+            self.actionSpectralEnergy = QAction("Spectral Energy Analysis", self)
+            self.actionSpectralEnergy.setToolTip("Analyze energy distribution across frequency bands (20-80 kHz)")
+            analysis_menu.addAction(self.actionSpectralEnergy)
+            
+            # ✅ CLICK DETECTOR
+            analysis_menu.addSeparator()
+            self.actionClickDetector = QAction("🔍 Automatic Click Detector...", self)
+            self.actionClickDetector.setShortcut("Ctrl+D")
+            self.actionClickDetector.setToolTip(
+                "Run automatic ultrasonic click detection algorithm\n"
+                "4-stage pipeline: Energy → Spectral → Decay → Deduplication"
+            )
+            analysis_menu.addAction(self.actionClickDetector)
 
         self.actionMath = QAction("Select Region for Analysis", self)
         self.actionMath.setToolTip("Select a region in the plot to perform mathematical analysis")
@@ -258,6 +271,7 @@ class ReplayBaseWindow(FileHandlerMixin, QMainWindow):
         #SOLO AUDIO
         if hasattr(self, 'plot_widget_fft'):
             self.actionNormalizeFFT.triggered.connect(self.normalize_fft_window)
+            self.actionSpectralEnergy.triggered.connect(self.show_spectral_energy_analysis)
 
 
     ###### AZIONI MENUBAR ######
@@ -1174,7 +1188,17 @@ class ReplayBaseWindow(FileHandlerMixin, QMainWindow):
             f"Export not yet implemented for this file type.\n"
             f"Parameters: {params}"
         )
-
+    
+    def show_spectral_energy_analysis(self):
+        """
+        Show spectral energy analysis for the current frame (AUDIO ONLY).
+        This method should be overridden in audio subclass.
+        """
+        QMessageBox.warning(
+            self, 
+            "Not Available", 
+            "Spectral energy analysis is only available for audio files."
+        )
 
 
 # Personalized LinearRegionItem with double-click signal
@@ -4354,3 +4378,426 @@ class MathOperations(QDialog, Ui_QDialogMath):
 
         finally:
             self._updating_ui = False
+
+
+# ============================================================================
+# SPECTRAL ENERGY ANALYSIS FUNCTIONS
+# ============================================================================
+
+def get_bin_indices(f_start_khz, f_end_khz, fs=200000, n_fft=512, array_offset_khz=20):
+    """
+    Convert frequency range (in kHz) to bin indices in the 154-bin array.
+    
+    Parameters:
+    -----------
+    f_start_khz : float
+        Start frequency in kHz (e.g., 20 for 20 kHz)
+    f_end_khz : float
+        End frequency in kHz (e.g., 40 for 40 kHz)
+    fs : int
+        Sampling rate in Hz (default: 200000)
+    n_fft : int
+        FFT size (default: 512)
+    array_offset_khz : float
+        Frequency of bin 0 in the array (default: 20 kHz)
+    
+    Returns:
+    --------
+    tuple : (start_idx, end_idx)
+        Indices for slicing the 154-bin array (inclusive range)
+    """
+    # Bin spacing in Hz
+    bin_spacing_hz = fs / n_fft  # 390.625 Hz
+    
+    # Convert kHz to Hz
+    f_start_hz = f_start_khz * 1000
+    f_end_hz = f_end_khz * 1000
+    array_offset_hz = array_offset_khz * 1000
+    
+    # Calculate indices relative to array start (20 kHz)
+    start_idx = int(np.round((f_start_hz - array_offset_hz) / bin_spacing_hz))
+    end_idx = int(np.round((f_end_hz - array_offset_hz) / bin_spacing_hz))
+    
+    # Clamp to valid range [0, 153]
+    start_idx = max(0, start_idx)
+    end_idx = min(153, end_idx)
+    
+    return start_idx, end_idx
+
+
+def compute_fft_energy(bins):
+    """
+    Compute spectral energy over multiple frequency sub-bands.
+    
+    Energy is calculated as E = mean(magnitude²) for each band,
+    representing average power in that frequency range.
+    
+    Parameters:
+    -----------
+    bins : np.ndarray
+        Array of 154 FFT magnitude values covering 20-80 kHz
+    
+    Returns:
+    --------
+    dict : Energy values for each sub-band with keys:
+        - 'total': 20-80 kHz (all 154 bins)
+        - 'low': 20-40 kHz
+        - 'high': 40-80 kHz
+        - 'b1': 20-30 kHz
+        - 'b2': 30-40 kHz
+        - 'b3': 40-60 kHz
+        - 'b4': 60-80 kHz
+    """
+    if len(bins) != 154:
+        raise ValueError(f"Expected 154 bins, got {len(bins)}")
+    
+    # Define sub-bands (in kHz)
+    bands = {
+        'total': (20, 80),
+        'low': (20, 40),
+        'high': (40, 80),
+        'b1': (20, 30),
+        'b2': (30, 40),
+        'b3': (40, 60),
+        'b4': (60, 80),
+    }
+    
+    # Compute energy for each band
+    energies = {}
+    bins_squared = bins ** 2
+    
+    for band_name, (f_start, f_end) in bands.items():
+        start_idx, end_idx = get_bin_indices(f_start, f_end)
+        # Include end_idx (Python slicing is exclusive at end)
+        band_energy = np.mean(bins_squared[start_idx:end_idx + 1])
+        energies[band_name] = band_energy
+    
+    return energies
+
+
+class SpectralEnergyDialog(QDialog):
+    """Finestra per mostrare l'analisi dell'energia spettrale di un frame FFT"""
+    def __init__(self, energies, frame_index=None, parent=None):
+        super().__init__(parent)
+        
+        # Salva riferimenti per normalizzazione
+        self.parent = parent
+        self.frame_index = frame_index
+        self.energies_raw = energies
+        self.energies_normalized = None
+        self.is_normalized = False
+        
+        title = "Spectral Energy Analysis"
+        if frame_index is not None:
+            title += f" - Frame {frame_index}"
+        self.setWindowTitle(title)
+        self.setMinimumSize(500, 400)
+        
+        layout = QVBoxLayout(self)
+        
+        # Title label
+        self.title_label = QLabel("<h2>FFT Spectral Energy Analysis</h2>")
+        self.title_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.title_label)
+        
+        # Info label
+        self.info_label = QLabel(
+            "Energy calculated as <b>E = mean(magnitude²)</b> over each frequency band.<br>"
+            "Represents average power in that frequency range."
+        )
+        self.info_label.setAlignment(Qt.AlignCenter)
+        self.info_label.setStyleSheet("color: #888; font-size: 10pt; margin: 10px;")
+        layout.addWidget(self.info_label)
+        
+        # ✅ CALCOLA RATIO R (broadband click detection)
+        self.ratio_raw = self._compute_energy_ratio(energies)
+        self.ratio_normalized = None  # Verrà calcolato on-demand
+        
+        # Ratio info label
+        ratio_color = self._get_ratio_color(self.ratio_raw)
+        ratio_status = self._get_ratio_status(self.ratio_raw)
+        self.ratio_label = QLabel(
+            f"<b>Energy Ratio R (E_low/E_high):</b> <span style='color:{ratio_color}; font-size:14pt;'>{self.ratio_raw:.3f}</span> — {ratio_status}"
+        )
+        self.ratio_label.setAlignment(Qt.AlignCenter)
+        self.ratio_label.setStyleSheet("margin: 5px;")
+        layout.addWidget(self.ratio_label)
+        
+        # Create table for results
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Band", "Frequency Range", "Energy (V²)", "Energy (mV²)"])
+
+        # Band definitions with pretty names
+        self.band_info = [
+            ('total', 'Total', '20-80 kHz'),
+            ('low', 'Low', '20-40 kHz'),
+            ('high', 'High', '40-80 kHz'),
+            ('b1', 'Band 1', '20-30 kHz'),
+            ('b2', 'Band 2', '30-40 kHz'),
+            ('b3', 'Band 3', '40-60 kHz'),
+            ('b4', 'Band 4', '60-80 kHz'),
+        ]
+        
+        self._populate_table(energies)
+        
+        # Style table
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        
+        # ✅ RIMUOVE I NUMERI DI RIGA
+        self.table.verticalHeader().setVisible(False)
+        
+        layout.addWidget(self.table)
+        
+        # Buttons layout
+        button_layout = QHBoxLayout()
+        
+        # Normalize button
+        self.normalize_button = QPushButton("Apply 50% Normalization")
+        self.normalize_button.clicked.connect(self._toggle_normalization)
+        button_layout.addWidget(self.normalize_button)
+        
+        # Close button
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.close)
+        button_layout.addWidget(close_button)
+        
+        layout.addLayout(button_layout)
+        
+        # Apply theme if available
+        if parent and hasattr(parent, 'theme_manager'):
+            saved_theme = parent.theme_manager.load_saved_theme()
+            parent.theme_manager.apply_theme(self, saved_theme)
+            
+            # Apply font manager fonts
+            if hasattr(parent, 'font_manager'):
+                parent.font_manager.apply_fonts_to_widgets(self)
+
+            # Se tema contiene light, imposta sfondo bianco con setStyleSheet
+            current_theme = getattr(parent.theme_manager, 'current_theme', 'dark.css')
+            is_light_theme = 'light' in current_theme.lower()
+            if is_light_theme:
+                self.setStyleSheet("background-color: white;")
+
+        # Center on parent
+        if parent:
+            parent_rect = parent.geometry()
+            self.resize(parent_rect.width() * 0.5, parent_rect.height() * 0.6)
+            self.move(
+                parent_rect.x() + (parent_rect.width() - self.width()) // 2,
+                parent_rect.y() + (parent_rect.height() - self.height()) // 2
+            )
+    
+    def _compute_energy_ratio(self, energies):
+        """
+        Calcola il ratio R = E_low / E_high per rilevare click broadband.
+        
+        Per un click acustico vero (broadband):
+        - R ≈ 0.5–3.0 (energia distribuita su tutto lo spettro)
+        
+        Per artefatti narrowband (es. ronzio 40 kHz):
+        - R >> 1 (energia concentrata in low) o R << 1 (energia concentrata in high)
+        
+        Returns:
+            float: Ratio R, o 0.0 se E_high è zero
+        """
+        e_low = energies.get('low', 0.0)
+        e_high = energies.get('high', 0.0)
+        
+        if e_high == 0.0:
+            return 0.0  # Evita divisione per zero
+        
+        ratio = e_low / e_high
+        return ratio
+    
+    def _get_ratio_color(self, ratio, is_normalized=False):
+        """
+        Ritorna il colore per visualizzare R in base alla validità.
+        
+        Soglie diverse per raw vs normalized:
+        - RAW: [0.5, 3.0] (microfono bias verso low freq)
+        - NORMALIZED: [0.3, 2.0] (correzione applicata, più accurato)
+        """
+        if is_normalized:
+            # Soglie per R_normalized (più strict in alto, più permissive in basso)
+            if 0.3 <= ratio <= 2.0:
+                return "green"  # Click broadband VALIDO
+            elif 0.2 <= ratio < 0.3 or 2.0 < ratio <= 2.5:
+                return "orange"  # Borderline
+            else:
+                return "red"  # Artifact
+        else:
+            # Soglie per R_raw (originali, più permissive)
+            if 0.5 <= ratio <= 3.0:
+                return "green"  # Click broadband VALIDO
+            elif 0.3 <= ratio < 0.5 or 3.0 < ratio <= 5.0:
+                return "orange"  # Borderline
+            else:
+                return "red"  # Artifact
+    
+    def _get_ratio_status(self, ratio, is_normalized=False):
+        """
+        Ritorna lo stato testuale per R.
+        
+        Soglie adattive basate su normalizzazione applicata.
+        """
+        if is_normalized:
+            # Soglie per R_normalized
+            if 0.3 <= ratio <= 2.0:
+                return "✅ Broadband Click (Valid)"
+            elif 0.2 <= ratio < 0.3 or 2.0 < ratio <= 2.5:
+                return "⚠️ Borderline (Check manually)"
+            elif ratio > 2.5:
+                return "❌ Low-frequency artifact"
+            elif ratio < 0.2:
+                return "❌ High-frequency artifact"
+            else:
+                return "⚠️ Unknown (E_high = 0?)"
+        else:
+            # Soglie per R_raw
+            if 0.5 <= ratio <= 3.0:
+                return "✅ Broadband Click (Valid)"
+            elif 0.3 <= ratio < 0.5 or 3.0 < ratio <= 5.0:
+                return "⚠️ Borderline (Check manually)"
+            elif ratio > 5.0:
+                return "❌ Low-frequency artifact"
+            elif ratio < 0.3:
+                return "❌ High-frequency artifact"
+            else:
+                return "⚠️ Unknown (E_high = 0?)"
+    
+    def _populate_table(self, energies):
+        """Popola la tabella con i valori di energia"""
+        self.table.setRowCount(len(self.band_info))
+        
+        for row, (key, name, freq_range) in enumerate(self.band_info):
+            energy_v2 = energies[key]
+            energy_mv2 = energy_v2 * 1e6  # Convert V² to mV²
+            
+            # Band name
+            name_item = QTableWidgetItem(name)
+            name_item.setFont(QFont("Arial", 11, QFont.Bold))
+            self.table.setItem(row, 0, name_item)
+            
+            # Frequency range
+            self.table.setItem(row, 1, QTableWidgetItem(freq_range))
+            
+            # Energy in V²
+            self.table.setItem(row, 2, QTableWidgetItem(f"{energy_v2:.6f}"))
+            
+            # Energy in mV²
+            self.table.setItem(row, 3, QTableWidgetItem(f"{energy_mv2:.3f}"))
+    
+    def _toggle_normalization(self):
+        """Toggle tra energia raw e normalizzata (50%)"""
+        if not self.is_normalized:
+            # APPLICA NORMALIZZAZIONE
+            self._compute_normalized_energy()
+            if self.energies_normalized is not None:
+                self.is_normalized = True
+                self._update_display()
+        else:
+            # TORNA A RAW
+            self.is_normalized = False
+            self._update_display()
+    
+    def _compute_normalized_energy(self):
+        """Calcola energia con correzione 50% dalla FFT normalizzata"""
+        if not self.parent or not hasattr(self.parent, 'data_manager'):
+            QMessageBox.warning(self, "Error", "Cannot access parent data manager.")
+            return
+        
+        if self.frame_index is None or self.frame_index >= len(self.parent.data_manager.fft_data):
+            QMessageBox.warning(self, "Error", "Invalid frame index.")
+            return
+        
+        print("🔧 Computing normalized spectral energy (50% correction)...")
+        
+        # === 1. DATI DAL DATASHEET (SPU0410LR5H-QB) ===
+        datasheet_freq_khz = np.array([20, 25, 30, 40, 50, 60, 70, 80])
+        datasheet_response_db = np.array([8.0, 10.5, 6.0, -2.0, -6.0, -7.0, -6.0, -4.0])
+        datasheet_freq_hz = datasheet_freq_khz * 1000
+        
+        # === 2. RECUPERA FFT ORIGINALE DEL FRAME ===
+        fft_magnitudes = self.parent.data_manager.fft_data[self.frame_index]
+        freq_axis = self.parent.data_manager.frequency_axis
+        
+        # === 3. CALCOLA CORREZIONE 50% ===
+        valid_mask = (freq_axis >= 20000) & (freq_axis <= 80000)
+        freq_range = freq_axis[valid_mask]
+        
+        mic_response_db = np.interp(freq_range, datasheet_freq_hz, datasheet_response_db)
+        correction_gain_50 = 10 ** (-mic_response_db * 0.5 / 20.0)
+        
+        # === 4. APPLICA CORREZIONE ===
+        normalized_fft = fft_magnitudes.copy()
+        normalized_fft[valid_mask] = fft_magnitudes[valid_mask] * correction_gain_50
+        
+        # === 5. RICALCOLA ENERGIE E RATIO ===
+        try:
+            self.energies_normalized = compute_fft_energy(normalized_fft)
+            self.ratio_normalized = self._compute_energy_ratio(self.energies_normalized)
+            
+            # Statistiche
+            gain_stats = {
+                'max_gain_db': 20 * np.log10(np.max(correction_gain_50)),
+                'min_gain_db': 20 * np.log10(np.min(correction_gain_50)),
+            }
+            
+            print(f"✅ Normalized energies computed:")
+            print(f"   Gain range: {gain_stats['min_gain_db']:.2f} to {gain_stats['max_gain_db']:.2f} dB")
+            print(f"   Total energy: {self.energies_normalized['total']:.6f} V² (raw: {self.energies_raw['total']:.6f})")
+            print(f"   Ratio R: {self.ratio_normalized:.3f} (raw: {self.ratio_raw:.3f})")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Calculation Error", 
+                               f"Failed to compute normalized energies:\n{str(e)}")
+            print(f"❌ Error: {e}")
+    
+    def _update_display(self):
+        """Aggiorna display con energia corretta"""
+        if self.is_normalized and self.energies_normalized is not None:
+            # Mostra energia normalizzata
+            self._populate_table(self.energies_normalized)
+            
+            # Aggiorna ratio label con valore normalizzato (SOGLIE ADAPTIVE)
+            ratio_color = self._get_ratio_color(self.ratio_normalized, is_normalized=True)
+            ratio_status = self._get_ratio_status(self.ratio_normalized, is_normalized=True)
+            self.ratio_label.setText(
+                f"<b>Energy Ratio R (E_low/E_high) - NORMALIZED:</b> <span style='color:{ratio_color}; font-size:14pt;'>{self.ratio_normalized:.3f}</span> — {ratio_status}<br>"
+                f"<span style='color:#888; font-size:9pt;'>(Raw R = {self.ratio_raw:.3f} | Valid range: 0.3-2.0 for normalized)</span>"
+            )
+            
+            # Aggiorna titolo e info
+            self.info_label.setText(
+                "Energy calculated with <b>50% frequency response correction</b>.<br>"
+                "Estimated error: <b>±2.9 dB</b> (95% confidence)."
+            )
+            self.info_label.setStyleSheet("color: red; font-weight: bold; font-size: 10pt; margin: 10px;")
+            
+            self.normalize_button.setText("Show Raw Energy")
+            
+        else:
+            # Mostra energia raw
+            self._populate_table(self.energies_raw)
+            
+            # Aggiorna ratio label con valore raw (SOGLIE ORIGINALI)
+            ratio_color = self._get_ratio_color(self.ratio_raw, is_normalized=False)
+            ratio_status = self._get_ratio_status(self.ratio_raw, is_normalized=False)
+            self.ratio_label.setText(
+                f"<b>Energy Ratio R (E_low/E_high):</b> <span style='color:{ratio_color}; font-size:14pt;'>{self.ratio_raw:.3f}</span> — {ratio_status}<br>"
+                f"<span style='color:#888; font-size:9pt;'>(Valid range: 0.5-3.0 for raw)</span>"
+            )
+            
+            # Ripristina titolo e info
+            self.title_label.setText("<h2>FFT Spectral Energy Analysis</h2>")
+            self.info_label.setText(
+                "Energy calculated as <b>E = mean(magnitude²)</b> over each frequency band.<br>"
+                "Represents average power in that frequency range."
+            )
+            self.info_label.setStyleSheet("color: #888; font-size: 10pt; margin: 10px;")
+            
+            self.normalize_button.setText("Apply 50% Normalization")
