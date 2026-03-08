@@ -460,6 +460,8 @@ class ReplayBaseWindow(FileHandlerMixin, QMainWindow):
             toolbar.addAction(self.actionIFFTGraph)
             self.actionIFFTGraph.triggered.connect(self.show_ifft_window)
             self.actionIFFTGraph.setToolTip("Open iFFT graph")
+            #scorciatoia da tastiera
+            self.actionIFFTGraph.setShortcut("Ctrl+I")
 
         toolbar.addSeparator()
 

@@ -353,9 +353,28 @@ class IFFTWindow(QDialog):
         full_spectrum_mag = np.zeros(num_bins_full, dtype=np.float32)
         full_spectrum_phase = np.zeros(num_bins_full, dtype=np.int8)
         
-        # Inserisci la parte normalizzata 20-80kHz nelle posizioni corrette
+        # ✅ FIX ARTEFATTI: Applica Tukey window per transizioni graduali
         actual_bins_to_copy = min(len(normalized_fft_20_80khz), num_received_bins, len(fft_phases_int8))
-        full_spectrum_mag[bin_start:bin_start + actual_bins_to_copy] = normalized_fft_20_80khz[:actual_bins_to_copy]
+        taper_bins = max(5, actual_bins_to_copy // 10)
+        
+        # Crea finestra Tukey
+        window = np.ones(actual_bins_to_copy)
+        
+        # Left taper (cosine fade-in)
+        for i in range(taper_bins):
+            alpha = i / taper_bins
+            window[i] = 0.5 * (1 - np.cos(np.pi * alpha))
+        
+        # Right taper (cosine fade-out)
+        for i in range(taper_bins):
+            alpha = i / taper_bins
+            window[-(i+1)] = 0.5 * (1 - np.cos(np.pi * alpha))
+        
+        # Applica windowing alla parte normalizzata
+        normalized_fft_windowed = normalized_fft_20_80khz[:actual_bins_to_copy] * window
+        
+        # Inserisci la parte normalizzata WINDOWED 20-80kHz nelle posizioni corrette
+        full_spectrum_mag[bin_start:bin_start + actual_bins_to_copy] = normalized_fft_windowed
         full_spectrum_phase[bin_start:bin_start + actual_bins_to_copy] = fft_phases_int8[:actual_bins_to_copy]
         
         # === 7. CONVERTI FASI E CREA SPETTRO COMPLESSO ===
@@ -646,9 +665,28 @@ class IFFTWindow(QDialog):
             valid_mask = (freq_axis >= 20000) & (freq_axis <= 80000)
             fft_corrected = fft_magnitudes[valid_mask]
         
-        # Inserisci magnitude
+        # ✅ FIX ARTEFATTI: Applica Tukey window per transizioni graduali (identico al metodo principale)
         actual_bins = min(len(fft_corrected), bin_end - bin_start + 1)
-        full_spectrum_mag[bin_start:bin_start + actual_bins] = fft_corrected[:actual_bins]
+        taper_bins = max(5, actual_bins // 10)
+        
+        # Crea finestra Tukey
+        window = np.ones(actual_bins)
+        
+        # Left taper
+        for i in range(taper_bins):
+            alpha = i / taper_bins
+            window[i] = 0.5 * (1 - np.cos(np.pi * alpha))
+        
+        # Right taper
+        for i in range(taper_bins):
+            alpha = i / taper_bins
+            window[-(i+1)] = 0.5 * (1 - np.cos(np.pi * alpha))
+        
+        # Applica windowing
+        fft_corrected_windowed = fft_corrected[:actual_bins] * window
+        
+        # Inserisci magnitude WINDOWED
+        full_spectrum_mag[bin_start:bin_start + actual_bins] = fft_corrected_windowed
         
         # Inserisci fasi (se disponibili)
         if len(dm.phase_data) > frame_index:
@@ -1181,9 +1219,8 @@ class ReplayWindowAudio(ReplayBaseWindow):
             QMessageBox.warning(self, "No Data", "No FFT data available for analysis.")
             return
         
-        # Get current frame index
-        current_time_sec = self.current_position_ms / 1000.0
-        frame_index = int(current_time_sec / (self.data_manager.frame_duration_ms / 1000))
+        # Get current frame index (FIX: use round() to match step_frame behavior)
+        frame_index = int(round(self.current_position_ms / self.data_manager.frame_duration_ms))
         frame_index = max(0, min(frame_index, self.data_manager.total_frames - 1))
         
         if frame_index >= len(self.data_manager.fft_data):
@@ -1209,8 +1246,9 @@ class ReplayWindowAudio(ReplayBaseWindow):
         
         # Print to console for reference (includi ratio)
         ratio_raw = energies['low'] / energies['high'] if energies['high'] > 0 else 0.0
+        frame_time_sec = frame_index * self.data_manager.frame_duration_ms / 1000.0
         print(f"\n📊 Spectral Energy Analysis - Frame {frame_index}")
-        print(f"   Time: {current_time_sec:.3f}s")
+        print(f"   Time: {frame_time_sec:.3f}s")
         print(f"   Total (20-80 kHz):  {energies['total']:.6f} V² = {energies['total']*1e6:.3f} mV²")
         print(f"   Low   (20-40 kHz):  {energies['low']:.6f} V² = {energies['low']*1e6:.3f} mV²")
         print(f"   High  (40-80 kHz):  {energies['high']:.6f} V² = {energies['high']*1e6:.3f} mV²")
@@ -1363,8 +1401,8 @@ class ReplayWindowAudio(ReplayBaseWindow):
         
         current_time_sec = self.current_position_ms / 1000.0
         
-        # UPDATE FFT PLOT
-        frame_index = int(current_time_sec / (self.data_manager.frame_duration_ms / 1000))
+        # UPDATE FFT PLOT (FIX: use round() for consistent frame index calculation)
+        frame_index = int(round(self.current_position_ms / self.data_manager.frame_duration_ms))
         frame_index = max(0, min(frame_index, self.data_manager.total_frames - 1))
         
         if frame_index < len(self.data_manager.fft_data):
@@ -1903,9 +1941,8 @@ class ReplayWindowAudio(ReplayBaseWindow):
             QMessageBox.warning(self, "No Phase Data", "iFFT requires phase information (file version >= 3.0).")
             return
         
-        # ✅ CALCOLA FRAME CORRENTE
-        current_time_sec = self.current_position_ms / 1000.0
-        current_frame_index = int(current_time_sec / (self.data_manager.frame_duration_ms / 1000.0))
+        # ✅ CALCOLA FRAME CORRENTE (FIX: use round() for consistent frame index)
+        current_frame_index = int(round(self.current_position_ms / self.data_manager.frame_duration_ms))
         current_frame_index = max(0, min(current_frame_index, self.data_manager.total_frames - 1))
         
         # ✅ ESTRAI DATI FFT (154 bins, 20-80kHz)
@@ -1936,8 +1973,28 @@ class ReplayWindowAudio(ReplayBaseWindow):
         full_spectrum_mag = np.zeros(num_bins_full, dtype=np.float32)
         full_spectrum_phase = np.zeros(num_bins_full, dtype=np.int8)
         
-        # Inserisci i dati 20-80kHz nelle posizioni corrette
-        full_spectrum_mag[bin_start:bin_start + num_received_bins] = fft_magnitudes
+        # ✅ FIX ARTEFATTI: Applica Tukey window per transizioni graduali ai bordi
+        # Taper length: 10% del range (circa 15 bins per lato)
+        taper_bins = max(5, num_received_bins // 10)
+        
+        # Crea finestra Tukey per smooth edges
+        window = np.ones(num_received_bins)
+        
+        # Left taper (cosine fade-in)
+        for i in range(taper_bins):
+            alpha = i / taper_bins
+            window[i] = 0.5 * (1 - np.cos(np.pi * alpha))
+        
+        # Right taper (cosine fade-out)
+        for i in range(taper_bins):
+            alpha = i / taper_bins
+            window[-(i+1)] = 0.5 * (1 - np.cos(np.pi * alpha))
+        
+        # Applica windowing alle magnitude (smooth transitions)
+        fft_magnitudes_windowed = fft_magnitudes * window
+        
+        # Inserisci i dati 20-80kHz WINDOWED nelle posizioni corrette
+        full_spectrum_mag[bin_start:bin_start + num_received_bins] = fft_magnitudes_windowed
         full_spectrum_phase[bin_start:bin_start + num_received_bins] = fft_phases_int8
         
         # ✅ CONVERTI FASI E CREA SPETTRO COMPLESSO
@@ -1970,6 +2027,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
         print(f"   Samples: {num_samples} (expected: 512)")
         print(f"   Bins used: {bin_start}-{bin_start+num_received_bins} ({num_received_bins} bins)")
         print(f"   Frequency range: {bin_start*bin_freq:.0f} Hz - {(bin_start+num_received_bins)*bin_freq:.0f} Hz")
+        print(f"   ✅ Tukey window applied ({taper_bins} bins taper per side) to reduce edge artifacts")
         
         if abs(actual_duration_ms - 2.56) > 0.1:
             print(f"⚠️ WARNING: Duration mismatch! Got {actual_duration_ms:.2f}ms, expected 2.56ms")
@@ -2204,9 +2262,8 @@ class ReplayWindowAudio(ReplayBaseWindow):
         
         datasheet_freq_hz = datasheet_freq_khz * 1000
         
-        # === 2. OTTIENI SPETTRO FFT CORRENTE ===
-        current_time_sec = self.current_position_ms / 1000.0
-        frame_index = int(current_time_sec / (self.data_manager.frame_duration_ms / 1000))
+        # === 2. OTTIENI SPETTRO FFT CORRENTE (FIX: use round() for consistent frame index) ===
+        frame_index = int(round(self.current_position_ms / self.data_manager.frame_duration_ms))
         frame_index = max(0, min(frame_index, self.data_manager.total_frames - 1))
         
         if frame_index >= len(self.data_manager.fft_data):

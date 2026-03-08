@@ -446,20 +446,23 @@ class ClickDetectorDialog(QDialog):
                 'classification': classification
             })
         
-        # ✅ STATISTICHE DETTAGLIATE
-        num_identified = sum(1 for c in candidates_stage3 if "IDENTIFIED" in c['classification'])
-        num_possible = sum(1 for c in candidates_stage3 if "POSSIBLE" in c['classification'])
-        
-        print(f"✅ Stage 3 complete: {len(candidates_stage3)}/{len(candidates_stage2)} frames passed ({len(candidates_stage3)/len(candidates_stage2)*100:.1f}%)")
-        print(f"   📊 Classification breakdown:")
-        print(f"      ✅ IDENTIFIED: {num_identified} ({num_identified/len(candidates_stage3)*100:.1f}% of passed)")
-        print(f"      ⚠️ POSSIBLE: {num_possible} ({num_possible/len(candidates_stage3)*100:.1f}% of passed)")
-
+        # ✅ STATISTICHE DETTAGLIATE (con guard per lista vuota)
+        stage3_pct = (len(candidates_stage3)/len(candidates_stage2)*100) if len(candidates_stage2) > 0 else 0.0
+        print(f"✅ Stage 3 complete: {len(candidates_stage3)}/{len(candidates_stage2)} frames passed ({stage3_pct:.1f}%)")
         
         if len(candidates_stage3) == 0:
             progress.close()
             QMessageBox.information(self, "No Clicks Found", "No frames passed the decay analysis test.\nAll candidates lack exponential decay signature.")
             return
+        
+        # Calcola breakdown SOLO se ci sono candidati
+        num_identified = sum(1 for c in candidates_stage3 if "IDENTIFIED" in c['classification'])
+        num_possible = sum(1 for c in candidates_stage3 if "POSSIBLE" in c['classification'])
+        
+        print(f"   📊 Classification breakdown:")
+        print(f"      ✅ IDENTIFIED: {num_identified} ({num_identified/len(candidates_stage3)*100:.1f}% of passed)")
+        print(f"      ⚠️ POSSIBLE: {num_possible} ({num_possible/len(candidates_stage3)*100:.1f}% of passed)")
+
         
         # ========================================================================
         # STAGE 4: DEDUPLICATION
