@@ -336,54 +336,14 @@ class ReplayBaseWindow(FileHandlerMixin, QMainWindow):
     
     def about_action(self):
         """Azione per mostrare informazioni sull'applicazione"""
-        msg = QMessageBox(self)
-        msg.setIcon(QMessageBox.Information)
-        msg.setWindowTitle("About")
-        msg.setText(
-            "Here is some information about the application."
-        )
-        msg.setStyleSheet("""
-            QMessageBox {
-                background-color: #fafafa;
-                color: #222;
-            }
-            QLabel {
-                color: #222;
-            }
-            QPushButton {
-                background-color: #e0e0e0;
-                color: #222;
-                border-radius: 6px;
-                padding: 6px 12px;
-            }
-        """)
-        msg.exec()
+        #stessa di documentazione per ora
+        self.documentation_action()
     
     def documentation_action(self):
         """Azione per mostrare la documentazione"""
-        msg = QMessageBox(self)
-        msg.setIcon(QMessageBox.Information)
-        msg.setWindowTitle("Documentazione")
-        msg.setText(
-            "The documentation is not available yet. Please check back later."
-        )
-        msg.setStyleSheet("""
-            QMessageBox {
-                background-color: #fafafa;
-                color: #222;
-            }
-            QLabel {
-                color: #222;
-            }
-            QPushButton {
-                background-color: #e0e0e0;
-                color: #222;
-                border-radius: 6px;
-                padding: 6px 12px;
-            }
-        """)
-        msg.exec()
-    
+        import webbrowser
+        webbrowser.open(AppConfig.DOCUMENTATION_URL)
+
     def version_action(self):
         """Azione per mostrare la versione dell'applicazione"""
         msg = QMessageBox(self)

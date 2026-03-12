@@ -4,17 +4,28 @@ Click Detector Algorithm Dialog - Rilevamento automatico click ultrasonici
 Implementa la pipeline algoritmica a 4 stadi descritta in:
 docs/click_detector_algorithm_strategy.md
 
-PIPELINE:
+PIPELINE (v3.0 - Updated Validation Criteria):
 1. Stage 1: Energy threshold (μ + Nσ)
-2. Stage 2: Spectral ratio R = E_low/E_high
-3. Stage 3: iFFT decay analysis (Hilbert envelope)
+2. Stage 2: Spectral ratio R = E_low/E_high (DESCRIPTIVE ONLY - not used for validation)
+3. Stage 3: Three-criterion validation:
+   - Criterion 1: Temporal SNR > 5.0 (peak_amplitude / noise_rms)
+   - Criterion 2: PRE_ratio < 0.15 (E_pre / E_post - silence before click)
+   - Criterion 3: Global decay: E_W1 > E_W4 (first > last sub-window)
 4. Stage 4: Deduplication
 
 PARAMETRI CONFIGURABILI:
 - Threshold energia: μ + Nσ (default: N=4, step=σ)
 - Normalizzazione 50%: On/Off
-- R² minimo spectral: 0.0-1.0
-- R² minimo decay: 0.0-1.0
+- SNR minimo: 3.0-10.0 (default: 5.0)
+- PRE_ratio max: 0.0-0.5 (default: 0.15)
+
+REMOVED IN v3.0:
+- R² spectral/decay thresholds (now descriptive features only)
+- R as validation criterion (now descriptive feature only)
+
+FEATURE UPDATES:
+- tau_ms, r2_log, R: saved as DESCRIPTIVE features for statistical analysis
+- Offline noise estimation for accurate SNR calculation
 """
 
 import numpy as np
@@ -31,7 +42,7 @@ from PySide6.QtGui import QFont
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from windows.replay_window_audio import compute_hilbert_envelope, find_peak, check_decay
+from windows.replay_window_audio import compute_hilbert_envelope, find_peak, check_decay, estimate_noise_offline
 from core.replay_base_window import compute_fft_energy
 
 
@@ -103,23 +114,23 @@ class ClickDetectorDialog(QDialog):
         self.normalize_checkbox.setToolTip("Stage 2: Apply frequency response normalization\nRecommended: ON for accurate spectral ratio")
         params_layout.addRow("Use Normalization:", self.normalize_checkbox)
         
-        # 3. R² minimo spectral
-        self.r2_spectral_spinbox = QDoubleSpinBox()
-        self.r2_spectral_spinbox.setDecimals(2)
-        self.r2_spectral_spinbox.setRange(0.0, 1.0)
-        self.r2_spectral_spinbox.setSingleStep(0.05)
-        self.r2_spectral_spinbox.setValue(0.70)
-        self.r2_spectral_spinbox.setToolTip("Stage 2: Minimum R² for spectral ratio quality\n≥0.7 = IDENTIFIED\n≥0.5 = POSSIBLE")
-        params_layout.addRow("R² min (spectral ratio):", self.r2_spectral_spinbox)
+        # 3. SNR minimo
+        self.snr_min_spinbox = QDoubleSpinBox()
+        self.snr_min_spinbox.setDecimals(1)
+        self.snr_min_spinbox.setRange(3.0, 10.0)
+        self.snr_min_spinbox.setSingleStep(0.5)
+        self.snr_min_spinbox.setValue(5.0)
+        self.snr_min_spinbox.setToolTip("Stage 3: Minimum SNR for click validation\nRecommended: 5.0")
+        params_layout.addRow("Min. SNR (Criterion 1):", self.snr_min_spinbox)
         
-        # 4. R² minimo decay
-        self.r2_decay_spinbox = QDoubleSpinBox()
-        self.r2_decay_spinbox.setDecimals(2)
-        self.r2_decay_spinbox.setRange(0.0, 1.0)
-        self.r2_decay_spinbox.setSingleStep(0.05)
-        self.r2_decay_spinbox.setValue(0.60)  # Reduced from 0.70 for 120-sample method
-        self.r2_decay_spinbox.setToolTip("Stage 3: Minimum R² for decay quality (logarithmic fit on 120 samples)\n≥0.80 = IDENTIFIED (high confidence)\n≥0.60 = POSSIBLE (borderline)\n<0.60 = NOT_CLICK")
-        params_layout.addRow("R² min (decay analysis):", self.r2_decay_spinbox)
+        # 4. PRE_ratio max
+        self.pre_ratio_max_spinbox = QDoubleSpinBox()
+        self.pre_ratio_max_spinbox.setDecimals(2)
+        self.pre_ratio_max_spinbox.setRange(0.0, 0.5)
+        self.pre_ratio_max_spinbox.setSingleStep(0.05)
+        self.pre_ratio_max_spinbox.setValue(0.15)
+        self.pre_ratio_max_spinbox.setToolTip("Stage 3: Maximum PRE_ratio for click validation\nRecommended: 0.15")
+        params_layout.addRow("Max. PRE_ratio (Criterion 2):", self.pre_ratio_max_spinbox)
         
         params_group.setLayout(params_layout)
         layout.addWidget(params_group)
@@ -146,25 +157,27 @@ class ClickDetectorDialog(QDialog):
         layout.addWidget(results_label)
         
         self.results_table = QTableWidget()
-        self.results_table.setColumnCount(9)
+        self.results_table.setColumnCount(11)
         self.results_table.setHorizontalHeaderLabels([
-            "Timestamp", "Amplitude", "Energy FFT", "Ratio R", 
-            "R² Spectral", "R² Decay (log)", "τ (ms)", "Classification", "Notes"
+            "Timestamp", "Amplitude", "SNR", "PRE_ratio", "E_W1/E_W4",
+            "Energy FFT", "Ratio R", "R² (log)", "τ (ms)", "Classification", "Notes"
         ])
         self.results_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.results_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.results_table.setAlternatingRowColors(True)
         
         header = self.results_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(8, QHeaderView.Stretch)
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Timestamp
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # Amplitude
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # SNR
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # PRE_ratio
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # E_W1/E_W4
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)  # Energy FFT
+        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)  # Ratio R
+        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)  # R² (log)
+        header.setSectionResizeMode(8, QHeaderView.ResizeToContents)  # τ (ms)
+        header.setSectionResizeMode(9, QHeaderView.ResizeToContents)  # Classification
+        header.setSectionResizeMode(10, QHeaderView.Stretch)          # Notes
         
         self.results_table.verticalHeader().setVisible(False)
         layout.addWidget(self.results_table)
@@ -245,14 +258,14 @@ class ClickDetectorDialog(QDialog):
         threshold_mv = self.threshold_spinbox.value()
         threshold_v = threshold_mv / 1000.0
         use_normalization = self.normalize_checkbox.isChecked()
-        r2_spectral_min = self.r2_spectral_spinbox.value()
-        r2_decay_min = self.r2_decay_spinbox.value()
+        snr_min = self.snr_min_spinbox.value()
+        pre_ratio_max = self.pre_ratio_max_spinbox.value()
         
         print(f"\n📋 PARAMETERS:")
         print(f"   Energy threshold: {threshold_mv:.3f} mV ({threshold_v:.6f} V)")
         print(f"   Normalization: {'ON (50% correction)' if use_normalization else 'OFF'}")
-        print(f"   R² min (spectral): {r2_spectral_min:.2f}")
-        print(f"   R² min (decay): {r2_decay_min:.2f}")
+        print(f"   Min. SNR (Criterion 1): {snr_min:.1f}")
+        print(f"   Max. PRE_ratio (Criterion 2): {pre_ratio_max:.2f}")
         
         total_frames = self.data_manager.total_frames
         
@@ -260,6 +273,24 @@ class ClickDetectorDialog(QDialog):
         progress = QProgressDialog("Running click detection...", "Cancel", 0, 100, self)
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
+        
+        # ========================================================================
+        # OFFLINE NOISE ESTIMATION (before all stages)
+        # ========================================================================
+        print(f"\n{'='*80}")
+        print("OFFLINE NOISE ESTIMATION")
+        print(f"{'='*80}")
+        
+        progress.setLabelText("Estimating noise from empty frames...")
+        progress.setValue(5)
+        
+        noise_info = estimate_noise_offline(self.data_manager, energy_threshold_multiplier=4.0, max_samples=500)
+        noise_rms = noise_info['noise_rms']
+        
+        # Cache noise_rms on data_manager so IFFTWindow dialog can compute SNR interactively
+        self.data_manager._cached_noise_rms = noise_rms
+        
+        print(f"✅ Noise RMS: {noise_rms*1000:.6f} mV (from {noise_info['n_samples']} empty frames)")
         
         # ========================================================================
         # STAGE 1: ENERGY THRESHOLD
@@ -289,17 +320,19 @@ class ClickDetectorDialog(QDialog):
             return
         
         # ========================================================================
-        # STAGE 2: SPECTRAL RATIO CHECK
+        # STAGE 2: SPECTRAL ANALYSIS (DESCRIPTIVE ONLY - not used for validation)
         # ========================================================================
         print(f"\n{'='*80}")
-        print("STAGE 2: SPECTRAL RATIO VERIFICATION (BROADBAND TEST)")
+        print("STAGE 2: SPECTRAL ENERGY ANALYSIS (DESCRIPTIVE FEATURES)")
         print(f"{'='*80}")
+        print("⚠️ NOTE: Spectral ratio R is computed but NOT used for validation in v3.0")
+        print("         All Stage 1 candidates pass to Stage 3 for temporal analysis")
         
         candidates_stage2 = []
         
         for idx, frame_idx in enumerate(candidates_stage1):
             if idx % 100 == 0:
-                progress.setValue(25 + int((idx / len(candidates_stage1)) * 25))
+                progress.setValue(25 + int((idx / len(candidates_stage1)) * 15))
                 if progress.wasCanceled():
                     return
             
@@ -313,80 +346,33 @@ class ClickDetectorDialog(QDialog):
             # Calcola energie
             energies = compute_fft_energy(fft_mags)
             
-            # Calcola ratio R
+            # Calcola ratio R (DESCRIPTIVE ONLY - not used for filtering)
             ratio = energies['low'] / energies['high'] if energies['high'] > 0 else 0.0
             
-            # ✅ RANGE DI ACCETTAZIONE ESTESO (include casi borderline/dubbi)
-            # Fisica: Click broadband ha ratio ~0.5-2.0 (energia bilanciata low/high)
-            # Artifacts: Toni puri (<0.2) o EMI (>5.0)
-            # 
-            # STRATEGY: Accetta anche click "dubbi" con distribuzione spettrale anomala
-            # → Stage 3 (decay analysis) farà la selezione finale
-            if use_normalization:
-                # Con normalizzazione: range più ampio (correzione altera distribuzione)
-                r_min, r_max = 0.2, 3.0  # Era: 0.3-2.0 (troppo restrittivo)
-                classification = "NORMALIZED"
-            else:
-                # Senza normalizzazione: range molto permissivo
-                r_min, r_max = 0.3, 5.0  # Era: 0.5-3.0 (troppo restrittivo)
-                classification = "RAW"
-            
-            # ✅ ACCETTA se ratio in range (anche borderline)
-            if r_min <= ratio <= r_max:
-                # Classifica qualità ratio per diagnostica
-                if use_normalization:
-                    if 0.5 <= ratio <= 1.5:
-                        ratio_quality = "GOOD"
-                    elif 0.3 <= ratio <= 2.0:
-                        ratio_quality = "ACCEPTABLE"
-                    else:
-                        ratio_quality = "BORDERLINE"
-                else:
-                    if 0.6 <= ratio <= 2.5:
-                        ratio_quality = "GOOD"
-                    elif 0.4 <= ratio <= 3.5:
-                        ratio_quality = "ACCEPTABLE"
-                    else:
-                        ratio_quality = "BORDERLINE"
-                
-                candidates_stage2.append({
-                    'frame_idx': frame_idx,
-                    'energies': energies,
-                    'ratio': ratio,
-                    'ratio_quality': ratio_quality,
-                    'normalization': classification
-                })
+            candidates_stage2.append({
+                'frame_idx': frame_idx,
+                'energies': energies,
+                'ratio': ratio,  # Saved as descriptive feature
+            })
         
-        # ✅ STATISTICHE DETTAGLIATE Stage 2
-        num_good = sum(1 for c in candidates_stage2 if c.get('ratio_quality') == 'GOOD')
-        num_acceptable = sum(1 for c in candidates_stage2 if c.get('ratio_quality') == 'ACCEPTABLE')
-        num_borderline = sum(1 for c in candidates_stage2 if c.get('ratio_quality') == 'BORDERLINE')
-        
-        print(f"✅ Stage 2 complete: {len(candidates_stage2)}/{len(candidates_stage1)} frames passed ({len(candidates_stage2)/len(candidates_stage1)*100:.1f}%)")
-        if len(candidates_stage2) > 0:
-            print(f"   📊 Spectral ratio quality breakdown:")
-            print(f"      ✅ GOOD: {num_good} ({num_good/len(candidates_stage2)*100:.1f}% of passed)")
-            print(f"      ⚠️ ACCEPTABLE: {num_acceptable} ({num_acceptable/len(candidates_stage2)*100:.1f}% of passed)")
-            print(f"      🔶 BORDERLINE: {num_borderline} ({num_borderline/len(candidates_stage2)*100:.1f}% of passed - spectrum anomaly)")
-
-        
-        if len(candidates_stage2) == 0:
-            progress.close()
-            QMessageBox.information(self, "No Clicks Found", "No frames passed the spectral ratio test.\nAll candidates are likely narrowband artifacts.")
-            return
+        print(f"✅ Stage 2 complete: {len(candidates_stage2)}/{len(candidates_stage1)} candidates analyzed")
+        print(f"   All candidates passed to Stage 3 (no filtering in Stage 2)")
         
         # ========================================================================
-        # STAGE 3: DECAY ANALYSIS (TIME DOMAIN)
+        # STAGE 3: THREE-CRITERION TEMPORAL VALIDATION (v3.0)
         # ========================================================================
         print(f"\n{'='*80}")
-        print("STAGE 3: TIME DOMAIN DECAY ANALYSIS")
+        print("STAGE 3: TEMPORAL VALIDATION (3 CRITERIA)")
         print(f"{'='*80}")
+        print("Criterion 1: SNR > {:.1f} (peak_amplitude / noise_rms)".format(snr_min))
+        print("Criterion 2: PRE_ratio < {:.2f} (E_pre / E_post - silence before click)".format(pre_ratio_max))
+        print("Criterion 3: Global decay (E_W1 > E_W4)")
         
         candidates_stage3 = []
         
         for idx, candidate in enumerate(candidates_stage2):
             if idx % 10 == 0:
-                progress.setValue(50 + int((idx / len(candidates_stage2)) * 40))
+                progress.setValue(40 + int((idx / len(candidates_stage2)) * 45))
                 if progress.wasCanceled():
                     return
             
@@ -401,68 +387,111 @@ class ClickDetectorDialog(QDialog):
             # Calcola envelope
             envelope = compute_hilbert_envelope(signal)
             
-            # Trova picco
-            peak_idx, peak_amp = find_peak(signal)
+            # ✅ BUG FIX: Trova il picco sull'ENVELOPE (non sul segnale raw).
+            # check_decay() riceve l'envelope e usa peak_idx come indice su di esso.
+            # Usare il raw potrebbe puntare a un campione di portante, non al vero picco.
+            peak_idx, peak_amp = find_peak(envelope)
             
-            # Check decay (con gestione spill)
+            # Check decay (con gestione spill) - RETURNS DESCRIPTIVE FEATURES ONLY
             next_frame_signal = None
             if peak_idx > 380 and frame_idx + 1 < total_frames:
                 next_frame_signal = self._reconstruct_ifft(frame_idx + 1, use_normalization)
             
             decay_results = check_decay(envelope, peak_idx, next_frame_signal=next_frame_signal)
             
-            # Classifica in base a R²_log (FIT LOGARITMICO su 120 CAMPIONI)
-            r2_log = decay_results['r_squared_log']
-            tau = decay_results['tau_ms']
+            # Extract features for validation
+            r2_log = decay_results['r_squared_log']  # Descriptive only
+            tau_ms = decay_results['tau_ms']  # Descriptive only
             slope_log = decay_results['slope_log']
+            E_W1 = decay_results['E_W1']
+            E_W4 = decay_results['E_W4']
             
-            # CRITERIO PRINCIPALE: Usa solo R²_log e slope (non 'decaying' che ha threshold hardcoded)
-            # - slope < 0: OBBLIGATORIO (decay, not growth)
-            # - R² >= 0.70: HIGH confidence → IDENTIFIED (abbassato per 120-sample robustness)
-            # - R² >= r2_decay_min (default 0.60): borderline → POSSIBLE
-            # - R² < r2_decay_min: NOT_CLICK
+            # ================================================================
+            # CRITERION 1: Temporal SNR > threshold
+            # ================================================================
+            snr = peak_amp / noise_rms if noise_rms > 0 else 0.0
+            criterion_1_pass = (snr > snr_min)
             
-            # Guard: slope deve essere negativo (requisito fisico fondamentale)
-            if slope_log >= 0:
-                classification = "❌ NOT_CLICK"
-                continue  # Growth = physically invalid
-            
-            # Classifica in base a R² threshold
-            if r2_log >= 0.70:  # Abbassato da 0.80 per maggiore sensibilità
-                classification = "✅ IDENTIFIED"
-            elif r2_log >= r2_decay_min:
-                classification = "⚠️ POSSIBLE"
+            # ================================================================
+            # CRITERION 2: PRE_ratio < threshold (silence before click)
+            # ================================================================
+            # E_pre = mean energy in a window STRICTLY BEFORE the peak
+            # Use [0:peak_idx-10] to avoid including the click rise itself.
+            # If peak is very early (< 20 samples), we cannot compute a
+            # meaningful pre-window → treat as silence (ratio = 0.0).
+            pre_end = max(0, peak_idx - 10)  # 10-sample guard before peak
+            if pre_end >= 10:
+                E_pre = np.mean(signal[:pre_end] ** 2)
             else:
-                classification = "❌ NOT_CLICK"
-                continue  # Below user threshold
+                E_pre = 0.0  # Peak too early → assume silence before click
+
+            # E_post: mean power in 120-sample post-peak window
+            post_start = peak_idx
+            post_end = min(peak_idx + 120, len(signal))
+            E_post = np.mean(signal[post_start:post_end] ** 2) if post_end > post_start else 1e-9
+            
+            pre_ratio = E_pre / E_post if E_post > 1e-12 else 999.0
+            criterion_2_pass = (pre_ratio < pre_ratio_max)
+            
+            # ================================================================
+            # CRITERION 3: Global energy decay (E_W1 > E_W4)
+            # ================================================================
+            criterion_3_pass = (E_W1 > E_W4)
+            
+            # ================================================================
+            # FINAL VALIDATION: All 3 criteria must pass
+            # ================================================================
+            all_criteria_pass = (criterion_1_pass and criterion_2_pass and criterion_3_pass)
+            
+            if all_criteria_pass:
+                classification = "✅ CONFIRMED"
+            else:
+                # Determine reason for rejection
+                failed_criteria = []
+                if not criterion_1_pass:
+                    failed_criteria.append(f"SNR={snr:.1f}<{snr_min}")
+                if not criterion_2_pass:
+                    failed_criteria.append(f"PRE={pre_ratio:.2f}>{pre_ratio_max}")
+                if not criterion_3_pass:
+                    failed_criteria.append(f"E_W1={E_W1:.2e}≤E_W4={E_W4:.2e}")
+                classification = f"❌ REJECTED (" + ", ".join(failed_criteria) + ")"
+                continue  # Skip rejected candidates
             
             candidates_stage3.append({
                 **candidate,
                 'peak_amp': peak_amp,
                 'peak_idx': peak_idx,
                 'decay_results': decay_results,
-                'r2_log': r2_log,
-                'tau_ms': tau,
+                'r2_log': r2_log,          # Descriptive
+                'tau_ms': tau_ms,          # Descriptive
+                'slope_log': slope_log,    # Descriptive
+                'snr': snr,                # Criterion 1
+                'pre_ratio': pre_ratio,    # Criterion 2
+                'E_W1': E_W1,              # Criterion 3
+                'E_W4': E_W4,              # Criterion 3
+                'E_pre': E_pre,            # Diagnostic
+                'E_post': E_post,          # Diagnostic
+                'noise_rms': noise_rms,    # Reference
+                'criterion_1_pass': criterion_1_pass,
+                'criterion_2_pass': criterion_2_pass,
+                'criterion_3_pass': criterion_3_pass,
+                'confirmed': True,
                 'classification': classification
             })
         
-        # ✅ STATISTICHE DETTAGLIATE (con guard per lista vuota)
+        # ✅ STATISTICHE DETTAGLIATE Stage 3
         stage3_pct = (len(candidates_stage3)/len(candidates_stage2)*100) if len(candidates_stage2) > 0 else 0.0
         print(f"✅ Stage 3 complete: {len(candidates_stage3)}/{len(candidates_stage2)} frames passed ({stage3_pct:.1f}%)")
         
         if len(candidates_stage3) == 0:
             progress.close()
-            QMessageBox.information(self, "No Clicks Found", "No frames passed the decay analysis test.\nAll candidates lack exponential decay signature.")
+            QMessageBox.information(self, "No Clicks Found", "No frames passed the 3-criterion validation.\nAll candidates failed temporal analysis.")
             return
         
-        # Calcola breakdown SOLO se ci sono candidati
-        num_identified = sum(1 for c in candidates_stage3 if "IDENTIFIED" in c['classification'])
-        num_possible = sum(1 for c in candidates_stage3 if "POSSIBLE" in c['classification'])
-        
-        print(f"   📊 Classification breakdown:")
-        print(f"      ✅ IDENTIFIED: {num_identified} ({num_identified/len(candidates_stage3)*100:.1f}% of passed)")
-        print(f"      ⚠️ POSSIBLE: {num_possible} ({num_possible/len(candidates_stage3)*100:.1f}% of passed)")
-
+        print(f"   📊 All confirmed clicks passed all 3 criteria:")
+        print(f"      ✅ Criterion 1 (SNR > {snr_min}): 100%")
+        print(f"      ✅ Criterion 2 (PRE < {pre_ratio_max}): 100%")
+        print(f"      ✅ Criterion 3 (E_W1 > E_W4): 100%")
         
         # ========================================================================
         # STAGE 4: DEDUPLICATION
@@ -559,6 +588,17 @@ class ClickDetectorDialog(QDialog):
         fft_phases_rad = (full_spectrum_phase / 127.0) * np.pi
         complex_spectrum = full_spectrum_mag * np.exp(1j * fft_phases_rad)
         
+        # ✅ APPLICA TUKEY WINDOW ALLO SPETTRO COMPLESSO (FIX GIBBS CORRETTO)
+        taper_bins = max(5, actual_bins // 10)
+        window_full = np.ones(num_bins_full)
+        
+        for i in range(taper_bins):
+            alpha = i / taper_bins
+            window_full[bin_start + i] = 0.5 * (1 - np.cos(np.pi * alpha))
+            window_full[bin_start + actual_bins - i - 1] = 0.5 * (1 - np.cos(np.pi * alpha))
+        
+        complex_spectrum = complex_spectrum * window_full
+        
         # iFFT
         try:
             time_domain_signal = np.fft.irfft(complex_spectrum, n=fft_size)
@@ -567,91 +607,105 @@ class ClickDetectorDialog(QDialog):
             return None
     
     def _deduplicate_clicks(self, candidates):
-        """Rimuove duplicati (frame consecutivi = stesso click)"""
+        """
+        Rimuove duplicati: frame consecutivi (gap ≤ max_gap) = stesso click.
+        Mantiene il frame con ampiezza massima per ogni gruppo.
+        """
         if len(candidates) == 0:
             return []
+        
+        MAX_GAP = 3  # frame consecutivi entro questo gap → stesso click
         
         # Ordina per frame_idx
         candidates_sorted = sorted(candidates, key=lambda x: x['frame_idx'])
         
-        unique_clicks = []
-        i = 0
+        # Raggruppa per prossimità
+        groups = []
+        current_group = [candidates_sorted[0]]
         
-        while i < len(candidates_sorted):
-            current = candidates_sorted[i]
-            
-            # Controlla se il prossimo frame è consecutivo
-            if i + 1 < len(candidates_sorted) and candidates_sorted[i + 1]['frame_idx'] == current['frame_idx'] + 1:
-                next_candidate = candidates_sorted[i + 1]
-                
-                # Mantieni quello con ampiezza maggiore
-                if next_candidate['peak_amp'] > current['peak_amp']:
-                    unique_clicks.append(next_candidate)
-                else:
-                    unique_clicks.append(current)
-                
-                i += 2  # Skip entrambi
+        for i in range(1, len(candidates_sorted)):
+            gap = candidates_sorted[i]['frame_idx'] - candidates_sorted[i-1]['frame_idx']
+            if gap <= MAX_GAP:
+                current_group.append(candidates_sorted[i])
             else:
-                unique_clicks.append(current)
-                i += 1
+                groups.append(current_group)
+                current_group = [candidates_sorted[i]]
+        groups.append(current_group)
+        
+        # Per ogni gruppo: tieni il frame con peak_amp massima
+        unique_clicks = []
+        for group in groups:
+            best = max(group, key=lambda x: x['peak_amp'])
+            if len(group) > 1:
+                print(f"   🔗 Dedup group: {len(group)} frames → kept frame {best['frame_idx']} (amp={best['peak_amp']:.6f} V)")
+            unique_clicks.append(best)
         
         return unique_clicks
     
     def _populate_results_table(self, clicks):
-        """Popola tabella risultati"""
+        """Popola tabella risultati con nuove colonne v3.0"""
         self.results_table.setRowCount(len(clicks))
         
         for row, click in enumerate(clicks):
             frame_idx = click['frame_idx']
             timestamp = (frame_idx * self.data_manager.frame_duration_ms) / 1000.0
             
-            # Timestamp
+            # Col 0: Timestamp
             self.results_table.setItem(row, 0, QTableWidgetItem(f"{timestamp:.3f} s"))
             
-            # Amplitude
+            # Col 1: Amplitude
             self.results_table.setItem(row, 1, QTableWidgetItem(f"{click['peak_amp']:.6f} V"))
             
-            # Energy FFT
+            # Col 2: SNR (Criterion 1)
+            snr = click.get('snr', 0.0)
+            self.results_table.setItem(row, 2, QTableWidgetItem(f"{snr:.1f}"))
+            
+            # Col 3: PRE_ratio (Criterion 2)
+            pre_ratio = click.get('pre_ratio', 0.0)
+            self.results_table.setItem(row, 3, QTableWidgetItem(f"{pre_ratio:.3f}"))
+            
+            # Col 4: E_W1/E_W4 ratio (Criterion 3)
+            E_W1 = click.get('E_W1', 0.0)
+            E_W4 = click.get('E_W4', 1e-12)
+            decay_ratio = E_W1 / E_W4 if E_W4 > 1e-12 else 999.0
+            self.results_table.setItem(row, 4, QTableWidgetItem(f"{decay_ratio:.1f}"))
+            
+            # Col 5: Energy FFT (descriptive)
             energy_mv2 = click['energies']['total'] * 1e6
-            self.results_table.setItem(row, 2, QTableWidgetItem(f"{energy_mv2:.3f} mV²"))
+            self.results_table.setItem(row, 5, QTableWidgetItem(f"{energy_mv2:.3f} mV²"))
             
-            # Ratio R
-            self.results_table.setItem(row, 3, QTableWidgetItem(f"{click['ratio']:.3f}"))
+            # Col 6: Ratio R (descriptive)
+            self.results_table.setItem(row, 6, QTableWidgetItem(f"{click['ratio']:.3f}"))
             
-            # R² Spectral (TODO: implementare calcolo)
-            self.results_table.setItem(row, 4, QTableWidgetItem("N/A"))
+            # Col 7: R² (log) - Decay fit quality (descriptive only)
+            r2_log = click.get('r2_log', 0.0)
+            self.results_table.setItem(row, 7, QTableWidgetItem(f"{r2_log:.4f}"))
             
-            # R² Decay (LOGARITMICO)
-            r2_log = click['r2_log']
-            self.results_table.setItem(row, 5, QTableWidgetItem(f"{r2_log:.4f}"))
-            
-            # τ (tau) - Decay time constant
-            tau = click['tau_ms']
+            # Col 8: τ (tau) - Decay time constant (descriptive)
+            tau = click.get('tau_ms', -1.0)
             if tau > 0:
-                self.results_table.setItem(row, 6, QTableWidgetItem(f"{tau:.3f}"))
+                self.results_table.setItem(row, 8, QTableWidgetItem(f"{tau:.3f}"))
             else:
-                self.results_table.setItem(row, 6, QTableWidgetItem("N/A"))
+                self.results_table.setItem(row, 8, QTableWidgetItem("N/A"))
             
-            # Classification
+            # Col 9: Classification
             classification_item = QTableWidgetItem(click['classification'])
-            if "IDENTIFIED" in click['classification']:
+            if "CONFIRMED" in click['classification']:
                 classification_item.setForeground(Qt.darkGreen)
-            elif "POSSIBLE" in click['classification']:
-                classification_item.setForeground(Qt.darkYellow)
             else:
                 classification_item.setForeground(Qt.red)
-            self.results_table.setItem(row, 7, classification_item)
+            self.results_table.setItem(row, 9, classification_item)
             
-            # Notes
+            # Col 10: Notes
             notes = []
-            if click['decay_results'].get('used_next_frame', False):
+            if click.get('decay_results', {}).get('used_next_frame', False):
                 notes.append("Multi-frame")
-            if click['decay_results'].get('near_end', False):
+            if click.get('decay_results', {}).get('near_end', False):
                 notes.append("Near end")
-            self.results_table.setItem(row, 8, QTableWidgetItem(", ".join(notes)))
+            self.results_table.setItem(row, 10, QTableWidgetItem(", ".join(notes)))
     
     def export_results(self):
-        """Esporta risultati in CSV"""
+        """Esporta risultati in CSV con nuove colonne v3.0"""
         from PySide6.QtWidgets import QFileDialog
         import csv
         
@@ -667,10 +721,11 @@ class ClickDetectorDialog(QDialog):
             with open(filename, 'w', newline='') as f:
                 writer = csv.writer(f)
                 
-                # Header
+                # Header (updated for v3.0)
                 writer.writerow([
-                    "Timestamp (s)", "Frame Index", "Amplitude (V)", "Energy FFT (mV²)", 
-                    "Ratio R", "R² Decay (log)", "τ (ms)", "Classification", "Notes"
+                    "Timestamp (s)", "Frame Index", "Amplitude (V)", "SNR", "PRE_ratio",
+                    "E_W1", "E_W4", "Decay_Ratio", "Energy FFT (mV²)", 
+                    "Ratio R", "R² (log)", "τ (ms)", "Classification", "Notes"
                 ])
                 
                 # Dati
@@ -678,22 +733,33 @@ class ClickDetectorDialog(QDialog):
                     frame_idx = click['frame_idx']
                     timestamp = (frame_idx * self.data_manager.frame_duration_ms) / 1000.0
                     energy_mv2 = click['energies']['total'] * 1e6
-                    tau = click['tau_ms'] if click['tau_ms'] > 0 else "N/A"
+                    tau = click.get('tau_ms', -1.0)
+                    tau_str = f"{tau:.3f}" if tau > 0 else "N/A"
+                    
+                    # Calculate decay ratio
+                    E_W1 = click.get('E_W1', 0.0)
+                    E_W4 = click.get('E_W4', 1e-12)
+                    decay_ratio = E_W1 / E_W4 if E_W4 > 1e-12 else 999.0
                     
                     notes = []
-                    if click['decay_results'].get('used_next_frame', False):
+                    if click.get('decay_results', {}).get('used_next_frame', False):
                         notes.append("Multi-frame")
-                    if click['decay_results'].get('near_end', False):
+                    if click.get('decay_results', {}).get('near_end', False):
                         notes.append("Near end")
                     
                     writer.writerow([
                         f"{timestamp:.3f}",
                         frame_idx,
                         f"{click['peak_amp']:.6f}",
+                        f"{click.get('snr', 0.0):.1f}",
+                        f"{click.get('pre_ratio', 0.0):.3f}",
+                        f"{E_W1:.6e}",
+                        f"{E_W4:.6e}",
+                        f"{decay_ratio:.1f}",
                         f"{energy_mv2:.3f}",
                         f"{click['ratio']:.3f}",
-                        f"{click['r2_log']:.4f}",
-                        tau if tau == "N/A" else f"{tau:.3f}",
+                        f"{click.get('r2_log', 0.0):.4f}",
+                        tau_str,
                         click['classification'],
                         "; ".join(notes)
                     ])

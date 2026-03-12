@@ -24,7 +24,8 @@ class AppConfig:
     ORGANIZATION = "Tommy Vaninetti"
     VERSION = "1.0.0"
     WEBSITE_URL = "https://www.plantleaf.it"
-    
+    DOCUMENTATION_URL = "https://github.com/TommyVaninetti/PlantLeaf---documentation"
+
     # Impostazioni predefinite
     DEFAULT_FONT_SCALE = 1.35
     DEFAULT_THEME = "light_green.css"

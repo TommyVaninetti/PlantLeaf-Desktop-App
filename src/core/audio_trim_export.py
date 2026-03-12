@@ -85,9 +85,23 @@ class AudioTrimExporter:
             # === FASE 2: CALCOLA RANGE FRAME ===
             total_duration = self.metadata.get('duration', 0)
             estimated_total_frames = int(total_duration * self.frame_rate)
-            
+
+            # Use round() for end_frame so floating-point end_time maps to the
+            # nearest frame boundary instead of always truncating downward.
+            # This fixes the "cut file ends slightly before the requested time"
+            # bug that becomes noticeable on large (≥2 GB) files.
             start_frame = int(start_time * self.frame_rate)
-            end_frame = int(end_time * self.frame_rate)
+            end_frame = round(end_time * self.frame_rate)
+
+            # Determine the real number of frames actually present in the file
+            # (the header duration may be slightly off for large files).
+            file_size = os.path.getsize(self.file_path)
+            actual_data_bytes = file_size - 128  # subtract header
+            actual_total_frames = actual_data_bytes // self.bytes_per_frame
+
+            # Clamp end_frame so we never try to read past the real end of file
+            end_frame = min(end_frame, actual_total_frames)
+
             new_frame_count = end_frame - start_frame
             
             print(f"\n📊 Audio Trim Export Parameters:")
@@ -224,7 +238,10 @@ class AudioTrimExporter:
                         
                         # Scrivi chunk direttamente (NO re-timestamp necessario per audio)
                         out_f.write(chunk_bytes)
-                        frames_written += frames_in_chunk
+                        # Increment by the number of COMPLETE frames actually read,
+                        # not by frames_in_chunk (the requested amount). This prevents
+                        # frames_written from overshooting the real data on partial reads.
+                        frames_written += len(chunk_bytes) // self.bytes_per_frame
                         
                         # Aggiorna progress (25-85%)
                         copy_progress = int(25 + (frames_written / new_frame_count) * 60)
