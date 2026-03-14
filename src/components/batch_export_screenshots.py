@@ -299,8 +299,25 @@ class BatchExportWorker(QThread):
             if sig_raw is None or sig_norm is None:
                 continue
 
+            # ── Sanity check: skip physically impossible frames ───────────────
+            # Corrupted frames can contain values of thousands of Volts.
+            # These cause float32 overflow (RuntimeWarning: overflow in square)
+            # which then produces inf/nan that crashes numpy's FFT at C level.
+            # A real ultrasonic sensor will never produce more than ~50 V peak;
+            # we use 100 V as a generous hard ceiling.
+            MAX_PHYSICAL_V = 100.0
+            fft_raw_check = dm.fft_data[frame_idx]
+            if (float(np.max(np.abs(fft_raw_check))) > MAX_PHYSICAL_V or
+                    float(np.max(np.abs(sig_raw)))     > MAX_PHYSICAL_V or
+                    not np.all(np.isfinite(sig_raw))   or
+                    not np.all(np.isfinite(fft_raw_check))):
+                print(f"⚠️  Frame {frame_idx} skipped: physically implausible values "
+                      f"(peak FFT={float(np.max(np.abs(fft_raw_check))):.1f} V, "
+                      f"peak sig={float(np.max(np.abs(sig_raw))):.1f} V)")
+                continue
+
             # FFT data
-            fft_raw   = dm.fft_data[frame_idx].copy()
+            fft_raw   = fft_raw_check.copy()
             fft_norm  = self._normalize_fft(fft_raw)
             freq_axis = dm.frequency_axis
 
@@ -314,17 +331,22 @@ class BatchExportWorker(QThread):
                 continue
             peak_idx, peak_amp = find_peak(env_raw)
 
-            # Decay fit
+            # Decay fit — pre-compute next frame envelope here (in worker thread,
+            # using our pure-numpy compute_hilbert_envelope) so that check_decay
+            # never has to call it internally (avoids a second FFT inside check_decay
+            # that could interact with macOS Accelerate from a QThread).
             fs = dm.header_info.get('fs', 200000)
-            next_sig = None
+            next_env = None
             if peak_idx > 212 and frame_idx + 1 < total_frames:
                 try:
                     next_sig = self._reconstruct_ifft(frame_idx + 1, normalized=False)
+                    if next_sig is not None:
+                        next_env = compute_hilbert_envelope(next_sig)
                 except Exception:
-                    next_sig = None
+                    next_env = None
             try:
                 decay = check_decay(env_raw, peak_idx,
-                                    next_frame_signal=next_sig,
+                                    next_frame_envelope=next_env,
                                     noise_rms=noise_rms)
             except Exception as e:
                 print(f"⚠️  check_decay failed for frame {frame_idx}: {e}")
@@ -366,7 +388,9 @@ class BatchExportWorker(QThread):
 
             # ── Extended parameters (only meaningful when noise_rms is real) ─
             # SPR — spectral peak ratio (broadband check)
-            fft_power  = fft_norm ** 2
+            # Use float64 cast to avoid float32 overflow on large (but not
+            # physically implausible) values that survive the sanity check above.
+            fft_power  = fft_norm.astype(np.float64) ** 2
             mean_power = float(np.mean(fft_power))
             max_power  = float(np.max(fft_power))
             spr        = max_power / mean_power if mean_power > 1e-20 else 0.0

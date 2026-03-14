@@ -622,147 +622,126 @@ class IFFTWindow(QDialog):
         # Analizza decadimento (con o senza frame successivo)
         print(f"\n🔍 Decay Analysis {'(NORMALIZED)' if self.is_normalized else '(RAW)'}:")
         print(f"   Peak at t = {peak_time:.6f} s (sample {peak_idx}/{len(current_signal)})")
-        print(f"   Peak amplitude: {peak_amp:.6f} V")
+        print(f"   Peak amplitude: {peak_amp:.6f} V  ({peak_amp*1e6:.1f} µV)")
 
         # Recupera noise_rms dalla cache del detector (per truncation B e display)
         _cached_noise_rms = None
         if self.parent and hasattr(self.parent, 'data_manager'):
             _cached_noise_rms = getattr(self.parent.data_manager, '_cached_noise_rms', None)
 
+        # Pre-calcola envelope del frame successivo (evita che check_decay lo ricalcoli)
+        next_frame_envelope = None
+        if next_frame_signal is not None:
+            try:
+                next_frame_envelope = compute_hilbert_envelope(next_frame_signal)
+            except Exception:
+                next_frame_envelope = None
+
         decay_results = check_decay(self.envelope_data, peak_idx,
-                                    next_frame_signal=next_frame_signal,
+                                    next_frame_envelope=next_frame_envelope,
                                     noise_rms=_cached_noise_rms)
-        
-        # Stampa risultati
-        print(f"\n📊 Decay Metrics (300-Sample Logarithmic Fit):")
-        print(f"   Window analyzed: {decay_results['n_samples']} samples ({decay_results['n_samples']/200:.3f} ms)")
-        if decay_results.get('used_next_frame', False):
-            print(f"   ✅ Extended analysis using next frame data")
-        
-        # Legacy info (4 sub-windows per reference)
-        print(f"\n   📋 Legacy Sub-window Energies (reference only):")
-        for i, E in enumerate(decay_results['energies'], 1):
-            print(f"      W{i}: {E:.9f} V² = {E*1e6:.3f} mV²")
-        
-        print(f"\n   📈 PRIMARY ANALYSIS: Log-linear Fit v3.2 (A+B+C improvements)")
-        print(f"      Smoothing (C): {'✅' if decay_results.get('fit_smoothed') else '❌'} (moving avg 4 samp, anti-ripple 50 kHz)")
-        print(f"      Skip (A): {decay_results.get('fit_skip', 5) - decay_results.get('fit_snap_offset', 0)} samples post-peak (fixed)")
-        print(f"      Snap (D): +{decay_results.get('fit_snap_offset', 0)} samples (local-max alignment, ≤6)")
-        print(f"      Total skip: {decay_results.get('fit_skip', 5)} samples from peak")
-        print(f"      Truncation (B): {'✅ YES' if decay_results.get('fit_truncated') else '❌ NO'} (noise floor 2× noise_rms)")
-        print(f"      Fit samples: {decay_results.get('n_fit_samples', '?')} / {decay_results['n_samples']} total")
-        print(f"      Slope (log): {decay_results['slope_log']:.6f}")
-        print(f"      R² (log): {decay_results['r_squared_log']:.4f}  ⭐ DESCRIPTIVE ONLY (v3.0)")
-        print(f"      τ (tau): {decay_results['tau_ms']:.3f} ms" if decay_results['tau_ms'] > 0 else "      τ (tau): N/A (invalid slope)")
-        
-        # v3.1: Show all 5 criteria evaluation
+
+        # ── v4.0: Evaluate all criteria (mirrors the detector pipeline) ──────
+        # Default thresholds (shown in UI — user can run detector to change them)
+        V4_MAX_PRE_SNR   = 1.7
+        V4_MIN_DECAY_RATIO = 2.0
+        V4_MAX_ASYM      = 2.5
+        V4_MIN_PEAK_IFFT = 130e-6   # 130 µV in V
+        V4_TAU_MIN       = 0.045    # ms
+        V4_TAU_MAX       = 1.3      # ms
+        V4_MIN_R2        = 0.45
+
         E_W1 = decay_results.get('E_W1', 0)
         E_W4 = decay_results.get('E_W4', 0)
+        r2_log  = decay_results['r_squared_log']
+        tau_ms  = decay_results['tau_ms']
         decay_ratio = E_W1 / E_W4 if E_W4 > 0 else 0
 
-        # --- Criterion 3: Global decay with minimum ratio ---
-        MIN_DECAY_RATIO = 2.0
-        criterion_3_pass = (E_W1 > E_W4 * MIN_DECAY_RATIO)
-        print(f"\n   ⭐ v3.1 Criterion 3 (Global Decay – E_W1 > {MIN_DECAY_RATIO}× E_W4):")
-        print(f"      E_W1 / E_W4 = {decay_ratio:.2f}  (need ≥ {MIN_DECAY_RATIO})")
-        print(f"      Criterion 3: {'✅ PASS' if criterion_3_pass else '❌ FAIL'}")
+        # peak iFFT
+        peak_pass = (peak_amp > V4_MIN_PEAK_IFFT)
 
-        # --- Criterion 4: Narrow-spike test (symmetry + flanks-near-noise) ---
-        ASYM_THRESHOLD    = 0.5
-        LEVEL_FRACTION    = 0.10
-        FALL_SEARCH       = 40    # 0.2 ms at 200 kHz
-        SPIKE_HALF_WIN    = 40    # 0.2 ms each side
-        SPIKE_NOISE_FACTOR= 3.0
-        envelope = self.envelope_data
+        # C2: pre_snr (only if normalized and noise available)
+        if self.is_normalized and _cached_noise_rms and _cached_noise_rms > 0:
+            GUARD = 20
+            pre_end = max(0, peak_idx - GUARD)
+            if pre_end >= 50:
+                pre_window = current_signal[:pre_end]
+            else:
+                pre_window = np.array([_cached_noise_rms])
+            rms_pre  = float(np.sqrt(np.mean(pre_window ** 2)))
+            pre_snr  = rms_pre / _cached_noise_rms
+            c2_pass  = (pre_snr < V4_MAX_PRE_SNR)
+            pre_snr_str = f"{pre_snr:.2f}"
+        else:
+            pre_snr = None
+            c2_pass = None
+            pre_snr_str = "N/A (run detector to cache noise RMS)"
+
+        # C3: global decay
+        c3_pass = (E_W1 > E_W4 * V4_MIN_DECAY_RATIO)
+
+        # asym
+        LEVEL_FRACTION = 0.10
+        FALL_SEARCH    = 40
         level = peak_amp * LEVEL_FRACTION
-
-        # Step 1: symmetry
+        envelope = self.envelope_data
         rise_start = peak_idx
         for i in range(peak_idx - 1, -1, -1):
             if envelope[i] < level:
                 rise_start = i + 1
                 break
         rise_s = max(1, peak_idx - rise_start)
-
-        fall_end_idx  = min(peak_idx + FALL_SEARCH, len(envelope))
-        fall_s        = FALL_SEARCH
-        fall_cross_idx = peak_idx + FALL_SEARCH
+        fall_end_idx = min(peak_idx + FALL_SEARCH, len(envelope))
+        fall_s = FALL_SEARCH
         for i in range(peak_idx + 1, fall_end_idx):
             if envelope[i] < level:
                 fall_s = i - peak_idx
-                fall_cross_idx = i
                 break
-        asym_ratio   = rise_s / fall_s if fall_s > 0 else 1.0
-        is_symmetric = (asym_ratio >= ASYM_THRESHOLD)
+        asym_ratio = rise_s / fall_s if fall_s > 0 else 1.0
+        asym_pass  = (asym_ratio < V4_MAX_ASYM)
 
-        # Step 2: flank-to-noise
-        noise_ref = self.parent.data_manager._cached_noise_rms if (
-            self.parent and hasattr(self.parent, 'data_manager') and
-            hasattr(self.parent.data_manager, '_cached_noise_rms')
-        ) else None
-        if noise_ref and noise_ref > 0:
-            left_flank  = envelope[max(0, rise_start - SPIKE_HALF_WIN):rise_start]
-            right_flank = envelope[fall_cross_idx:min(fall_cross_idx + SPIKE_HALF_WIN, len(envelope))]
-            left_near   = (len(left_flank)  == 0 or float(np.max(left_flank))  < SPIKE_NOISE_FACTOR * noise_ref)
-            right_near  = (len(right_flank) == 0 or float(np.max(right_flank)) < SPIKE_NOISE_FACTOR * noise_ref)
-            flanks_near_noise = left_near and right_near
-            flank_str = f"L={'✅' if left_near else '❌'} R={'✅' if right_near else '❌'}"
+        # tau
+        if tau_ms > 0:
+            tau_pass = (V4_TAU_MIN <= tau_ms <= V4_TAU_MAX)
+            tau_str  = f"{tau_ms:.3f} ms"
         else:
-            flanks_near_noise = None
-            flank_str = "no noise_rms"
+            tau_pass = False
+            tau_str  = "N/A → ❌ FAIL"
 
-        criterion_4_pass = not (is_symmetric and flanks_near_noise is True)
-        print(f"\n   ⭐ v3.1 Criterion 4 (Narrow-spike test):")
-        print(f"      rise={rise_s} samp, fall={fall_s} samp → asym_ratio={asym_ratio:.3f} (sym≥{ASYM_THRESHOLD}: {is_symmetric})")
-        print(f"      Flanks near noise (±0.2ms, factor {SPIKE_NOISE_FACTOR}×): {flank_str}")
-        print(f"      Criterion 4: {'✅ PASS' if criterion_4_pass else '❌ FAIL (narrow symmetric spike)'}")
+        # R²
+        r2_pass = (r2_log > V4_MIN_R2)
 
-        # --- Criterion 5: Clean tail (no secondary burst > 3× valley) ---
-        DECAY_SKIP     = 10
-        TAIL_WINDOW    = 300
-        REBOUND_FACTOR = 3.0
-        tail_start = peak_idx + DECAY_SKIP
-        tail_end   = min(peak_idx + TAIL_WINDOW, len(envelope))
-        if tail_end > tail_start + 5:
-            tail_env   = envelope[tail_start:tail_end]
-            valley_val = float(np.min(tail_env))
-            valley_pos = int(np.argmin(tail_env))
-            post_valley = tail_env[valley_pos + 1:]
-            rebound_thr = valley_val * REBOUND_FACTOR
-            has_rebound = (len(post_valley) > 0 and
-                           float(np.max(post_valley)) > rebound_thr and
-                           rebound_thr > level)
-            criterion_5_pass = not has_rebound
-            rebound_max = float(np.max(post_valley)) if len(post_valley) > 0 else 0.0
-            print(f"\n   ⭐ v3.1 Criterion 5 (Clean Tail – rebound < {REBOUND_FACTOR}× valley):")
-            print(f"      valley={valley_val*1000:.3f} mV, max_rebound={rebound_max*1000:.3f} mV, "
-                  f"thresh={rebound_thr*1000:.3f} mV")
-            print(f"      Criterion 5: {'✅ PASS' if criterion_5_pass else '❌ FAIL (secondary burst)'}")
+        # Overall — normalized only: all criteria matter
+        # For RAW mode: show criteria but note that scan uses normalized
+        if self.is_normalized:
+            all_pass = peak_pass and (c2_pass is not False) and c3_pass and asym_pass and tau_pass and r2_pass
         else:
-            criterion_5_pass = True
-            print(f"\n   ⭐ v3.1 Criterion 5 (Clean Tail): ✅ PASS (tail too short → conservative)")
+            all_pass = None   # Can't evaluate: scan is normalized-only
 
-        print(f"\n   ✅ Quality checks:")
-        print(f"      Near frame end: {'⚠️ YES (possible spill)' if decay_results['near_end'] else '✅ NO'}")
-
-        # Valutazione finale v3.1 (C3+C4+C5 — C1/C2 need noise_rms from detector)
-        r2_log = decay_results['r_squared_log']
-        structural_pass = criterion_3_pass and criterion_4_pass and criterion_5_pass
-        if structural_pass and r2_log >= 0.70:
-            verdict = "✅ GOOD DECAY TREND (C3+C4+C5 PASS + R²≥0.70, likely click)"
+        if all_pass is True:
+            verdict = "✅ WOULD PASS SCAN (all iFFT criteria met)"
             color = "green"
-        elif structural_pass and r2_log >= 0.50:
-            verdict = "⚠️ MODERATE DECAY (C3+C4+C5 PASS + R²≥0.50, check SNR/pre_snr)"
-            color = "orange"
-        elif criterion_3_pass and r2_log >= 0.50:
-            verdict = "⚠️ PARTIAL (C3 PASS but C4 or C5 failed – check waveform shape)"
-            color = "orange"
-        else:
-            verdict = "❌ POOR DECAY (C3 failed OR R²<0.50, likely not a click)"
+        elif all_pass is False:
+            failed = []
+            if not peak_pass:
+                failed.append(f"peak={peak_amp*1e6:.0f}µV<130µV")
+            if c2_pass is False:
+                failed.append(f"pre_snr={pre_snr:.2f}≥{V4_MAX_PRE_SNR}")
+            if not c3_pass:
+                failed.append(f"E_W1/E_W4={decay_ratio:.2f}<{V4_MIN_DECAY_RATIO}")
+            if not asym_pass:
+                failed.append(f"asym={asym_ratio:.2f}≥{V4_MAX_ASYM}")
+            if not tau_pass:
+                failed.append(f"τ={tau_str}")
+            if not r2_pass:
+                failed.append(f"R²={r2_log:.3f}<{V4_MIN_R2}")
+            verdict = "❌ WOULD FAIL SCAN: " + ", ".join(failed)
             color = "red"
-        
-        print(f"\n🎯 Verdict (descriptive): {verdict}")
-        print(f"   ⚠️ NOTE: Final validation also requires SNR and pre_snr (C1/C2 — run detector for cached noise_rms)")
+        else:
+            verdict = "⚠️ RAW mode — Scan uses normalized iFFT only. Run in normalized mode for scan prediction."
+            color = "orange"
+
+        print(f"\n🎯 v4.0 Scan prediction (normalized): {verdict}")
         
         # Mostra popup con risultati (CUSTOM DIALOG per temi corretti)
         self._show_decay_results_dialog(
@@ -1011,331 +990,217 @@ class IFFTWindow(QDialog):
             print(f"   ❌ iFFT error for frame {frame_index}: {e}")
             return None
     
-    def _show_decay_results_dialog(self, frame_index, is_normalized, peak_time, peak_idx, 
+    def _show_decay_results_dialog(self, frame_index, is_normalized, peak_time, peak_idx,
                                    peak_amp, decay_results, verdict, verdict_color):
-        """Mostra dialog personalizzato con risultati decay analysis (tema-aware, v3.0)."""
+        """Mostra dialog con risultati decay analysis v4.0 (tema-aware)."""
         from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QTextEdit, QPushButton, QHBoxLayout
         from PySide6.QtCore import Qt
-        
+
         dialog = QDialog(self)
-        dialog.setWindowTitle("Decay Analysis Results (v3.0)")
-        dialog.setMinimumSize(640, 960)
-        
+        dialog.setWindowTitle("Decay Analysis Results  v4.0")
+        dialog.setMinimumSize(680, 820)
+
         layout = QVBoxLayout(dialog)
-        
-        # TITOLO
+
         title_label = QLabel(f"<b style='font-size:16pt;'>Frame {frame_index if frame_index is not None else '?'}</b>")
         title_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(title_label)
-        
-        mode_label = QLabel(f"<i>{'50% Normalized iFFT' if is_normalized else 'Raw iFFT (no correction)'}</i>")
+
+        mode_label = QLabel(f"<i>{'50% Normalized iFFT' if is_normalized else 'Raw iFFT (no correction) — Scan uses normalized only'}</i>")
         mode_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(mode_label)
-        
+
         text_widget = QTextEdit()
         text_widget.setReadOnly(True)
-        
-        # ── Calcola pre_snr e SNR per il frame corrente (coerente col detector) ──
+
+        # ── retrieve cached values ──────────────────────────────────────────
         if self.parent and hasattr(self.parent, 'data_manager'):
-            dm = self.parent.data_manager
-            noise_rms = getattr(dm, '_cached_noise_rms', None)
+            noise_rms = getattr(self.parent.data_manager, '_cached_noise_rms', None)
         else:
             noise_rms = None
 
-        # Recupera segnale corrente per calcoli
         current_signal = self.signal_data_normalized if self.is_normalized else self.signal_data_raw
 
-        # ── pre_snr: coerente con il detector (stesso algoritmo, stessa logica) ──
-        MIN_PRE_SAMPLES = 50
-        GUARD = 20
-        pre_end = max(0, peak_idx - GUARD)
-        n_pre_current = pre_end
-
-        if noise_rms is not None and noise_rms > 0:
-            if n_pre_current >= MIN_PRE_SAMPLES:
-                pre_window = current_signal[:pre_end]
-                pre_source_str = f"current frame ({n_pre_current} samples)"
-            elif self.frame_index is not None and self.frame_index > 0 and self.parent:
-                # Prova a ricostruire il frame precedente
-                try:
-                    prev_sig = self.parent._reconstruct_ifft_for_frame(
-                        self.frame_index - 1,
-                        normalized=self.is_normalized
-                    ) if hasattr(self.parent, '_reconstruct_ifft_for_frame') else None
-                except Exception:
-                    prev_sig = None
-
-                if prev_sig is not None:
-                    prev_tail = prev_sig[-200:]
-                    current_pre = current_signal[:pre_end] if pre_end > 0 else np.array([])
-                    pre_window = np.concatenate([prev_tail, current_pre])
-                    pre_source_str = f"prev[-200:] + current[:{pre_end}] ({len(pre_window)} samples)"
-                else:
-                    pre_window = current_signal[:pre_end] if pre_end > 0 else np.array([noise_rms])
-                    pre_source_str = f"current only – prev unavailable ({len(pre_window)} samples)"
-            else:
-                pre_window = np.array([noise_rms])
-                pre_source_str = "first frame fallback"
-
-            rms_pre = float(np.sqrt(np.mean(pre_window ** 2))) if len(pre_window) > 0 else noise_rms
-            pre_snr_v = rms_pre / noise_rms
-            MAX_PRE_SNR_DEFAULT = 3.0
-            pre_pass_str = f"✅ PASS (<{MAX_PRE_SNR_DEFAULT})" if pre_snr_v < MAX_PRE_SNR_DEFAULT else f"❌ FAIL (≥{MAX_PRE_SNR_DEFAULT})"
-            pre_snr_display = f"{pre_snr_v:.2f}  (RMS_pre={rms_pre*1000:.3f} mV)"
-        else:
-            pre_snr_v = None
-            rms_pre = None
-            pre_snr_display = "N/A – run detector to cache noise RMS"
-            pre_pass_str = "⚠️ unknown"
-            pre_source_str = "N/A"
-
-        # ── SNR ──
-        if noise_rms is not None and noise_rms > 0:
-            snr_v = peak_amp / noise_rms
-            snr_str = f"{snr_v:.2f}  ({20*np.log10(snr_v):.1f} dB)"
-            snr_pass_str = "✅ PASS (≥5.0)" if snr_v >= 5.0 else "❌ FAIL (<5.0)"
-        else:
-            snr_v = None
-            snr_str = "N/A – run detector to cache noise RMS"
-            snr_pass_str = "⚠️ unknown"
+        # ── v4.0 thresholds ─────────────────────────────────────────────────
+        V4_MAX_PRE_SNR    = 1.7
+        V4_MIN_DECAY_RATIO = 2.0
+        V4_MAX_ASYM       = 2.5
+        V4_MIN_PEAK_IFFT  = 130e-6   # 130 µV
+        V4_TAU_MIN        = 0.045
+        V4_TAU_MAX        = 1.3
+        V4_MIN_R2         = 0.45
 
         E_W1 = decay_results.get('E_W1', 0)
         E_W4 = decay_results.get('E_W4', 0)
         decay_ratio_v = E_W1 / E_W4 if E_W4 > 1e-15 else 999.0
-        MIN_DECAY_RATIO = 2.0
-        crit3_pass_str = f"✅ PASS (ratio≥{MIN_DECAY_RATIO})" if E_W1 > E_W4 * MIN_DECAY_RATIO else f"❌ FAIL (ratio={decay_ratio_v:.2f}<{MIN_DECAY_RATIO})"
+        tau_ms = decay_results.get('tau_ms', -1.0)
+        r2_log = decay_results.get('r_squared_log', 0.0)
 
-        # ── Criterion 4: narrow-spike test (symmetry + flanks-near-noise) ──
-        LEVEL_FRACTION    = 0.10
-        FALL_SEARCH       = 40    # 0.2 ms max fall search
-        ASYM_THRESHOLD    = 0.5
-        SPIKE_HALF_WIN    = 40    # 0.2 ms each side for flank check
-        SPIKE_NOISE_FACTOR= 3.0
+        # ── iFFT peak ───────────────────────────────────────────────────────
+        peak_pass = (peak_amp > V4_MIN_PEAK_IFFT)
+        peak_pass_str = f"✅ PASS ({peak_amp*1e6:.1f} µV > 130 µV)" if peak_pass else f"❌ FAIL ({peak_amp*1e6:.1f} µV ≤ 130 µV)"
+
+        # ── C2: pre_snr ─────────────────────────────────────────────────────
+        if noise_rms and noise_rms > 0:
+            GUARD = 20
+            pre_end = max(0, peak_idx - GUARD)
+            pre_window = current_signal[:pre_end] if pre_end >= 50 else np.array([noise_rms])
+            rms_pre   = float(np.sqrt(np.mean(pre_window ** 2)))
+            pre_snr_v = rms_pre / noise_rms
+            c2_pass   = (pre_snr_v < V4_MAX_PRE_SNR)
+            c2_str    = f"{'✅' if c2_pass else '❌'} {pre_snr_v:.2f}  (threshold < {V4_MAX_PRE_SNR})"
+            pre_src   = f"{len(pre_window)} samples"
+        else:
+            pre_snr_v = None
+            c2_pass   = None
+            c2_str    = "⚠️ N/A — run detector first to cache noise RMS"
+            rms_pre   = None
+            pre_src   = "N/A"
+
+        # ── C3: global decay ────────────────────────────────────────────────
+        c3_pass = (E_W1 > E_W4 * V4_MIN_DECAY_RATIO)
+        c3_str  = f"{'✅' if c3_pass else '❌'} {decay_ratio_v:.2f}×  (need > {V4_MIN_DECAY_RATIO}×)"
+
+        # ── asym ────────────────────────────────────────────────────────────
+        LEVEL_FRACTION = 0.10
+        FALL_SEARCH    = 40
         level = peak_amp * LEVEL_FRACTION
-        current_envelope = self.envelope_data  # already computed above
-
+        env   = self.envelope_data
         rise_start = peak_idx
         for i in range(peak_idx - 1, -1, -1):
-            if current_envelope[i] < level:
+            if env[i] < level:
                 rise_start = i + 1
                 break
-        rise_samples = max(1, peak_idx - rise_start)
-
-        fall_end_idx = min(peak_idx + FALL_SEARCH, len(current_envelope))
-        fall_samples = FALL_SEARCH
-        fall_cross_idx = peak_idx + FALL_SEARCH
+        rise_s = max(1, peak_idx - rise_start)
+        fall_end_idx = min(peak_idx + FALL_SEARCH, len(env))
+        fall_s = FALL_SEARCH
         for i in range(peak_idx + 1, fall_end_idx):
-            if current_envelope[i] < level:
-                fall_samples = i - peak_idx
-                fall_cross_idx = i
+            if env[i] < level:
+                fall_s = i - peak_idx
                 break
-        asymmetry_ratio = rise_samples / fall_samples if fall_samples > 0 else 1.0
-        is_symmetric = (asymmetry_ratio >= ASYM_THRESHOLD)
+        asym_ratio = rise_s / fall_s if fall_s > 0 else 1.0
+        asym_pass  = (asym_ratio < V4_MAX_ASYM)
+        asym_str   = f"{'✅' if asym_pass else '❌'} {asym_ratio:.3f}  (rise={rise_s} fall={fall_s} samp, need < {V4_MAX_ASYM})"
 
-        # Flank-to-noise check (only meaningful if noise_rms is available)
-        if noise_rms and noise_rms > 0:
-            left_start = max(0, rise_start - SPIKE_HALF_WIN)
-            left_flank = current_envelope[left_start:rise_start]
-            left_near_noise  = (len(left_flank)  == 0 or float(np.max(left_flank))  < SPIKE_NOISE_FACTOR * noise_rms)
-            right_end = min(fall_cross_idx + SPIKE_HALF_WIN, len(current_envelope))
-            right_flank = current_envelope[fall_cross_idx:right_end]
-            right_near_noise = (len(right_flank) == 0 or float(np.max(right_flank)) < SPIKE_NOISE_FACTOR * noise_rms)
-            flanks_near_noise = left_near_noise and right_near_noise
+        # ── tau ─────────────────────────────────────────────────────────────
+        if tau_ms > 0:
+            tau_pass = (V4_TAU_MIN <= tau_ms <= V4_TAU_MAX)
+            tau_str  = f"{'✅' if tau_pass else '❌'} {tau_ms:.3f} ms  (need [{V4_TAU_MIN}–{V4_TAU_MAX}] ms)"
         else:
-            flanks_near_noise = None  # can't evaluate without noise_rms
+            tau_pass = False
+            tau_str  = f"❌ N/A (slope ≥ 0 → no valid decay)"
 
-        crit4_pass = not (is_symmetric and flanks_near_noise is True)
-        if flanks_near_noise is None:
-            crit4_pass_str = (f"✅ PASS (asym={asymmetry_ratio:.3f} – sym check only, no noise ref)"
-                              if not is_symmetric else
-                              f"⚠️ symmetric ({asymmetry_ratio:.3f}≥{ASYM_THRESHOLD}) – flanks unknown (no noise RMS)")
-        else:
-            crit4_pass_str = (f"✅ PASS" if crit4_pass else
-                              f"❌ FAIL (narrow spike: asym={asymmetry_ratio:.3f}≥{ASYM_THRESHOLD}, flanks@noise)")
+        # ── R² ──────────────────────────────────────────────────────────────
+        r2_pass = (r2_log > V4_MIN_R2)
+        r2_str  = f"{'✅' if r2_pass else '❌'} {r2_log:.4f}  (need > {V4_MIN_R2})"
 
-        # ── Criterion 5: clean tail (no secondary burst > 3× valley) ──
-        DECAY_SKIP     = 10
-        TAIL_WINDOW    = 300
-        REBOUND_FACTOR = 3.0
-        tail_start = peak_idx + DECAY_SKIP
-        tail_end   = min(peak_idx + TAIL_WINDOW, len(current_envelope))
-        if tail_end > tail_start + 5:
-            tail_env = current_envelope[tail_start:tail_end]
-            valley_idx_local = int(np.argmin(tail_env))
-            valley_val = float(tail_env[valley_idx_local])
-            post_valley = tail_env[valley_idx_local + 1:]
-            rebound_threshold = valley_val * REBOUND_FACTOR
-            has_rebound = (len(post_valley) > 0 and
-                           float(np.max(post_valley)) > rebound_threshold and
-                           rebound_threshold > level)
-            crit5_pass = not has_rebound
-            rebound_max_v = float(np.max(post_valley)) if len(post_valley) > 0 else 0.0
-            crit5_val_str = (f"valley={valley_val*1000:.3f} mV, "
-                             f"max_rebound={rebound_max_v*1000:.3f} mV, "
-                             f"thresh={rebound_threshold*1000:.3f} mV")
-        else:
-            crit5_pass = True
-            crit5_val_str = "tail too short → conservative PASS"
-        crit5_pass_str = "✅ PASS (clean tail)" if crit5_pass else "❌ FAIL (secondary burst)"
+        # ── normalized flag ─────────────────────────────────────────────────
+        norm_note = "" if is_normalized else "<br><i style='color:orange;'>⚠️ Using RAW iFFT — Scan evaluates normalized only. Switch to normalized for accurate prediction.</i>"
 
-        # Quarter-window duration (300 samples / 4 = 75 samples = 0.375 ms)
-        quarter_ms = 300 / 4 / 200  # ms
-
-        html_content = f"""
+        html = f"""
 <div style='font-family: monospace; font-size: 11pt; line-height: 1.6;'>
 
-<!-- ═══ SECTION 1: PEAK ═══ -->
-<p><b style='font-size:13pt; text-decoration:underline;'>Peak Information</b></p>
+<!-- PEAK -->
+<p><b style='font-size:13pt; text-decoration:underline;'>Peak Information</b>{norm_note}</p>
 <table style='margin-left:20px; border-collapse:collapse;'>
-<tr><td style='padding:4px; width:170px;'>Time in frame:</td>
-    <td style='padding:4px;'><b>{peak_time:.6f} s</b>  (sample {peak_idx} / {len(current_signal)})</td></tr>
+<tr><td style='padding:4px; width:200px;'>Time in frame:</td>
+    <td><b>{peak_time:.6f} s</b>  (sample {peak_idx}/{len(current_signal)})</td></tr>
 <tr><td style='padding:4px;'>Amplitude (envelope):</td>
-    <td style='padding:4px;'><b>{peak_amp:.6f} V</b>  =  {peak_amp*1000:.4f} mV</td></tr>
+    <td><b>{peak_amp*1e6:.2f} µV</b>  =  {peak_amp*1000:.5f} mV</td></tr>
+<tr><td style='padding:4px;'>Noise RMS (cached):</td>
+    <td>{f"{noise_rms*1000:.4f} mV" if noise_rms else "not available – run detector first"}</td></tr>
 </table>
 
-<!-- ═══ SECTION 2: V3.1 CRITERIA ═══ -->
-<p style='margin-top:12px;'><b style='font-size:13pt; text-decoration:underline;'>v3.1 Validation Criteria</b>
-<span style='font-size:9pt; color:gray;'> (used by Automatic Click Detector)</span></p>
-<table style='margin-left:20px; border-collapse:collapse; width:95%;'>
+<!-- V4.0 CRITERIA -->
+<p style='margin-top:14px;'><b style='font-size:13pt; text-decoration:underline;'>v4.0 Scan Criteria  (normalized iFFT)</b></p>
+<table style='margin-left:20px; border-collapse:collapse; width:96%;'>
 <tr style='background-color:rgba(100,100,255,0.12);'>
     <th style='padding:6px; text-align:left;'>Criterion</th>
-    <th style='padding:6px; text-align:right;'>Value</th>
-    <th style='padding:6px; text-align:left;'>Default threshold</th>
     <th style='padding:6px; text-align:left;'>Result</th>
 </tr>
 <tr>
-    <td style='padding:5px;'><b>1. SNR</b> = peak / noise_rms</td>
-    <td style='padding:5px; text-align:right;'><b>{snr_str}</b></td>
-    <td style='padding:5px;'>&gt; 5.0  (14 dB)</td>
-    <td style='padding:5px;'>{snr_pass_str}</td>
+    <td style='padding:5px;'><b>Peak iFFT norm &gt; 130 µV</b></td>
+    <td style='padding:5px;'>{peak_pass_str}</td>
 </tr>
 <tr style='background-color:rgba(128,128,128,0.08);'>
-    <td style='padding:5px;'><b>2. pre_snr</b> = RMS_pre / noise_rms</td>
-    <td style='padding:5px; text-align:right;'><b>{pre_snr_display}</b></td>
-    <td style='padding:5px;'>&lt; 2.0  (silence before)</td>
-    <td style='padding:5px;'>{pre_pass_str}</td>
+    <td style='padding:5px;'><b>C2: pre_snr &lt; {V4_MAX_PRE_SNR}</b></td>
+    <td style='padding:5px;'>{c2_str}</td>
 </tr>
 <tr>
-    <td style='padding:5px;'><b>3. Global decay</b> E_W1 / E_W4</td>
-    <td style='padding:5px; text-align:right;'><b>{decay_ratio_v:.2f}×</b>  (W1={E_W1:.3e}, W4={E_W4:.3e})</td>
-    <td style='padding:5px;'>E_W1 &gt; 2&times; E_W4</td>
-    <td style='padding:5px;'>{crit3_pass_str}</td>
+    <td style='padding:5px;'><b>C3: E_W1 &gt; {V4_MIN_DECAY_RATIO}× E_W4</b></td>
+    <td style='padding:5px;'>{c3_str}</td>
 </tr>
 <tr style='background-color:rgba(128,128,128,0.08);'>
-    <td style='padding:5px;'><b>4. Narrow spike</b> sym + flanks @ noise (±0.2 ms)</td>
-    <td style='padding:5px; text-align:right;'><b>asym={asymmetry_ratio:.3f}</b>  (rise={rise_samples} fall={fall_samples} samp)</td>
-    <td style='padding:5px;'>sym≥0.5 AND flanks&lt;3×noise</td>
-    <td style='padding:5px;'>{crit4_pass_str}</td>
+    <td style='padding:5px;'><b>asym (rise/fall) &lt; {V4_MAX_ASYM}</b></td>
+    <td style='padding:5px;'>{asym_str}</td>
 </tr>
 <tr>
-    <td style='padding:5px;'><b>5. Clean tail</b> no secondary burst</td>
-    <td style='padding:5px; text-align:right;'><b style='font-size:9pt;'>{crit5_val_str}</b></td>
-    <td style='padding:5px;'>rebound &lt; 3× valley</td>
-    <td style='padding:5px;'>{crit5_pass_str}</td>
+    <td style='padding:5px;'><b>τ ∈ [{V4_TAU_MIN}, {V4_TAU_MAX}] ms</b></td>
+    <td style='padding:5px;'>{tau_str}</td>
+</tr>
+<tr style='background-color:rgba(128,128,128,0.08);'>
+    <td style='padding:5px;'><b>R² &gt; {V4_MIN_R2}</b></td>
+    <td style='padding:5px;'>{r2_str}</td>
 </tr>
 </table>
 <p style='margin-left:20px; font-size:9pt; color:gray;'>
-Noise RMS cached by detector: {f"{noise_rms*1000:.4f} mV" if noise_rms else "not available – run detector first"}.
-pre_snr window: {pre_source_str}.
+pre_snr window: {pre_src}.  Fit: skip={decay_results.get('fit_skip',5)} samp,
+trunc={'YES' if decay_results.get('fit_truncated') else 'NO'},
+smooth={'YES' if decay_results.get('fit_smoothed') else 'NO'},
+n_fit={decay_results.get('n_fit_samples','?')}.
 </p>
 
-<!-- ═══ SECTION 3: SUB-WINDOW ENERGIES ═══ -->
-<p style='margin-top:12px;'><b style='font-size:13pt; text-decoration:underline;'>Post-peak Sub-windows  (1.5 ms / 4 = 0.375 ms each)</b></p>
-<table style='margin-left:20px; border-collapse:collapse; width:80%;'>
+<!-- SUB-WINDOW ENERGIES -->
+<p style='margin-top:12px;'><b style='font-size:12pt; text-decoration:underline;'>Post-peak Sub-windows  (1.5 ms / 4 = 0.375 ms each)</b></p>
+<table style='margin-left:20px; border-collapse:collapse; width:70%;'>
 <tr style='background-color:rgba(128,128,128,0.2);'>
-    <th style='padding:6px; text-align:left;'>Window</th>
-    <th style='padding:6px; text-align:right;'>Duration</th>
-    <th style='padding:6px; text-align:right;'>Energy (mV²)</th>
-    <th style='padding:6px; text-align:left;'>Trend</th>
+    <th style='padding:5px;'>Win</th><th style='padding:5px;'>Duration</th>
+    <th style='padding:5px; text-align:right;'>Energy (mV²)</th><th style='padding:5px;'>Trend</th>
 </tr>
-<tr><td style='padding:4px;'>W1</td><td style='padding:4px; text-align:right;'>0 – 375 μs</td>
-    <td style='padding:4px; text-align:right;'><b>{decay_results['energies'][0]*1e6:.4f}</b></td>
-    <td style='padding:4px;'>⬆ reference</td></tr>
+<tr><td>W1</td><td>0–375 µs</td>
+    <td style='text-align:right;'><b>{decay_results['energies'][0]*1e6:.4f}</b></td><td>⬆</td></tr>
 <tr style='background-color:rgba(128,128,128,0.08);'>
-<td style='padding:4px;'>W2</td><td style='padding:4px; text-align:right;'>375 – 750 μs</td>
-    <td style='padding:4px; text-align:right;'><b>{decay_results['energies'][1]*1e6:.4f}</b></td>
-    <td style='padding:4px;'>{'⬇' if decay_results['energies'][1] < decay_results['energies'][0] else '⬆'}</td></tr>
-<tr><td style='padding:4px;'>W3</td><td style='padding:4px; text-align:right;'>750 μs – 1.125 ms</td>
-    <td style='padding:4px; text-align:right;'><b>{decay_results['energies'][2]*1e6:.4f}</b></td>
-    <td style='padding:4px;'>{'⬇' if decay_results['energies'][2] < decay_results['energies'][1] else '⬆'}</td></tr>
+    <td>W2</td><td>375–750 µs</td>
+    <td style='text-align:right;'><b>{decay_results['energies'][1]*1e6:.4f}</b></td>
+    <td>{'⬇' if decay_results['energies'][1]<decay_results['energies'][0] else '⬆'}</td></tr>
+<tr><td>W3</td><td>750–1125 µs</td>
+    <td style='text-align:right;'><b>{decay_results['energies'][2]*1e6:.4f}</b></td>
+    <td>{'⬇' if decay_results['energies'][2]<decay_results['energies'][1] else '⬆'}</td></tr>
 <tr style='background-color:rgba(128,128,128,0.08);'>
-<td style='padding:4px;'>W4</td><td style='padding:4px; text-align:right;'>1.125 – 1.5 ms</td>
-    <td style='padding:4px; text-align:right;'><b>{decay_results['energies'][3]*1e6:.4f}</b></td>
-    <td style='padding:4px;'>{'⬇' if decay_results['energies'][3] < decay_results['energies'][2] else '⬆'}</td></tr>
+    <td>W4</td><td>1125–1500 µs</td>
+    <td style='text-align:right;'><b>{decay_results['energies'][3]*1e6:.4f}</b></td>
+    <td>{'⬇' if decay_results['energies'][3]<decay_results['energies'][2] else '⬆'}</td></tr>
 </table>
-<p style='margin-left:20px; font-size:9pt; color:gray;'>Monotone (W1&gt;W2&gt;W3&gt;W4): {'✅ YES' if decay_results['monotone'] else '❌ NO'}</p>
 
-<!-- ═══ SECTION 4: DECAY FIT (DESCRIPTIVE) ═══ -->
-<p style='margin-top:12px;'><b style='font-size:13pt; text-decoration:underline;'>Exponential Decay Fit</b>
-<span style='font-size:9pt; color:gray;'> (descriptive only – NOT used for validation, v3.2 A+B+C)</span></p>
-<table style='margin-left:20px; border-collapse:collapse; width:90%;'>
-<tr>
-    <td style='padding:4px; width:220px;'>Slope (log-linear):</td>
-    <td style='padding:4px;'><b>{decay_results['slope_log']:.6f}</b>
-        {'  ↳ ✅ decay' if decay_results['slope_log'] < 0 else '  ↳ ❌ growth'}</td>
-</tr>
-<tr style='background-color:rgba(128,128,128,0.08);'>
-    <td style='padding:4px;'>R² (log-linear):</td>
-    <td style='padding:4px;'><b>{decay_results['r_squared_log']:.4f}</b>
-        {'  → excellent' if decay_results['r_squared_log'] >= 0.85 else '  → good' if decay_results['r_squared_log'] >= 0.70 else '  → fair' if decay_results['r_squared_log'] >= 0.50 else '  → poor'}</td>
-</tr>
-<tr>
-    <td style='padding:4px;'>τ (decay time constant):</td>
-    <td style='padding:4px;'><b>{f"{decay_results['tau_ms']:.3f} ms" if decay_results['tau_ms'] > 0 else "N/A (slope ≥ 0)"}</b>
-        {f"  ({'⚡ fast' if decay_results['tau_ms'] < 0.1 else '📊 typical' if decay_results['tau_ms'] < 0.5 else '🔊 slow'} click)" if decay_results['tau_ms'] > 0 else ""}</td>
-</tr>
-<tr style='background-color:rgba(128,128,128,0.08);'>
-    <td style='padding:4px;'>Samples analyzed:</td>
-    <td style='padding:4px;'>{decay_results['window_samples']} total
-        {'  ✅ next-frame extended' if decay_results.get('used_next_frame', False) else ''}</td>
-</tr>
-<tr>
-    <td style='padding:4px;'>Fit samples (after A+B):</td>
-    <td style='padding:4px;'><b>{decay_results.get('n_fit_samples', '?')}</b>
-        &nbsp;(skip={decay_results.get('fit_skip', 5)},
-        trunc={'✅' if decay_results.get('fit_truncated') else '—'},
-        smooth={'✅' if decay_results.get('fit_smoothed') else '—'})</td>
-</tr>
-</table>
-<p style='margin-left:20px; font-size:9pt; color:gray;'>
-  A: skip {decay_results.get('fit_skip', 5) - decay_results.get('fit_snap_offset', 0)} post-peak samples (transient) + snap +{decay_results.get('fit_snap_offset', 0)} samp (local-max align, D).
-  B: truncated at 2× noise_rms {'✅' if decay_results.get('fit_truncated') else '(not applied – no noise ref or signal above floor)'}.
-  C: 4-sample moving avg (annuls 50 kHz carrier ripple) {'✅' if decay_results.get('fit_smoothed') else '—'}.
+<!-- FLAGS -->
+<p style='margin-top:8px; margin-left:20px;'>
+Near frame end: {'⚠️ YES – spill handled' if decay_results.get('used_next_frame') else '⚠️ near end' if decay_results['near_end'] else '✅ NO'}
 </p>
 
-<!-- ═══ SECTION 5: FLAGS ═══ -->
-<p style='margin-top:10px; margin-left:20px; font-size:10pt;'>
-<b>Near frame end (&gt;41%):</b> {'⚠️ YES – spill possible' if decay_results['near_end'] else '✅ NO'}
-</p>
-
-<!-- ═══ VERDICT ═══ -->
+<!-- VERDICT -->
 <br>
 <p style='text-align:center; font-size:14pt; font-weight:bold; padding:10px;
           background-color:rgba({self._verdict_color_to_rgb(verdict_color)},0.3); border-radius:5px;'>
 {verdict}
 </p>
 <p style='text-align:center; font-size:9pt; color:gray;'>
-  Verdict is based on decay shape only. Full validation uses all 5 criteria: SNR, pre_snr &lt; 3.0, E_W1 &gt; 2×E_W4, narrow-spike test, clean tail.
-  Decay fit (R², τ) uses v3.2 improvements: skip 5 samp, truncate at 2×noise_rms, 4-samp smoothing.
+  Thresholds shown are v4.0 defaults (configurable in Click Detector dialog).
+  Stage 2 FFT filters (SPR ≤ 20, peak_fft &gt; 0.85 mV) not evaluated here.
 </p>
-
 </div>
 """
-        
-        text_widget.setHtml(html_content)
+        text_widget.setHtml(html)
         layout.addWidget(text_widget)
-        
-        # PULSANTE CHIUDI
-        button_layout = QHBoxLayout()
-        button_layout.addStretch()
-        close_button = QPushButton("Close")
-        close_button.setMinimumWidth(100)
-        close_button.clicked.connect(dialog.accept)
-        button_layout.addWidget(close_button)
-        button_layout.addStretch()
-        layout.addLayout(button_layout)
-        
-        # Applica tema
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setMinimumWidth(100)
+        close_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(close_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
         if self.parent and hasattr(self.parent, 'theme_manager'):
             saved_theme = self.parent.theme_manager.load_saved_theme()
             self.parent.theme_manager.apply_theme(dialog, saved_theme)
@@ -1348,7 +1213,6 @@ pre_snr window: {pre_source_str}.
                                   border: 1px solid #ccc; padding: 5px; border-radius: 3px; }
                     QPushButton:hover { background-color: #e0e0e0; }
                 """)
-
         dialog.exec()
     
     def _verdict_color_to_rgb(self, color_name):
@@ -1527,86 +1391,76 @@ def estimate_noise_offline(data_manager, energy_threshold_multiplier=4.0, max_sa
     }
 
 
-def suppress_edge_artifacts(signal: np.ndarray, edge_samples: int = 4,
-                             artifact_factor: float = 3.0) -> np.ndarray:
+def suppress_edge_artifacts(signal: np.ndarray,
+                             check_samples: int = 15,
+                             gibbs_factor: float = 2.5) -> np.ndarray:
     """
-    Neutralizza artefatti di bordo nel segnale time-domain post-iFFT.
+    Sopprime artefatti di Gibbs nel segnale time-domain post-iFFT.
 
-    Nonostante la finestra Tukey applicata allo spettro complesso, i primi e gli ultimi
-    campioni della iFFT possono contenere valori anomali causati da discontinuità di fase
-    alla frontiera della finestra spettrale. Questi si manifestano come overshooting
-    che, sull'envelope di Hilbert, appare come un picco isolato → falso positivo.
+    ALGORITMO v3 — RILEVAMENTO SIMMETRICO (AND condition)
+    =====================================================
+    Il fenomeno di Gibbs è SIMMETRICO: deriva dalla troncatura spettrale
+    (bin_start=51, bin_end=204) e produce ringing su ENTRAMBI i bordi del
+    frame simultaneamente e con intensità paragonabile.
 
-    Pattern tipico osservato (bordo destro, letto a ritroso):
-        s[n-1] = +140 µV  ← artefatto
-        s[n-2] = +130 µV  ← artefatto
-        s[n-3] =  -25 µV  ← segnale normale (rumore ±20 µV)
-        ...
+    Strategia:
+    - Calcola energia RMS sui primi `check_samples` campioni (bordo sx)
+    - Calcola energia RMS sugli ultimi `check_samples` campioni (bordo dx)
+    - Calcola energia RMS nella zona interna [40 .. n-40] (riferimento sicuro)
+    - Se ENTRAMBI i bordi hanno energia > gibbs_factor × energia_interna
+      → Gibbs confermato → applica half-Hann fade su check_samples per lato
+    - Altrimenti → segnale reale o click a bordo → NON toccare nulla
 
-    **Algoritmo (corretto)**:
-    Per ogni campione di bordo i ∈ [0..edge_samples-1]:
-      1. La finestra di riferimento parte SEMPRE da edge_samples verso l'interno,
-         così i campioni di bordo (anche quelli non ancora corretti) NON inquinano
-         mai la stima del livello locale.
-      2. Il riferimento è il PICCO assoluto dei campioni interni (non RMS).
-      3. Se |s[i]| > artifact_factor × peak_interno → artefatto → azzerato
-         (zero è più sicuro dell'interpolazione: evita di introdurre discontinuità
-          artificiali che l'envelope di Hilbert potrebbe amplificare)
-      4. Se comparabile → segnale reale → lasciato intatto.
-
-    Perché zero invece di interpolazione:
-      Gli artefatti di bordo iFFT sono tipicamente di fase opposta o di ampiezza
-      incoerente. Sostituirli con zero (o con un valore molto piccolo) è equivalente
-      a dire "non ho informazione qui" — il segnale analitico di Hilbert gestisce
-      bene brevi tratti azzerati senza produrre artefatti sull'envelope.
+    Perché AND e non OR:
+    - Un click reale vicino al bordo sx → bordo sx alto, bordo dx basso → AND
+      fallisce → click preservato ✅
+    - Gibbs puro → entrambi i bordi elevati vs interno silenzioso → AND vero
+      → corretto ✅
+    - Caso raro (click che riempie tutto il frame) → τ > 2.56 ms → già
+      escluso dal criterio τ_max = 1.3 ms, nessun danno ✅
 
     Parametri
     ---------
     signal : np.ndarray
-        Segnale time-domain (output di irfft).
-    edge_samples : int
-        Numero di campioni di bordo da esaminare su ciascun lato (default: 4).
-        Aumentato a 4 per coprire il pattern osservato (2 campioni anomali + margine).
-    artifact_factor : float
-        Soglia = artifact_factor × max(|campioni interni|). Default: 3.0.
-        Con rumore ±20 µV e picco interno = 25 µV → soglia = 75 µV.
-        Campioni anomali a 130-140 µV vengono corretti. ✓
-        Click reale al bordo (tutti i campioni nell'area sono grandi) → soglia alta → PASS. ✓
+        Segnale time-domain (output di irfft), tipicamente 512 campioni.
+    check_samples : int
+        Campioni di bordo da esaminare (default: 15 ≈ 0.075 ms @ 200 kHz).
+    gibbs_factor : float
+        Soglia: bordo_rms > gibbs_factor × interno_rms → bordo sospetto.
 
     Returns
     -------
     np.ndarray
-        Segnale con bordi corretti (copia, originale non modificato).
+        Segnale con bordi corretti se Gibbs rilevato, copia invariata altrimenti.
     """
-    if len(signal) < edge_samples * 3 + 2:
+    n = len(signal)
+    if n < 100:
         return signal.copy()
 
     result = signal.copy()
-    n = len(result)
 
-    # Finestra di riferimento: sempre dall'INTERNO, mai toccata dai bordi.
-    # Usiamo campioni [edge_samples .. edge_samples+ref_window-1] per il lato sinistro
-    # e [n-edge_samples-ref_window .. n-edge_samples-1] per il lato destro.
-    ref_window = 10  # 10 campioni interni = stima robusta del livello locale
+    # Zona interna: lontana dai bordi, sicura da artefatti di Gibbs
+    interior = result[40: n - 40]
+    if len(interior) < 10:
+        return result
 
-    # --- Bordo sinistro: campioni [0 .. edge_samples-1] ---
-    ref_left = result[edge_samples: edge_samples + ref_window]
-    peak_left = float(np.max(np.abs(ref_left))) if len(ref_left) > 0 else 0.0
-    threshold_left = artifact_factor * peak_left if peak_left > 0 else np.inf
+    energy_interior = float(np.sqrt(np.mean(interior ** 2)))
+    if energy_interior < 1e-15:
+        # Segnale quasi nullo → niente da correggere
+        return result
 
-    for i in range(edge_samples):
-        if abs(result[i]) > threshold_left:
-            result[i] = 0.0  # azzera: nessuna informazione affidabile qui
+    # Energie dei bordi
+    energy_left  = float(np.sqrt(np.mean(result[:check_samples] ** 2)))
+    energy_right = float(np.sqrt(np.mean(result[n - check_samples:] ** 2)))
 
-    # --- Bordo destro: campioni [n-edge_samples .. n-1] ---
-    ref_right = result[n - edge_samples - ref_window: n - edge_samples]
-    peak_right = float(np.max(np.abs(ref_right))) if len(ref_right) > 0 else 0.0
-    threshold_right = artifact_factor * peak_right if peak_right > 0 else np.inf
+    left_suspicious  = energy_left  > gibbs_factor * energy_interior
+    right_suspicious = energy_right > gibbs_factor * energy_interior
 
-    for i in range(edge_samples):
-        idx = n - 1 - i
-        if abs(result[idx]) > threshold_right:
-            result[idx] = 0.0  # azzera: nessuna informazione affidabile qui
+    # Applica correzione SOLO se entrambi i bordi sono anomali (Gibbs = simmetrico)
+    if left_suspicious and right_suspicious:
+        fade_win = 0.5 * (1.0 - np.cos(np.pi * np.arange(check_samples) / check_samples))
+        result[:check_samples]       *= fade_win        # fade-in sinistro
+        result[n - check_samples:]   *= fade_win[::-1]  # fade-out destro
 
     return result
 
@@ -1792,16 +1646,32 @@ def compute_decay_r2(post_peak_window: np.ndarray, fs: int = 200000,
         }
 
     # ── Fit log-lineare ───────────────────────────────────────────────────────
+    # ⚠️  np.polyfit chiama np.linalg.lstsq → Apple Accelerate LAPACK → segfault
+    #    se invocato da un QThread su macOS. Sostituiamo con la formula chiusa
+    #    della regressione lineare semplice (O(n), zero chiamate BLAS/LAPACK):
+    #        slope = (n·Σ(x·y) − Σx·Σy) / (n·Σ(x²) − (Σx)²)
+    #    che è esattamente quello che polyfit(deg=1) calcola internamente, ma
+    #    usando solo operazioni element-wise su numpy array (thread-safe).
     epsilon = 1e-9
     log_env = np.log(np.maximum(working, epsilon))
-    n_array = np.arange(n_fit, dtype=float)
+    n_array = np.arange(n_fit, dtype=np.float64)
 
     try:
-        slope_log, intercept = np.polyfit(n_array, log_env, deg=1)
+        # Regressione lineare con formula chiusa — nessun BLAS/LAPACK
+        n_pts  = float(n_fit)
+        sum_x  = float(np.sum(n_array))
+        sum_y  = float(np.sum(log_env))
+        sum_xx = float(np.sum(n_array * n_array))
+        sum_xy = float(np.sum(n_array * log_env))
+        denom  = n_pts * sum_xx - sum_x * sum_x
+        if abs(denom) < 1e-30:
+            raise ValueError("degenerate fit (all x equal)")
+        slope_log = (n_pts * sum_xy - sum_x * sum_y) / denom
+        intercept = (sum_y - slope_log * sum_x) / n_pts
 
         log_pred = slope_log * n_array + intercept
-        ss_res = np.sum((log_env - log_pred) ** 2)
-        ss_tot = np.sum((log_env - np.mean(log_env)) ** 2)
+        ss_res = float(np.sum((log_env - log_pred) ** 2))
+        ss_tot = float(np.sum((log_env - (sum_y / n_pts)) ** 2))
         r2_log = float(1.0 - ss_res / ss_tot) if ss_tot > 1e-30 else 0.0
 
         if slope_log < 0:
@@ -1828,7 +1698,8 @@ def compute_decay_r2(post_peak_window: np.ndarray, fs: int = 200000,
 
 
 def check_decay(envelope: np.ndarray, peak_idx: int, fs=200000,
-                next_frame_signal=None, noise_rms: float = None) -> dict:
+                next_frame_signal=None, next_frame_envelope=None,
+                noise_rms: float = None) -> dict:
     """
     Analizza il decadimento post-picco e calcola feature descrittive.
     
@@ -1900,20 +1771,24 @@ def check_decay(envelope: np.ndarray, peak_idx: int, fs=200000,
     end_idx = peak_idx + window_samples
     
     # ✅ SE PICCO VICINO A FINE FRAME E DATI INSUFFICIENTI
-    if end_idx > len(envelope) and near_end and next_frame_signal is not None:
+    if end_idx > len(envelope) and near_end and (next_frame_envelope is not None or next_frame_signal is not None):
         # Calcola quanti samples mancano
         missing_samples = end_idx - len(envelope)
         
         print(f"   🔗 SPILL DETECTED: Peak at sample {peak_idx}/{len(envelope)}, need {missing_samples} samples from next frame")
         
-        # Calcola envelope del frame successivo
+        # Usa l'envelope pre-calcolato se disponibile, altrimenti lo calcola
         try:
-            next_envelope = compute_hilbert_envelope(next_frame_signal)
+            if next_frame_envelope is not None:
+                next_env = next_frame_envelope
+            else:
+                # fallback legacy — preferire sempre next_frame_envelope
+                next_env = compute_hilbert_envelope(next_frame_signal)
             
             # Concatena: envelope corrente + primi N samples del prossimo
             extended_envelope = np.concatenate([
                 envelope[start_idx:],
-                next_envelope[:missing_samples]
+                next_env[:missing_samples]
             ])
             
             decay_window = extended_envelope
@@ -1956,17 +1831,24 @@ def check_decay(envelope: np.ndarray, peak_idx: int, fs=200000,
         
         energies = [E1, E2, E3, E4]
         
-        # Fit lineare legacy (solo per reference)
-        x_fit = np.array([0, 1, 2, 3])
-        y_fit = np.array(energies)
+        # Fit lineare legacy (solo per reference) — formula chiusa, no BLAS
+        x_fit = np.array([0, 1, 2, 3], dtype=np.float64)
+        y_fit = np.array(energies,      dtype=np.float64)
         
         try:
-            slope_legacy, _ = np.polyfit(x_fit, y_fit, deg=1)
-            y_pred = slope_legacy * x_fit + np.mean(y_fit)
-            ss_res = np.sum((y_fit - y_pred) ** 2)
-            ss_tot = np.sum((y_fit - np.mean(y_fit)) ** 2)
-            r2_legacy = float(1 - (ss_res / ss_tot)) if ss_tot > 0 else 0.0
-        except:
+            n_pts_l  = 4.0
+            sx  = float(np.sum(x_fit))
+            sy  = float(np.sum(y_fit))
+            sxx = float(np.sum(x_fit * x_fit))
+            sxy = float(np.sum(x_fit * y_fit))
+            den = n_pts_l * sxx - sx * sx
+            slope_legacy = (n_pts_l * sxy - sx * sy) / den if abs(den) > 1e-30 else 0.0
+            intercept_l  = (sy - slope_legacy * sx) / n_pts_l
+            y_pred = slope_legacy * x_fit + intercept_l
+            ss_res = float(np.sum((y_fit - y_pred) ** 2))
+            ss_tot = float(np.sum((y_fit - sy / n_pts_l) ** 2))
+            r2_legacy = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+        except Exception:
             slope_legacy = 0.0
             r2_legacy = 0.0
         
@@ -2852,6 +2734,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
         # ✅ ESEGUI iFFT (ORA con spettro completo 256 bins FORZANDO n=fft_size (512)
         try:
             time_domain_signal = np.fft.irfft(complex_spectrum, n=fft_size)
+            time_domain_signal = suppress_edge_artifacts(time_domain_signal)  # ✅ FIX Gibbs
         except Exception as e:
             QMessageBox.critical(self, "iFFT Error", f"Failed to compute iFFT:\n{str(e)}")
             return
@@ -3185,7 +3068,49 @@ class ReplayWindowAudio(ReplayBaseWindow):
             except:
                 pass  # Legenda già presente
         
-        # === 10. FEEDBACK UTENTE ===
+        # === 10. STAGE 2 FFT FILTER EVALUATION (v4.0) ===
+        # Thresholds (align with click_detector_dialog defaults)
+        STAGE2_MAX_SPR   = 20.0
+        STAGE2_MIN_PEAK  = 0.00085   # 0.85 mV in V (FFT data in V)
+
+        # Peak amplitude of normalized spectrum (in range 20-80 kHz)
+        peak_fft_norm = float(np.max(normalized_fft[valid_mask]))
+
+        # SPR = peak / (mean of neighbours in full spectrum, simple approximation)
+        peak_bin = int(np.argmax(normalized_fft))
+        N = len(normalized_fft)
+        NEIGHBOUR_HALF = max(1, N // 40)   # ~2.5% of bins as neighbour window
+        n_lo = max(0, peak_bin - NEIGHBOUR_HALF)
+        n_hi = min(N, peak_bin + NEIGHBOUR_HALF + 1)
+        # Exclude peak bin itself, use surrounding bands
+        side_lo = normalized_fft[max(0, n_lo - NEIGHBOUR_HALF * 2):n_lo]
+        side_hi = normalized_fft[n_hi:min(N, n_hi + NEIGHBOUR_HALF * 2)]
+        sides = np.concatenate([side_lo, side_hi])
+        mean_neighbours = float(np.mean(sides)) if len(sides) > 0 else 1e-12
+        spr_val = peak_fft_norm / mean_neighbours if mean_neighbours > 0 else 999.0
+
+        peak_pass_s2  = (peak_fft_norm >= STAGE2_MIN_PEAK)
+        spr_pass_s2   = (spr_val <= STAGE2_MAX_SPR)
+        stage2_pass   = peak_pass_s2 and spr_pass_s2
+
+        s2_icon = "✅" if stage2_pass else "❌"
+        peak_icon = "✅" if peak_pass_s2 else "❌"
+        spr_icon  = "✅" if spr_pass_s2  else "❌"
+
+        stage2_html = (
+            f"<hr>"
+            f"<b>Stage 2 FFT Filter (v4.0)</b><br>"
+            f"{s2_icon} <b>{'PASS' if stage2_pass else 'FAIL'}</b> — normalized FFT<br>"
+            f"&nbsp;&nbsp;{peak_icon} Peak FFT: <b>{peak_fft_norm*1000:.3f} mV</b>"
+            f"  (need ≥ 0.85 mV)<br>"
+            f"&nbsp;&nbsp;{spr_icon} SPR: <b>{spr_val:.1f}</b>"
+            f"  (need ≤ 20)<br>"
+            f"<span style='font-size:9pt; color:gray;'>"
+            f"Peak bin: {freq_axis[peak_bin]/1000:.1f} kHz"
+            f"</span>"
+        )
+
+        # === 11. FEEDBACK UTENTE ===
         msg = QMessageBox(self)
         msg.setIcon(QMessageBox.Information)
         msg.setWindowTitle("Normalization Applied (Display Only)")
@@ -3198,7 +3123,8 @@ class ReplayWindowAudio(ReplayBaseWindow):
             f"<font color='red'><b>Red curve:</b> Normalized (50%)</font><br><br>"
             f"⚠️ <b>Original data unchanged</b> (overlay display only)<br>"
             f"📝 Suitable for <b>qualitative analysis</b> only<br>"
-            f"📖 See technical report for details"
+            f"📖 See technical report for details<br>"
+            f"{stage2_html}"
         )
         msg.setStyleSheet("""
             QMessageBox {
@@ -3223,8 +3149,9 @@ class ReplayWindowAudio(ReplayBaseWindow):
             }
         """)
         msg.exec()
-        
-        print("✅ Normalization overlay displayed")
+
+        print(f"✅ Normalization overlay displayed  |  Stage 2: {'PASS' if stage2_pass else 'FAIL'}"
+              f"  peak={peak_fft_norm*1000:.3f} mV  SPR={spr_val:.1f}")
         
         # Salva dati normalizzati per iFFT window
         self._normalized_fft_cache = {

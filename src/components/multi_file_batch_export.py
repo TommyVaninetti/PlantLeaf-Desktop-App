@@ -100,7 +100,7 @@ class MultiFileBatchExportDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Batch Screenshot Export — Multiple Files")
         self.setMinimumSize(700, 600)
-        self.resize(820, 870)
+        self.resize(900, 870)
 
         # Internal state
         self._file_paths: list[str] = []
