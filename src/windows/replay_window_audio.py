@@ -25,7 +25,6 @@ from core.replay_base_window import ReplayBaseWindow, compute_fft_energy, Spectr
 from core.replay_base_window import ReplayBaseWindow, compute_fft_energy, SpectralEnergyDialog
 from plotting.plot_manager import BasePlotWidget
 from core.audio_trim_export import AudioTrimExporter
-from scipy.signal import hilbert
 
 
 class AudioDataManager:
@@ -1615,26 +1614,41 @@ def suppress_edge_artifacts(signal: np.ndarray, edge_samples: int = 4,
 def compute_hilbert_envelope(signal: np.ndarray) -> np.ndarray:
     """
     Calcola l'inviluppo istantaneo del segnale usando la trasformata di Hilbert.
-    
+
+    Implementazione pure-numpy (senza scipy) per garantire la thread-safety su
+    macOS: scipy.signal.hilbert chiama internamente BLAS/LAPACK tramite openblas,
+    il che può causare un segfault quando invocato da un QThread sul main run-loop
+    di Cocoa. La versione numpy usa solo np.fft.rfft / np.fft.irfft che sono
+    sicuri in qualsiasi thread.
+
     Per un click ultrasonico (sinusoide smorzata), l'inviluppo mostra il decadimento
     esponenziale che lo caratterizza.
-    
+
     Parameters:
     -----------
     signal : np.ndarray
         Segnale time-domain (es: output di iFFT)
-    
+
     Returns:
     --------
     np.ndarray : Instantaneous amplitude envelope A[n] = |analytic_signal[n]|
     """
-    # Segnale analitico = signal + j*hilbert(signal)
-    analytic_signal = hilbert(signal)
-    
-    # Inviluppo = modulo del segnale analitico
-    envelope = np.abs(analytic_signal)
-    
-    return envelope
+    N = len(signal)
+    # Spettro a singolo lato (rfft è sufficiente perché il segnale è reale)
+    Xf = np.fft.rfft(signal, n=N)
+    # Costruisce la finestra analitica: DC e Nyquist rimangono invariati,
+    # tutte le frequenze positive vengono raddoppiate
+    h = np.zeros(N // 2 + 1, dtype=np.float64)
+    h[0] = 1.0                  # DC
+    if N % 2 == 0:
+        h[1:-1] = 2.0           # frequenze positive (escluso Nyquist)
+        h[-1]   = 1.0           # Nyquist (solo quando N è pari)
+    else:
+        h[1:]   = 2.0           # frequenze positive
+    # Parte immaginaria del segnale analitico (trasformata di Hilbert)
+    hilbert_part = np.fft.irfft(Xf * h, n=N)
+    # Inviluppo = modulo del segnale analitico = sqrt(x² + H{x}²)
+    return np.sqrt(signal ** 2 + hilbert_part ** 2)
 
 
 def find_peak(signal: np.ndarray) -> tuple:

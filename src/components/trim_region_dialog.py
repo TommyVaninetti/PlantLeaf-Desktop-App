@@ -452,7 +452,7 @@ class TrimRegionDialog(QDialog):
         name_no_ext = os.path.splitext(original_name)[0]
         ext = os.path.splitext(original_name)[1]
         
-        default_name = f"{name_no_ext}_trimmed_{start:.1f}-{end:.1f}s{ext}"
+        default_name = f"{name_no_ext}_final" #cambiato per rendere più semplice il nome
         default_path = os.path.join(os.path.dirname(self.file_path), default_name)
         
         # Salva il path completo internamente

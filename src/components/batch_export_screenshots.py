@@ -304,19 +304,31 @@ class BatchExportWorker(QThread):
             fft_norm  = self._normalize_fft(fft_raw)
             freq_axis = dm.frequency_axis
 
-            # Envelopes
-            env_raw  = compute_hilbert_envelope(sig_raw)
-            env_norm = compute_hilbert_envelope(sig_norm)
+            # Envelopes — wrap in try/except: scipy.hilbert can segfault on
+            # macOS when called from a QThread if openblas has threading issues
+            try:
+                env_raw  = compute_hilbert_envelope(sig_raw)
+                env_norm = compute_hilbert_envelope(sig_norm)
+            except Exception as e:
+                print(f"⚠️  hilbert envelope failed for frame {frame_idx}: {e}")
+                continue
             peak_idx, peak_amp = find_peak(env_raw)
 
             # Decay fit
             fs = dm.header_info.get('fs', 200000)
             next_sig = None
             if peak_idx > 212 and frame_idx + 1 < total_frames:
-                next_sig = self._reconstruct_ifft(frame_idx + 1, normalized=False)
-            decay = check_decay(env_raw, peak_idx,
-                                next_frame_signal=next_sig,
-                                noise_rms=noise_rms)
+                try:
+                    next_sig = self._reconstruct_ifft(frame_idx + 1, normalized=False)
+                except Exception:
+                    next_sig = None
+            try:
+                decay = check_decay(env_raw, peak_idx,
+                                    next_frame_signal=next_sig,
+                                    noise_rms=noise_rms)
+            except Exception as e:
+                print(f"⚠️  check_decay failed for frame {frame_idx}: {e}")
+                continue
 
             snr    = peak_amp / noise_rms if noise_rms > 0 else 0.0
             E_W1   = decay['E_W1']
@@ -377,18 +389,18 @@ class BatchExportWorker(QThread):
                 # Group info (for folder structure)
                 'group_size':      group_size,
                 'group_first_ts':  group_first_ts,
-                # FFT
-                'freq_axis':       freq_axis,
-                'fft_raw':         fft_raw,
-                'fft_norm':        fft_norm,
-                # iFFT
-                'time_axis':       time_axis,
-                'sig_raw':         sig_raw,
-                'sig_norm':        sig_norm,
-                'env_norm':        env_norm,
-                # Fit
-                'fit_xs':          fit_xs,
-                'fit_ys':          fit_ys,
+                # FFT — copy so main thread owns independent memory
+                'freq_axis':       np.array(freq_axis, copy=True),
+                'fft_raw':         np.array(fft_raw,   copy=True),
+                'fft_norm':        np.array(fft_norm,  copy=True),
+                # iFFT — copy so main thread owns independent memory
+                'time_axis':       np.array(time_axis, copy=True),
+                'sig_raw':         np.array(sig_raw,   copy=True),
+                'sig_norm':        np.array(sig_norm,  copy=True),
+                'env_norm':        np.array(env_norm,  copy=True),
+                # Fit — copy if not None
+                'fit_xs':          np.array(fit_xs, copy=True) if fit_xs is not None else None,
+                'fit_ys':          np.array(fit_ys, copy=True) if fit_ys is not None else None,
                 'fit_skip':        fit_skip_total,
                 'r2':              r2,
                 'tau_ms':          tau_ms,
@@ -465,16 +477,16 @@ def render_click_screenshot(frame_data: dict, out_path: str, accent_color: str):
     n_total   = frame_data.get('n_total', 1)
 
     # ── Root container ────────────────────────────────────────────────────────
-    # Use Qt.Tool + FramelessWindowHint so the widget is never shown as a
-    # normal window in the taskbar / Mission Control on macOS.
-    # We move it far off-screen AND keep it at 0×0 size until layout is
-    # applied, preventing any visible flash.
+    # Qt.Tool + FramelessWindowHint keeps the widget out of the taskbar /
+    # Mission Control on macOS.  WA_DontShowOnScreen (set just before show())
+    # prevents any native OS window from ever being created, which avoids
+    # both the "outside any known screen" warning and the segfault that
+    # followed when dozens of off-screen windows accumulated.
     container = QWidget(
         None,
-        Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+        Qt.Tool | Qt.FramelessWindowHint
     )
     container.setFixedSize(W, H)
-    container.move(-W - 200, -H - 200)   # well off-screen in all directions
     container.setStyleSheet("background-color: #1e1e2e;")
     container.setAttribute(Qt.WA_DeleteOnClose, False)  # we destroy() manually
 
@@ -633,16 +645,22 @@ def render_click_screenshot(frame_data: dict, out_path: str, accent_color: str):
     root.addWidget(footer_lbl)
 
     # ── Render ────────────────────────────────────────────────────────────────
-    # Show the widget (off-screen) so Qt creates native handles and runs
-    # the layout engine, but process only posted/paint events — this ensures
-    # pyqtgraph PlotWidgets draw their content without the window ever
-    # appearing visibly on the user's display.
-    container.show()
-    QApplication.processEvents()
+    # IMPORTANT: we must NOT call show() on macOS — positioning a window
+    # outside screen bounds triggers "Window position … outside any known
+    # screen" warnings and eventually a segfault when many frames are queued.
+    #
+    # Strategy: force layout resolution without creating a native window.
+    #   1. setAttribute(WA_DontShowOnScreen) prevents any native handle from
+    #      being created by show().
+    #   2. show() is called only to trigger Qt's layout engine (which requires
+    #      the widget to be "visible" from Qt's perspective, but
+    #      WA_DontShowOnScreen suppresses the actual OS window creation).
+    #   3. Render directly via container.render() into an off-screen QPixmap.
+    #   4. hide() + destroy() cleans up immediately without touching native handles.
+    container.setAttribute(Qt.WA_DontShowOnScreen, True)
+    container.show()                       # triggers layout engine, no OS window
+    QApplication.processEvents()           # let pyqtgraph paint into its buffers
 
-    # Render directly into a QPixmap.
-    # render(QPainter, QPoint, ...) requires a QPoint as second positional arg.
-    # The QPainter must be ended BEFORE saving or destroying the pixmap.
     pixmap  = QPixmap(W, H)
     pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
@@ -650,12 +668,10 @@ def render_click_screenshot(frame_data: dict, out_path: str, accent_color: str):
     painter.end()   # ← must end before save() or "Cannot destroy paint device" error
     saved = pixmap.save(out_path, "PNG")
 
-    # Destroy synchronously — do NOT use deleteLater().
-    # deleteLater() schedules destruction for the next event loop tick; with
-    # 100+ widgets queued they pile up, exhausting native window handles and
-    # eventually crashing the app.  close() + destroy() releases the macOS
-    # NSWindow handle immediately.
-    container.close()
+    # Tear down: hide first (prevents any deferred show), then destroy.
+    # Do NOT use deleteLater() — with 100+ frames queued they pile up and
+    # exhaust native resources before the event loop can clean them up.
+    container.hide()
     container.destroy()
     return saved
 

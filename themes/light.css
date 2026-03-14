@@ -278,3 +278,14 @@ QListWidget::item:selected {
 QListWidget::item:hover {
     background-color: #f8f9fa;
 }
+/* ==== QPlainTextEdit / QTextEdit ==== */
+QPlainTextEdit, QTextEdit {
+    background-color: #ffffff;
+    color: #343a40;
+    border: 2px solid #dee2e6;
+    border-radius: 4px;
+    padding: 4px 8px;
+}
+QPlainTextEdit:focus, QTextEdit:focus {
+    border-color: #007bff;
+}

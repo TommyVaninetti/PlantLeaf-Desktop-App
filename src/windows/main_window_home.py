@@ -29,6 +29,7 @@ class MainWindowHome(BaseWindow):
         self.actionWebSite = QAction("Website", self)
         self.actionLicense = QAction("License", self)
         self.actionOpenFile = QAction("Open File", self)
+        self.actionBatchScreenshots = QAction("Batch Screenshots (Multiple Files)…", self)
         self.actionDark = QAction("Dark", self)
         self.actionDark_Green = QAction("Dark Green", self)
         self.actionDark_Blue = QAction("Dark Blue", self)
@@ -74,6 +75,9 @@ class MainWindowHome(BaseWindow):
         menu_bar.addMenu(menu_file)
         menu_file.addAction(self.actionOpenFile)
         self.actionOpenFile.setShortcut("Ctrl+O")
+        menu_file.addSeparator()
+        menu_file.addAction(self.actionBatchScreenshots)
+        self.actionBatchScreenshots.setShortcut("Ctrl+Shift+B")
 
         # Menu Settings (solo temi e font)
         menu_settings = QMenu("Settings", self)
@@ -125,6 +129,7 @@ class MainWindowHome(BaseWindow):
             (self.actionWebSite, self.website_action),
             (self.actionLicense, self.license_action),
             (self.actionOpenFile, self.open_file_action),
+            (self.actionBatchScreenshots, self._launch_multi_file_batch_export),
             (self.actionDark, lambda: self.update_style(theme_name="dark.css")),
             (self.actionDark_Green, lambda: self.update_style(theme_name="dark_green.css")),
             (self.actionDark_Blue, lambda: self.update_style(theme_name="dark_blue.css")),
@@ -247,8 +252,12 @@ class MainWindowHome(BaseWindow):
     #AZIONI PULSANTI PRINCIPALI
 
 
+    def _launch_multi_file_batch_export(self):
+        """Open the multi-file batch screenshot export dialog."""
+        from components.multi_file_batch_export import launch_multi_file_batch_export
+        launch_multi_file_batch_export(self)
+
     def new_voltage_analysis(self):
-        """Start a new voltage analysis"""
         print("🔋 Starting new voltage analysis...")
         try:
             from windows.main_window_voltage import MainWindowVoltage
