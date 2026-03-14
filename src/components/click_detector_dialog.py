@@ -4,20 +4,25 @@ Click Detector Algorithm Dialog - Rilevamento automatico click ultrasonici
 Implementa la pipeline algoritmica a 4 stadi descritta in:
 docs/click_detector_algorithm_strategy.md
 
-PIPELINE (v3.0 - Updated Validation Criteria):
+PIPELINE (v3.1 - Updated Validation Criteria):
 1. Stage 1: Energy threshold (μ + Nσ)
-2. Stage 2: Spectral ratio R = E_low/E_high (DESCRIPTIVE ONLY - not used for validation)
-3. Stage 3: Three-criterion validation:
+2. Stage 2: SPR broadband filter + Spectral ratio R = E_low/E_high (descriptive)
+3. Stage 3: Five-criterion validation:
    - Criterion 1: Temporal SNR > 5.0 (peak_amplitude / noise_rms)
-   - Criterion 2: PRE_ratio < 0.15 (E_pre / E_post - silence before click)
+   - Criterion 2: pre_snr < 3.0 (RMS(pre_window) / noise_rms - silence before click)
+                  Window: Case A (peak≥60→current frame), Case B (peak<60→prev[-200:]+current),
+                          Case C (first frame→fallback pre_snr=1.0)
+                  Raised from 2.0: leaf turbulence before impact can legitimately elevate pre-RMS.
    - Criterion 3: Global decay: E_W1 > E_W4 (first > last sub-window)
+   - Criterion 4: Asymmetry: rise/fall ratio < 0.5 (rejects symmetric spikes ~0.3 ms)
+   - Criterion 5: Clean tail: no secondary burst > 3× valley (rejects ringing/multi-burst)
 4. Stage 4: Deduplication
 
 PARAMETRI CONFIGURABILI:
 - Threshold energia: μ + Nσ (default: N=4, step=σ)
 - Normalizzazione 50%: On/Off
 - SNR minimo: 3.0-10.0 (default: 5.0)
-- PRE_ratio max: 0.0-0.5 (default: 0.15)
+- max_pre_snr: 1.0-10.0 (default: 3.0)
 
 REMOVED IN v3.0:
 - R² spectral/decay thresholds (now descriptive features only)
@@ -26,6 +31,7 @@ REMOVED IN v3.0:
 FEATURE UPDATES:
 - tau_ms, r2_log, R: saved as DESCRIPTIVE features for statistical analysis
 - Offline noise estimation for accurate SNR calculation
+- pre_snr replaces PRE_ratio (absolute reference via noise_rms, handles early-peak edge case)
 """
 
 import numpy as np
@@ -42,7 +48,7 @@ from PySide6.QtGui import QFont
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from windows.replay_window_audio import compute_hilbert_envelope, find_peak, check_decay, estimate_noise_offline
+from windows.replay_window_audio import compute_hilbert_envelope, find_peak, check_decay, estimate_noise_offline, suppress_edge_artifacts
 from core.replay_base_window import compute_fft_energy
 
 
@@ -123,14 +129,39 @@ class ClickDetectorDialog(QDialog):
         self.snr_min_spinbox.setToolTip("Stage 3: Minimum SNR for click validation\nRecommended: 5.0")
         params_layout.addRow("Min. SNR (Criterion 1):", self.snr_min_spinbox)
         
-        # 4. PRE_ratio max
-        self.pre_ratio_max_spinbox = QDoubleSpinBox()
-        self.pre_ratio_max_spinbox.setDecimals(2)
-        self.pre_ratio_max_spinbox.setRange(0.0, 0.5)
-        self.pre_ratio_max_spinbox.setSingleStep(0.05)
-        self.pre_ratio_max_spinbox.setValue(0.15)
-        self.pre_ratio_max_spinbox.setToolTip("Stage 3: Maximum PRE_ratio for click validation\nRecommended: 0.15")
-        params_layout.addRow("Max. PRE_ratio (Criterion 2):", self.pre_ratio_max_spinbox)
+        # 4. Max Spectral Peak Ratio (Stage 2 filter)
+        self.max_spr_spinbox = QDoubleSpinBox()
+        self.max_spr_spinbox.setDecimals(0)
+        self.max_spr_spinbox.setRange(5.0, 200.0)
+        self.max_spr_spinbox.setSingleStep(5.0)
+        self.max_spr_spinbox.setValue(30.0)
+        self.max_spr_spinbox.setToolTip(
+            "Stage 2 – Spectral Peak Ratio filter (broadband check)\n"
+            "SPR = max(|X[k]|²) / mean(|X[k]|²)  over 154 bins (20-80 kHz)\n\n"
+            "  Click broadband (≥15 kHz band): SPR ≈ 4–15\n"
+            "  Narrow-band tone / sinusoid:    SPR ≈ 50–150\n\n"
+            "Candidates with SPR > threshold are rejected as tonal noise.\n"
+            "Recommended: 30  (safe margin between clicks and pure tones)"
+        )
+        params_layout.addRow("Max. SPR (Stage 2 – broadband):", self.max_spr_spinbox)
+
+        # 5. Max pre-click SNR (Criterion 2)
+        self.max_pre_snr_spinbox = QDoubleSpinBox()
+        self.max_pre_snr_spinbox.setDecimals(1)
+        self.max_pre_snr_spinbox.setRange(1.0, 10.0)
+        self.max_pre_snr_spinbox.setSingleStep(0.5)
+        self.max_pre_snr_spinbox.setValue(3.0)
+        self.max_pre_snr_spinbox.setToolTip(
+            "Stage 3 – Criterion 2: Max pre-click noise level (relative to noise floor)\n"
+            "pre_snr = RMS(signal before peak) / noise_rms\n"
+            "  ≈ 1.0 → pure silence before click  (ideal)\n"
+            "  ≈ 2.0 → slight background activity\n"
+            "  ≈ 3.0 → moderate turbulence before click  (default)\n"
+            "  > 5.0 → continuous noise, likely not a click\n"
+            "Recommended: 3.0  (raised from 2.0 — leaf turbulence before impact\n"
+            "               can legitimately raise pre-click RMS to 2–3×noise)"
+        )
+        params_layout.addRow("Max. pre-click SNR (Criterion 2):", self.max_pre_snr_spinbox)
         
         params_group.setLayout(params_layout)
         layout.addWidget(params_group)
@@ -157,9 +188,9 @@ class ClickDetectorDialog(QDialog):
         layout.addWidget(results_label)
         
         self.results_table = QTableWidget()
-        self.results_table.setColumnCount(11)
+        self.results_table.setColumnCount(12)
         self.results_table.setHorizontalHeaderLabels([
-            "Timestamp", "Amplitude", "SNR", "PRE_ratio", "E_W1/E_W4",
+            "Timestamp", "Amplitude", "SNR", "pre_snr", "E_W1/E_W4", "SPR",
             "Energy FFT", "Ratio R", "R² (log)", "τ (ms)", "Classification", "Notes"
         ])
         self.results_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -167,17 +198,18 @@ class ClickDetectorDialog(QDialog):
         self.results_table.setAlternatingRowColors(True)
         
         header = self.results_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Timestamp
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # Amplitude
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # SNR
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # PRE_ratio
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # E_W1/E_W4
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)  # Energy FFT
-        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)  # Ratio R
-        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)  # R² (log)
-        header.setSectionResizeMode(8, QHeaderView.ResizeToContents)  # τ (ms)
-        header.setSectionResizeMode(9, QHeaderView.ResizeToContents)  # Classification
-        header.setSectionResizeMode(10, QHeaderView.Stretch)          # Notes
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)   # Timestamp
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)   # Amplitude
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)   # SNR
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)   # pre_snr
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)   # E_W1/E_W4
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)   # SPR
+        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)   # Energy FFT
+        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)   # Ratio R
+        header.setSectionResizeMode(8, QHeaderView.ResizeToContents)   # R² (log)
+        header.setSectionResizeMode(9, QHeaderView.ResizeToContents)   # τ (ms)
+        header.setSectionResizeMode(10, QHeaderView.ResizeToContents)  # Classification
+        header.setSectionResizeMode(11, QHeaderView.Stretch)           # Notes
         
         self.results_table.verticalHeader().setVisible(False)
         layout.addWidget(self.results_table)
@@ -258,14 +290,16 @@ class ClickDetectorDialog(QDialog):
         threshold_mv = self.threshold_spinbox.value()
         threshold_v = threshold_mv / 1000.0
         use_normalization = self.normalize_checkbox.isChecked()
+        max_spr = self.max_spr_spinbox.value()
         snr_min = self.snr_min_spinbox.value()
-        pre_ratio_max = self.pre_ratio_max_spinbox.value()
+        max_pre_snr = self.max_pre_snr_spinbox.value()
         
         print(f"\n📋 PARAMETERS:")
         print(f"   Energy threshold: {threshold_mv:.3f} mV ({threshold_v:.6f} V)")
         print(f"   Normalization: {'ON (50% correction)' if use_normalization else 'OFF'}")
+        print(f"   Max. SPR (Stage 2 broadband filter): {max_spr:.0f}")
         print(f"   Min. SNR (Criterion 1): {snr_min:.1f}")
-        print(f"   Max. PRE_ratio (Criterion 2): {pre_ratio_max:.2f}")
+        print(f"   Max. pre-click SNR (Criterion 2): {max_pre_snr:.1f}")
         
         total_frames = self.data_manager.total_frames
         
@@ -320,53 +354,88 @@ class ClickDetectorDialog(QDialog):
             return
         
         # ========================================================================
-        # STAGE 2: SPECTRAL ANALYSIS (DESCRIPTIVE ONLY - not used for validation)
+        # STAGE 2: SPECTRAL PEAK RATIO FILTER (broadband check)
+        # ========================================================================
+        # SPR = max(|X[k]|²) / mean(|X[k]|²)  over all 154 bins (20-80 kHz)
+        #
+        # Physical basis:
+        #   A broadband click distributes energy across many bins → SPR low (4-15)
+        #   A pure tone / narrow-band noise concentrates all energy in 1-3 bins → SPR high (50-150)
+        #
+        # This filter is FAST (operates on FFT magnitudes, no iFFT needed) and
+        # AMPLITUDE-INVARIANT: SPR depends only on spectral shape, not signal level.
         # ========================================================================
         print(f"\n{'='*80}")
-        print("STAGE 2: SPECTRAL ENERGY ANALYSIS (DESCRIPTIVE FEATURES)")
+        print("STAGE 2: SPECTRAL PEAK RATIO FILTER (broadband check)")
         print(f"{'='*80}")
-        print("⚠️ NOTE: Spectral ratio R is computed but NOT used for validation in v3.0")
-        print("         All Stage 1 candidates pass to Stage 3 for temporal analysis")
-        
+        print(f"   SPR = max(|X[k]|²) / mean(|X[k]|²)  threshold: {max_spr:.0f}")
+        print(f"   Expected: click broadband (≥15 kHz band) SPR≈4–15 | pure tone SPR≈50–150")
+
         candidates_stage2 = []
-        
+        spr_rejected = 0
+
         for idx, frame_idx in enumerate(candidates_stage1):
             if idx % 100 == 0:
                 progress.setValue(25 + int((idx / len(candidates_stage1)) * 15))
                 if progress.wasCanceled():
                     return
-            
-            # Ottieni FFT
+
+            # Ottieni FFT magnitudes
             fft_mags = self.data_manager.fft_data[frame_idx]
-            
+
             # Applica normalizzazione se richiesto
             if use_normalization:
                 fft_mags = self._normalize_fft(fft_mags)
-            
-            # Calcola energie
+
+            # ── Spectral Peak Ratio (SPR) ──────────────────────────────────────
+            fft_power = fft_mags ** 2
+            mean_power = np.mean(fft_power)
+            max_power  = np.max(fft_power)
+            spr = max_power / mean_power if mean_power > 1e-20 else 0.0
+            spr_pass = (spr <= max_spr)
+
+            if not spr_pass:
+                spr_rejected += 1
+                continue   # Reject: tonal / narrowband noise
+
+            # ── Spectral ratio R (descriptive only) ───────────────────────────
             energies = compute_fft_energy(fft_mags)
-            
-            # Calcola ratio R (DESCRIPTIVE ONLY - not used for filtering)
             ratio = energies['low'] / energies['high'] if energies['high'] > 0 else 0.0
-            
+
             candidates_stage2.append({
                 'frame_idx': frame_idx,
                 'energies': energies,
-                'ratio': ratio,  # Saved as descriptive feature
+                'ratio': ratio,   # descriptive
+                'spr': spr,       # saved for results table
             })
-        
-        print(f"✅ Stage 2 complete: {len(candidates_stage2)}/{len(candidates_stage1)} candidates analyzed")
-        print(f"   All candidates passed to Stage 3 (no filtering in Stage 2)")
+
+        print(f"✅ Stage 2 complete: {len(candidates_stage2)}/{len(candidates_stage1)} passed "
+              f"({spr_rejected} rejected by SPR > {max_spr:.0f})")
+
         
         # ========================================================================
         # STAGE 3: THREE-CRITERION TEMPORAL VALIDATION (v3.0)
         # ========================================================================
         print(f"\n{'='*80}")
-        print("STAGE 3: TEMPORAL VALIDATION (3 CRITERIA)")
+        print("STAGE 3: TEMPORAL VALIDATION (5 CRITERIA)")
         print(f"{'='*80}")
         print("Criterion 1: SNR > {:.1f} (peak_amplitude / noise_rms)".format(snr_min))
-        print("Criterion 2: PRE_ratio < {:.2f} (E_pre / E_post - silence before click)".format(pre_ratio_max))
-        print("Criterion 3: Global decay (E_W1 > E_W4)")
+        print("Criterion 2: pre_snr < {:.1f} (RMS_pre / noise_rms - silence before click)".format(max_pre_snr))
+        print("Criterion 3: Global decay (E_W1 > 2× E_W4, min ratio 2.0)")
+        print("Criterion 4: Narrow-spike test – rejects isolated symmetric spikes (EMI/artefacts)")
+        print("Criterion 5: Clean tail – no secondary burst > 3× valley (rejects ringing/multi-burst)")
+
+        # Constants for Criteria 3, 4, and 5 (defined here for visibility in summary prints)
+        MIN_DECAY_RATIO   = 2.0   # C3: E_W1 must be at least this many times E_W4 (rejects near-flat signals)
+        ASYM_THRESHOLD    = 0.5   # C4 step-1: rise/fall ratio – spike must be symmetric at 10%·peak
+        LEVEL_FRACTION    = 0.10  # C4: amplitude level for rise/fall measurement
+        FALL_SEARCH       = 40    # C4 step-1: max fall-search window (samples, 0.2 ms) — shorter than before
+        SPIKE_HALF_WIN    = 40    # C4 step-2: half-window for narrow-spike check (0.2 ms each side)
+        SPIKE_NOISE_FACTOR= 3.0   # C4 step-2: flanks near noise if max < SPIKE_NOISE_FACTOR × noise_rms
+        DECAY_SKIP        = 10    # C5: skip main lobe before valley search
+        TAIL_WINDOW       = 300   # C5: post-peak tail window (samples, 1.5 ms) — matches
+                                  #     check_decay() window_samples for consistency
+        REBOUND_FACTOR    = 3.0   # C5: secondary peak must be > factor × valley
         
         candidates_stage3 = []
         
@@ -394,7 +463,7 @@ class ClickDetectorDialog(QDialog):
             
             # Check decay (con gestione spill) - RETURNS DESCRIPTIVE FEATURES ONLY
             next_frame_signal = None
-            if peak_idx > 380 and frame_idx + 1 < total_frames:
+            if peak_idx > 212 and frame_idx + 1 < total_frames:  # matches near_end threshold in check_decay
                 next_frame_signal = self._reconstruct_ifft(frame_idx + 1, use_normalization)
             
             decay_results = check_decay(envelope, peak_idx, next_frame_signal=next_frame_signal)
@@ -413,35 +482,193 @@ class ClickDetectorDialog(QDialog):
             criterion_1_pass = (snr > snr_min)
             
             # ================================================================
-            # CRITERION 2: PRE_ratio < threshold (silence before click)
+            # CRITERION 2: pre_snr < max_pre_snr (silence before click)
             # ================================================================
-            # E_pre = mean energy in a window STRICTLY BEFORE the peak
-            # Use [0:peak_idx-10] to avoid including the click rise itself.
-            # If peak is very early (< 20 samples), we cannot compute a
-            # meaningful pre-window → treat as silence (ratio = 0.0).
-            pre_end = max(0, peak_idx - 10)  # 10-sample guard before peak
-            if pre_end >= 10:
-                E_pre = np.mean(signal[:pre_end] ** 2)
-            else:
-                E_pre = 0.0  # Peak too early → assume silence before click
+            # Measures whether the signal before the peak is compatible with
+            # the noise floor. pre_snr = RMS(pre-window) / noise_rms.
+            #   ≈ 1.0 → pure silence (ideal click)
+            #   > 2.0 → significant energy before click → likely not a click
+            #
+            # PRE WINDOW STRATEGY:
+            # We need at least MIN_PRE_SAMPLES=50 samples (~250 µs) for a
+            # statistically reliable RMS estimate.
+            #
+            # Case A – peak_idx >= 60: enough room in current frame.
+            #   pre_window = signal[0 : peak_idx - 10]
+            #
+            # Case B – peak_idx < 60 AND frame_idx > 0: extend into previous frame.
+            #   Use the last 200 samples of the previous frame (1 ms, certain silence
+            #   since that frame didn't pass Stage 1 energy threshold).
+            #   pre_window = concat(prev[-200:], signal[0 : peak_idx - 10])
+            #
+            # Case C – peak_idx < 60 AND frame_idx == 0: no previous frame.
+            #   Fallback: assume pre_snr = 1.0 (pass), rely on Criterion 1 SNR.
 
-            # E_post: mean power in 120-sample post-peak window
-            post_start = peak_idx
-            post_end = min(peak_idx + 120, len(signal))
-            E_post = np.mean(signal[post_start:post_end] ** 2) if post_end > post_start else 1e-9
+            MIN_PRE_SAMPLES = 50   # minimum samples for reliable RMS (~250 µs)
+            GUARD = 20              # samples before peak to exclude click rise
+
+            pre_end = max(0, peak_idx - GUARD)
+            n_pre_current = pre_end  # samples available in current frame before peak
+
+            if n_pre_current >= MIN_PRE_SAMPLES:
+                # Case A: enough samples in current frame
+                pre_window = signal[:pre_end]
+                pre_source = "current frame"
+
+            elif frame_idx > 0:
+                # Case B: extend into previous frame (last 200 samples = 1 ms)
+                # The previous frame did NOT pass Stage 1 → it is guaranteed
+                # to be below the energy threshold → safe noise reference.
+                prev_signal = self._reconstruct_ifft(frame_idx - 1, use_normalization)
+                if prev_signal is not None:
+                    prev_tail = prev_signal[-200:]   # last 1 ms of previous frame
+                    current_pre = signal[:pre_end] if pre_end > 0 else np.array([])
+                    pre_window = np.concatenate([prev_tail, current_pre])
+                    pre_source = f"prev[-200:] + current[:{pre_end}]"
+                else:
+                    # Reconstruction failed: use whatever we have in current frame
+                    pre_window = signal[:pre_end] if pre_end > 0 else np.array([noise_rms])
+                    pre_source = "current frame only (prev recon failed)"
+
+            else:
+                # Case C: first frame of file — no previous frame available.
+                # Conservatively assume silence → pre_snr = 1.0 → PASS.
+                # Criterion 1 (SNR) is the primary guard in this edge case.
+                pre_window = np.array([noise_rms])   # synthetic: exactly noise level
+                pre_source = "first frame fallback"
+
+            rms_pre = np.sqrt(np.mean(pre_window ** 2)) if len(pre_window) > 0 else noise_rms
+            pre_snr = rms_pre / noise_rms if noise_rms > 0 else 1.0
+            criterion_2_pass = (pre_snr < max_pre_snr)
+
+            print(f"      C2: pre_snr={pre_snr:.2f} (RMS_pre={rms_pre*1000:.4f} mV, "
+                  f"n={len(pre_window)} samples, src={pre_source})"
+                  f" → {'PASS' if criterion_2_pass else 'FAIL'}")
             
-            pre_ratio = E_pre / E_post if E_post > 1e-12 else 999.0
-            criterion_2_pass = (pre_ratio < pre_ratio_max)
-            
             # ================================================================
-            # CRITERION 3: Global energy decay (E_W1 > E_W4)
+            # CRITERION 3: Global energy decay (E_W1 > MIN_DECAY_RATIO × E_W4)
             # ================================================================
-            criterion_3_pass = (E_W1 > E_W4)
-            
+            criterion_3_pass = (E_W1 > E_W4 * MIN_DECAY_RATIO)
+
             # ================================================================
-            # FINAL VALIDATION: All 3 criteria must pass
+            # CRITERION 4: Narrow-spike test – rejects isolated symmetric spikes
             # ================================================================
-            all_criteria_pass = (criterion_1_pass and criterion_2_pass and criterion_3_pass)
+            # A real click is highly asymmetric: very fast rise, slow exponential
+            # fall. An EMI spike or mechanical artefact looks like a narrow,
+            # isolated pulse: symmetric AND both flanks drop to near the noise
+            # floor within 0.2 ms.
+            #
+            # Two-step test (both must be true to REJECT):
+            #
+            # Step 1 – Symmetry check (same as before, window now 0.2 ms = 40 samp):
+            #   rise_samples = samples from first crossing of 10%·peak back to peak
+            #   fall_samples = samples from peak until envelope < 10%·peak
+            #                  (capped at FALL_SEARCH = 40 samples = 0.2 ms)
+            #   → symmetric if rise_samples / fall_samples ≥ ASYM_THRESHOLD (0.5)
+            #
+            # Step 2 – Flank-to-noise check:
+            #   Look at the 0.2 ms window to the LEFT of rise_start and to the
+            #   RIGHT of the fall-crossing point (or peak + FALL_SEARCH if no
+            #   crossing found). If both flanks stay below SPIKE_NOISE_FACTOR ×
+            #   noise_rms, the pulse is narrow and isolated → spike.
+            #
+            # REJECT if Step1 AND Step2 are both true.
+            # PASS   if either fails (signal is asymmetric OR has a broad base).
+            #
+            # Real click:  fast rise, very slow fall (>0.2 ms) → fall_samples=FALL_SEARCH
+            #              → Step 2 right-flank is still above noise → PASS
+            # EMI spike:   rise ≈ fall ≈ 5-20 samp, both flanks at noise → FAIL
+            level = peak_amp * LEVEL_FRACTION
+
+            # --- Step 1: symmetry ---
+            rise_start = peak_idx
+            for i in range(peak_idx - 1, -1, -1):
+                if envelope[i] < level:
+                    rise_start = i + 1
+                    break
+            rise_samples = max(1, peak_idx - rise_start)
+
+            fall_end_idx = min(peak_idx + FALL_SEARCH, len(envelope))
+            fall_samples = FALL_SEARCH      # default: still above level at end of window
+            fall_cross_idx = peak_idx + FALL_SEARCH  # where the fall ends (or cap)
+            for i in range(peak_idx + 1, fall_end_idx):
+                if envelope[i] < level:
+                    fall_samples = i - peak_idx
+                    fall_cross_idx = i
+                    break
+
+            asymmetry_ratio = rise_samples / fall_samples if fall_samples > 0 else 1.0
+            is_symmetric = (asymmetry_ratio >= ASYM_THRESHOLD)
+
+            # --- Step 2: flank-to-noise check ---
+            # Left flank: SPIKE_HALF_WIN samples before rise_start
+            left_start = max(0, rise_start - SPIKE_HALF_WIN)
+            left_flank = envelope[left_start:rise_start]
+            left_near_noise = (len(left_flank) == 0 or
+                               float(np.max(left_flank)) < SPIKE_NOISE_FACTOR * noise_rms)
+
+            # Right flank: SPIKE_HALF_WIN samples after fall crossing
+            right_end = min(fall_cross_idx + SPIKE_HALF_WIN, len(envelope))
+            right_flank = envelope[fall_cross_idx:right_end]
+            right_near_noise = (len(right_flank) == 0 or
+                                float(np.max(right_flank)) < SPIKE_NOISE_FACTOR * noise_rms)
+
+            flanks_near_noise = left_near_noise and right_near_noise
+
+            # Reject only if BOTH conditions are met
+            criterion_4_pass = not (is_symmetric and flanks_near_noise)
+
+            print(f"      C4: rise={rise_samples} fall={fall_samples} asym={asymmetry_ratio:.3f} "
+                  f"sym={is_symmetric} flanks_noise={flanks_near_noise}"
+                  f" → {'PASS' if criterion_4_pass else 'FAIL (narrow symmetric spike)'}")
+
+            # ================================================================
+            # CRITERION 5: Clean tail – rejects ringing / multi-burst signals
+            # ================================================================
+            # A real click decays towards the noise floor without significant
+            # secondary bursts. Interference type 2 shows one or more secondary
+            # peaks after an initial decay.
+            #
+            # Method (robust to non-perfectly-monotone real clicks):
+            #   1. Find the local minimum of the envelope in the window
+            #      [peak_idx + DECAY_SKIP : peak_idx + TAIL_WINDOW]
+            #   2. Check that no sample after that minimum exceeds
+            #      min_local × REBOUND_FACTOR
+            #
+            # REBOUND_FACTOR = 3.0 → a secondary burst must be at least 3× the
+            # local valley to be flagged. This tolerates gentle undulations in
+            # real click envelopes while catching clear secondary peaks.
+            tail_start = peak_idx + DECAY_SKIP
+            tail_end   = min(peak_idx + TAIL_WINDOW, len(envelope))
+
+            if tail_end > tail_start + 5:
+                tail_env = envelope[tail_start:tail_end]
+                # Find valley (minimum) in the tail
+                valley_idx_local = int(np.argmin(tail_env))
+                valley_val = float(tail_env[valley_idx_local])
+
+                # Check for rebound after the valley
+                post_valley = tail_env[valley_idx_local + 1:]
+                rebound_threshold = valley_val * REBOUND_FACTOR
+                has_rebound = (len(post_valley) > 0 and
+                               float(np.max(post_valley)) > rebound_threshold and
+                               rebound_threshold > level)   # only meaningful above noise
+
+                criterion_5_pass = not has_rebound
+                rebound_max = float(np.max(post_valley)) if len(post_valley) > 0 else 0.0
+                print(f"      C5: valley={valley_val*1000:.4f} mV  rebound_max={rebound_max*1000:.4f} mV"
+                      f"  threshold={rebound_threshold*1000:.4f} mV"
+                      f" → {'PASS' if criterion_5_pass else 'FAIL (secondary burst)'}")
+            else:
+                # Tail too short to evaluate (near_end case) → conservative PASS
+                criterion_5_pass = True
+                print(f"      C5: tail too short ({tail_end - tail_start} samples) → PASS (conservative)")
+
+            # ================================================================
+            # FINAL VALIDATION: All 5 criteria must pass
+            # ================================================================
+            all_criteria_pass = (criterion_1_pass and criterion_2_pass and criterion_3_pass
+                                 and criterion_4_pass and criterion_5_pass)
             
             if all_criteria_pass:
                 classification = "✅ CONFIRMED"
@@ -451,14 +678,18 @@ class ClickDetectorDialog(QDialog):
                 if not criterion_1_pass:
                     failed_criteria.append(f"SNR={snr:.1f}<{snr_min}")
                 if not criterion_2_pass:
-                    failed_criteria.append(f"PRE={pre_ratio:.2f}>{pre_ratio_max}")
+                    failed_criteria.append(f"pre_snr={pre_snr:.2f}>{max_pre_snr:.1f}")
                 if not criterion_3_pass:
-                    failed_criteria.append(f"E_W1={E_W1:.2e}≤E_W4={E_W4:.2e}")
+                    failed_criteria.append(f"E_W1/E_W4={E_W1/E_W4 if E_W4>0 else 0:.2f}<{MIN_DECAY_RATIO}")
+                if not criterion_4_pass:
+                    failed_criteria.append(f"narrow-spike(asym={asymmetry_ratio:.2f}≥{ASYM_THRESHOLD},flanks@noise)")
+                if not criterion_5_pass:
+                    failed_criteria.append("secondary-burst")
                 classification = f"❌ REJECTED (" + ", ".join(failed_criteria) + ")"
                 continue  # Skip rejected candidates
             
             candidates_stage3.append({
-                **candidate,
+                **candidate,           # includes 'spr' from Stage 2
                 'peak_amp': peak_amp,
                 'peak_idx': peak_idx,
                 'decay_results': decay_results,
@@ -466,15 +697,20 @@ class ClickDetectorDialog(QDialog):
                 'tau_ms': tau_ms,          # Descriptive
                 'slope_log': slope_log,    # Descriptive
                 'snr': snr,                # Criterion 1
-                'pre_ratio': pre_ratio,    # Criterion 2
+                'pre_snr': pre_snr,        # Criterion 2
+                'rms_pre': rms_pre,        # Criterion 2 diagnostic
+                'pre_source': pre_source,  # Criterion 2 diagnostic (which window was used)
                 'E_W1': E_W1,              # Criterion 3
                 'E_W4': E_W4,              # Criterion 3
-                'E_pre': E_pre,            # Diagnostic
-                'E_post': E_post,          # Diagnostic
+                'asymmetry_ratio': asymmetry_ratio,   # Criterion 4
+                'rise_samples': rise_samples,          # Criterion 4 diagnostic
+                'fall_samples': fall_samples,          # Criterion 4 diagnostic
                 'noise_rms': noise_rms,    # Reference
                 'criterion_1_pass': criterion_1_pass,
                 'criterion_2_pass': criterion_2_pass,
                 'criterion_3_pass': criterion_3_pass,
+                'criterion_4_pass': criterion_4_pass,
+                'criterion_5_pass': criterion_5_pass,
                 'confirmed': True,
                 'classification': classification
             })
@@ -488,10 +724,12 @@ class ClickDetectorDialog(QDialog):
             QMessageBox.information(self, "No Clicks Found", "No frames passed the 3-criterion validation.\nAll candidates failed temporal analysis.")
             return
         
-        print(f"   📊 All confirmed clicks passed all 3 criteria:")
+        print(f"   📊 All confirmed clicks passed all 5 criteria:")
         print(f"      ✅ Criterion 1 (SNR > {snr_min}): 100%")
-        print(f"      ✅ Criterion 2 (PRE < {pre_ratio_max}): 100%")
+        print(f"      ✅ Criterion 2 (pre_snr < {max_pre_snr}): 100%")
         print(f"      ✅ Criterion 3 (E_W1 > E_W4): 100%")
+        print(f"      ✅ Criterion 4 (asymmetry ratio < {ASYM_THRESHOLD}): 100%")
+        print(f"      ✅ Criterion 5 (clean tail, no secondary burst): 100%")
         
         # ========================================================================
         # STAGE 4: DEDUPLICATION
@@ -512,6 +750,12 @@ class ClickDetectorDialog(QDialog):
         
         self.detected_clicks = final_clicks
         self.export_button.setEnabled(True)
+
+        # ✅ Cache clicks on data_manager so batch screenshot export can access them
+        self.data_manager._detected_clicks  = final_clicks
+        self.data_manager._cached_threshold_v = threshold_v
+        self.data_manager._cached_snr_min    = snr_min
+        self.data_manager._cached_max_pre_snr = max_pre_snr
         
         print(f"\n{'='*80}")
         print(f"🎉 DETECTION COMPLETE: {len(final_clicks)} CLICKS FOUND")
@@ -523,8 +767,8 @@ class ClickDetectorDialog(QDialog):
             "Detection Complete", 
             f"Found {len(final_clicks)} ultrasonic clicks!\n\n"
             f"Stage 1 (Energy): {len(candidates_stage1)} candidates\n"
-            f"Stage 2 (Spectral): {len(candidates_stage2)} candidates\n"
-            f"Stage 3 (Decay): {len(candidates_stage3)} candidates\n"
+            f"Stage 2 (SPR + Spectral): {len(candidates_stage2)} candidates\n"
+            f"Stage 3 (5-criterion): {len(candidates_stage3)} candidates\n"
             f"Stage 4 (Final): {len(final_clicks)} unique clicks"
         )
     
@@ -602,6 +846,7 @@ class ClickDetectorDialog(QDialog):
         # iFFT
         try:
             time_domain_signal = np.fft.irfft(complex_spectrum, n=fft_size)
+            time_domain_signal = suppress_edge_artifacts(time_domain_signal)
             return time_domain_signal
         except:
             return None
@@ -660,49 +905,54 @@ class ClickDetectorDialog(QDialog):
             snr = click.get('snr', 0.0)
             self.results_table.setItem(row, 2, QTableWidgetItem(f"{snr:.1f}"))
             
-            # Col 3: PRE_ratio (Criterion 2)
-            pre_ratio = click.get('pre_ratio', 0.0)
-            self.results_table.setItem(row, 3, QTableWidgetItem(f"{pre_ratio:.3f}"))
+            # Col 3: pre_snr (Criterion 2)
+            pre_snr = click.get('pre_snr', 0.0)
+            item_pre = QTableWidgetItem(f"{pre_snr:.2f}")
+            self.results_table.setItem(row, 3, item_pre)
             
             # Col 4: E_W1/E_W4 ratio (Criterion 3)
             E_W1 = click.get('E_W1', 0.0)
             E_W4 = click.get('E_W4', 1e-12)
             decay_ratio = E_W1 / E_W4 if E_W4 > 1e-12 else 999.0
             self.results_table.setItem(row, 4, QTableWidgetItem(f"{decay_ratio:.1f}"))
-            
-            # Col 5: Energy FFT (descriptive)
+
+            # Col 5: SPR – Spectral Peak Ratio (Stage 2 filter)
+            spr = click.get('spr', 0.0)
+            self.results_table.setItem(row, 5, QTableWidgetItem(f"{spr:.1f}"))
+
+            # Col 6: Energy FFT (descriptive)
             energy_mv2 = click['energies']['total'] * 1e6
-            self.results_table.setItem(row, 5, QTableWidgetItem(f"{energy_mv2:.3f} mV²"))
+            self.results_table.setItem(row, 6, QTableWidgetItem(f"{energy_mv2:.3f} mV²"))
             
-            # Col 6: Ratio R (descriptive)
-            self.results_table.setItem(row, 6, QTableWidgetItem(f"{click['ratio']:.3f}"))
+            # Col 7: Ratio R (descriptive)
+            self.results_table.setItem(row, 7, QTableWidgetItem(f"{click['ratio']:.3f}"))
             
-            # Col 7: R² (log) - Decay fit quality (descriptive only)
+            # Col 8: R² (log) - Decay fit quality (descriptive only)
             r2_log = click.get('r2_log', 0.0)
-            self.results_table.setItem(row, 7, QTableWidgetItem(f"{r2_log:.4f}"))
+            self.results_table.setItem(row, 8, QTableWidgetItem(f"{r2_log:.4f}"))
             
-            # Col 8: τ (tau) - Decay time constant (descriptive)
+            # Col 9: τ (tau) - Decay time constant (descriptive)
             tau = click.get('tau_ms', -1.0)
             if tau > 0:
-                self.results_table.setItem(row, 8, QTableWidgetItem(f"{tau:.3f}"))
+                self.results_table.setItem(row, 9, QTableWidgetItem(f"{tau:.3f}"))
             else:
-                self.results_table.setItem(row, 8, QTableWidgetItem("N/A"))
+                self.results_table.setItem(row, 9, QTableWidgetItem("N/A"))
             
-            # Col 9: Classification
+            # Col 10: Classification
             classification_item = QTableWidgetItem(click['classification'])
             if "CONFIRMED" in click['classification']:
                 classification_item.setForeground(Qt.darkGreen)
             else:
                 classification_item.setForeground(Qt.red)
-            self.results_table.setItem(row, 9, classification_item)
+            self.results_table.setItem(row, 10, classification_item)
             
-            # Col 10: Notes
+            # Col 11: Notes
             notes = []
             if click.get('decay_results', {}).get('used_next_frame', False):
                 notes.append("Multi-frame")
             if click.get('decay_results', {}).get('near_end', False):
                 notes.append("Near end")
-            self.results_table.setItem(row, 10, QTableWidgetItem(", ".join(notes)))
+            self.results_table.setItem(row, 11, QTableWidgetItem(", ".join(notes)))
     
     def export_results(self):
         """Esporta risultati in CSV con nuove colonne v3.0"""
@@ -721,11 +971,11 @@ class ClickDetectorDialog(QDialog):
             with open(filename, 'w', newline='') as f:
                 writer = csv.writer(f)
                 
-                # Header (updated for v3.0)
+                # Header (updated for v3.0 + SPR)
                 writer.writerow([
-                    "Timestamp (s)", "Frame Index", "Amplitude (V)", "SNR", "PRE_ratio",
-                    "E_W1", "E_W4", "Decay_Ratio", "Energy FFT (mV²)", 
-                    "Ratio R", "R² (log)", "τ (ms)", "Classification", "Notes"
+                    "Timestamp (s)", "Frame Index", "Amplitude (V)", "SNR", "pre_snr",
+                    "rms_pre (mV)", "SPR", "E_W1", "E_W4", "Decay_Ratio",
+                    "Energy FFT (mV²)", "Ratio R", "R² (log)", "τ (ms)", "Classification", "Notes"
                 ])
                 
                 # Dati
@@ -736,23 +986,28 @@ class ClickDetectorDialog(QDialog):
                     tau = click.get('tau_ms', -1.0)
                     tau_str = f"{tau:.3f}" if tau > 0 else "N/A"
                     
-                    # Calculate decay ratio
                     E_W1 = click.get('E_W1', 0.0)
                     E_W4 = click.get('E_W4', 1e-12)
                     decay_ratio = E_W1 / E_W4 if E_W4 > 1e-12 else 999.0
+                    rms_pre_mv = click.get('rms_pre', 0.0) * 1000.0
+                    spr = click.get('spr', 0.0)
                     
                     notes = []
                     if click.get('decay_results', {}).get('used_next_frame', False):
                         notes.append("Multi-frame")
                     if click.get('decay_results', {}).get('near_end', False):
                         notes.append("Near end")
+                    if click.get('pre_source', ''):
+                        notes.append(f"pre:{click['pre_source']}")
                     
                     writer.writerow([
                         f"{timestamp:.3f}",
                         frame_idx,
                         f"{click['peak_amp']:.6f}",
                         f"{click.get('snr', 0.0):.1f}",
-                        f"{click.get('pre_ratio', 0.0):.3f}",
+                        f"{click.get('pre_snr', 0.0):.2f}",
+                        f"{rms_pre_mv:.4f}",
+                        f"{spr:.1f}",
                         f"{E_W1:.6e}",
                         f"{E_W4:.6e}",
                         f"{decay_ratio:.1f}",

@@ -174,6 +174,15 @@ class ReplayBaseWindow(FileHandlerMixin, QMainWindow):
             )
             analysis_menu.addAction(self.actionClickDetector)
 
+            # ✅ BATCH SCREENSHOT EXPORT
+            self.actionBatchExport = QAction("📷 Batch Export Screenshots...", self)
+            self.actionBatchExport.setShortcut("Ctrl+Shift+E")
+            self.actionBatchExport.setToolTip(
+                "Export PNG screenshots for all detected clicks\n"
+                "Run Click Detector first. Saves to confirmed/ and rejected/ folders."
+            )
+            analysis_menu.addAction(self.actionBatchExport)
+
         self.actionMath = QAction("Select Region for Analysis", self)
         self.actionMath.setToolTip("Select a region in the plot to perform mathematical analysis")
         # Azione per aprire popup per aprire analisi salvate
