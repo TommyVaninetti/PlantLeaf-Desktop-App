@@ -5,7 +5,7 @@ PIPELINE v4.0 (only-normalized):
 1. Stage 1: Energy threshold (μ + Nσ) + group-size filter (run ≤ 4 frame)
 2. Stage 2: SPR ≤ 20  AND  peak normalized FFT > 0.85 mV
 3. Stage 3: iFFT validation (normalized only):
-   - C2: pre_snr < 1.7
+   - C2: pre_snr < 1.8
    - C3: E_W1 > 2× E_W4
    - asym < 2.5
    - peak iFFT normalized > 130 µV
@@ -19,9 +19,10 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QDoubleSpinBox, QCheckBox, QGroupBox, QProgressDialog,
     QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
-    QFormLayout, QSpinBox
+    QFormLayout, QSpinBox, QLineEdit, QComboBox, QDateEdit,
+    QFileDialog
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QDate
 from PySide6.QtGui import QFont
 
 import sys, os
@@ -31,6 +32,212 @@ from windows.replay_window_audio import (
     estimate_noise_offline, suppress_edge_artifacts
 )
 from core.replay_base_window import compute_fft_energy
+
+
+# =============================================================================
+# SESSION METADATA DIALOG  (shown before CSV export)
+# =============================================================================
+class SessionMetadataDialog(QDialog):
+    """
+    Dialog to collect session metadata before exporting the CSV.
+    Fields: sessione_id, condizione, specie, data.
+
+    Changes vs original:
+      - Condition combo has a fixed minimum width so items are always readable.
+      - Species is a free QLineEdit (not a dropdown) to allow any plant name.
+      - QDateEdit calendar popup is styled to match the current app theme.
+    """
+
+    CONDITIONS = ["empty", "unstressed", "mechanical", "hydric"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Session Metadata — CSV Export")
+        self.setMinimumWidth(420)
+        self.setWindowModality(Qt.ApplicationModal)
+
+        layout = QVBoxLayout(self)
+
+        title = QLabel("<b>Fill in session details before export</b>")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight)
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        # ── Session ID ────────────────────────────────────────────────────────
+        self.session_id_edit = QLineEdit()
+        self.session_id_edit.setPlaceholderText("e.g.  SES_001")
+        form.addRow("Session ID:", self.session_id_edit)
+
+        # ── Condition (dropdown, min width so text is always visible) ─────────
+        self.condition_combo = QComboBox()
+        self.condition_combo.addItems(self.CONDITIONS)
+        self.condition_combo.setMinimumWidth(200)
+        self.condition_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        form.addRow("Condition:", self.condition_combo)
+
+        # ── Species (free text — allows any plant name) ───────────────────────
+        self.species_edit = QLineEdit()
+        self.species_edit.setPlaceholderText("e.g.  cactus, aloe, spathiphyllum…")
+        self.species_edit.setMinimumWidth(200)
+        form.addRow("Species:", self.species_edit)
+
+        # ── Date ──────────────────────────────────────────────────────────────
+        self.date_edit = QDateEdit()
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDate(QDate.currentDate())
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.date_edit.setMinimumWidth(200)
+        form.addRow("Date:", self.date_edit)
+
+        layout.addLayout(form)
+        layout.addSpacing(10)
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        btn_layout = QHBoxLayout()
+        self.ok_button = QPushButton("✔  Export")
+        self.ok_button.setDefault(True)
+        self.ok_button.clicked.connect(self._on_ok)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.reject)
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.ok_button)
+        btn_layout.addWidget(self.cancel_button)
+        layout.addLayout(btn_layout)
+
+        # ── Apply calendar theme ──────────────────────────────────────────────
+        # Defer until the event loop starts so the calendar widget is created
+        from PySide6.QtCore import QTimer as _QTimer
+        _QTimer.singleShot(0, self._style_calendar)
+
+    def _style_calendar(self):
+        """Inject a theme-aware stylesheet into the QCalendarWidget popup."""
+        cal = self.date_edit.calendarWidget()
+        if cal is None:
+            return
+
+        # Try to read colours from the parent's theme_manager
+        bg      = "#2b2b2b"
+        fg      = "#e0e0e0"
+        sel_bg  = "#1976d2"
+        sel_fg  = "#ffffff"
+        hdr_bg  = "#1e1e1e"
+        hdr_fg  = "#e0e0e0"
+        nav_bg  = "#1e1e1e"
+        border  = "#555555"
+
+        # Detect theme from parent chain
+        p = self.parent()
+        while p is not None:
+            if hasattr(p, 'theme_manager'):
+                try:
+                    theme_name = p.theme_manager.load_saved_theme()
+                    colors     = p.theme_manager.get_theme_specific_colors()
+                    is_light   = 'light' in theme_name.lower()
+
+                    if is_light:
+                        bg      = colors.get('inactive_bg',     '#ffffff')
+                        fg      = colors.get('inactive_text',   '#222222')
+                        border  = colors.get('inactive_border', '#cccccc')
+                        hdr_bg  = colors.get('active_bg',       '#1976d2')
+                        hdr_fg  = colors.get('active_text',     '#ffffff')
+                        nav_bg  = colors.get('active_bg',       '#1976d2')
+                        sel_bg  = colors.get('active_bg',       '#1976d2')
+                        sel_fg  = colors.get('active_text',     '#ffffff')
+                    else:
+                        bg      = "#2b2b2b"
+                        fg      = "#e0e0e0"
+                        border  = colors.get('inactive_border', '#555555')
+                        hdr_bg  = colors.get('active_bg',       '#333333')
+                        hdr_fg  = colors.get('active_text',     '#ffffff')
+                        nav_bg  = colors.get('active_bg',       '#333333')
+                        sel_bg  = colors.get('active_bg',       '#555555')
+                        sel_fg  = colors.get('active_text',     '#ffffff')
+                except Exception:
+                    pass
+                break
+            try:
+                p = p.parent()
+            except Exception:
+                break
+
+        cal.setStyleSheet(f"""
+            QCalendarWidget QWidget {{
+                background-color: {bg};
+                color: {fg};
+            }}
+            QCalendarWidget QAbstractItemView {{
+                background-color: {bg};
+                color: {fg};
+                selection-background-color: {sel_bg};
+                selection-color: {sel_fg};
+                outline: none;
+            }}
+            QCalendarWidget QAbstractItemView:enabled {{
+                color: {fg};
+            }}
+            QCalendarWidget QAbstractItemView:disabled {{
+                color: {border};
+            }}
+            QCalendarWidget QToolButton {{
+                background-color: {nav_bg};
+                color: {hdr_fg};
+                border: none;
+                padding: 4px 8px;
+                border-radius: 4px;
+            }}
+            QCalendarWidget QToolButton:hover {{
+                background-color: {sel_bg};
+                color: {sel_fg};
+            }}
+            QCalendarWidget QMenu {{
+                background-color: {bg};
+                color: {fg};
+            }}
+            QCalendarWidget QSpinBox {{
+                background-color: {bg};
+                color: {fg};
+                border: 1px solid {border};
+                border-radius: 3px;
+            }}
+            QCalendarWidget QWidget#qt_calendar_navigationbar {{
+                background-color: {hdr_bg};
+            }}
+            QCalendarWidget QWidget#qt_calendar_prevmonth,
+            QCalendarWidget QWidget#qt_calendar_nextmonth {{
+                color: {hdr_fg};
+            }}
+        """)
+
+    def _on_ok(self):
+        if not self.session_id_edit.text().strip():
+            QMessageBox.warning(self, "Missing field", "Session ID cannot be empty.")
+            self.session_id_edit.setFocus()
+            return
+        if not self.species_edit.text().strip():
+            QMessageBox.warning(self, "Missing field", "Species cannot be empty.")
+            self.species_edit.setFocus()
+            return
+        self.accept()
+
+    # ── Accessors ─────────────────────────────────────────────────────────────
+    @property
+    def sessione_id(self) -> str:
+        return self.session_id_edit.text().strip()
+
+    @property
+    def condizione(self) -> str:
+        return self.condition_combo.currentText()
+
+    @property
+    def specie(self) -> str:
+        return self.species_edit.text().strip()
+
+    @property
+    def data(self) -> str:
+        return self.date_edit.date().toString("yyyy-MM-dd")
 
 
 class ClickDetectorDialog(QDialog):
@@ -122,12 +329,12 @@ class ClickDetectorDialog(QDialog):
         self.max_pre_snr_spinbox.setDecimals(2)
         self.max_pre_snr_spinbox.setRange(1.0, 10.0)
         self.max_pre_snr_spinbox.setSingleStep(0.1)
-        self.max_pre_snr_spinbox.setValue(1.7)
+        self.max_pre_snr_spinbox.setValue(1.8)
         self.max_pre_snr_spinbox.setToolTip(
             "Stage 3 – C2: Max pre-click noise level\n"
             "pre_snr = RMS(signal before peak) / noise_rms\n"
             "≈ 1.0 → silence before click  (ideal)\n"
-            "Default: 1.7"
+            "Default: 1.8"
         )
         params_layout.addRow("Max pre_snr (C2):", self.max_pre_snr_spinbox)
 
@@ -742,56 +949,136 @@ class ClickDetectorDialog(QDialog):
             self.results_table.setItem(row, 10, QTableWidgetItem(", ".join(notes)))
 
     def export_results(self):
-        """Export results to CSV."""
-        from PySide6.QtWidgets import QFileDialog
-        import csv
+        """
+        Export detected clicks to CSV.
 
+        Workflow:
+          1. Show SessionMetadataDialog to collect sessione_id, condizione,
+             specie, data.
+          2. Show file-save dialog.
+          3. Write one row per confirmed click with session-level columns
+             repeated on every row.
+
+        Format: semicolon-delimited, dot as decimal separator.
+
+        Columns (in order):
+          sessione_id; condizione; specie; data; durata_s; noise_rms_uV;
+          n_click_totali; timestamp_s; peak_iFFT_uV; pre_snr; ew1_ew4_ratio;
+          asymmetry_ratio; tau_ms; r2_log; slope_log; R_spectral; SPR; near_end_flag
+        """
+        if not self.detected_clicks:
+            QMessageBox.warning(self, "No Data", "Run detection first.")
+            return
+
+        # ── Step 1: collect session metadata ─────────────────────────────────
+        meta_dlg = SessionMetadataDialog(self)
+        if self.parent and hasattr(self.parent, 'theme_manager'):
+            saved_theme = self.parent.theme_manager.load_saved_theme()
+            self.parent.theme_manager.apply_theme(meta_dlg, saved_theme)
+        if meta_dlg.exec() != QDialog.Accepted:
+            return
+
+        sessione_id = meta_dlg.sessione_id
+        condizione  = meta_dlg.condizione
+        specie      = meta_dlg.specie
+        data        = meta_dlg.data
+
+        # ── Step 2: choose output file ────────────────────────────────────────
+        default_name = f"{sessione_id}_{condizione}_{specie}_{data}.csv"
         filename, _ = QFileDialog.getSaveFileName(
-            self, "Export Click Detection Results", "",
+            self, "Export Click Detection Results", default_name,
             "CSV Files (*.csv);;All Files (*)"
         )
         if not filename:
             return
 
+        # ── Step 3: compute session-level constants ───────────────────────────
+        duration_s      = self.data_manager.total_duration_sec
+        # noise_rms stored in V on the click dict; fall back to data_manager cache
+        noise_rms_v     = (self.detected_clicks[0].get('noise_rms', 0.0)
+                           if self.detected_clicks
+                           else getattr(self.data_manager, '_cached_noise_rms', 0.0))
+        noise_rms_uv    = noise_rms_v * 1e6
+        n_click_totali  = len(self.detected_clicks)
+
+        # ── Step 4: write CSV ─────────────────────────────────────────────────
+        HEADER = [
+            "sessione_id", "condizione", "specie", "data",
+            "durata_s", "noise_rms_uV", "n_click_totali",
+            "timestamp_s", "peak_iFFT_uV", "pre_snr", "ew1_ew4_ratio",
+            "asymmetry_ratio", "tau_ms", "r2_log", "slope_log",
+            "R_spectral", "SPR", "near_end_flag",
+        ]
+
+        def _fmt(v, decimals=6):
+            """Format a float with a dot decimal separator."""
+            if v is None:
+                return "NA"
+            if isinstance(v, bool):
+                return "1" if v else "0"
+            try:
+                return f"{float(v):.{decimals}f}"
+            except (TypeError, ValueError):
+                return str(v)
+
         try:
-            with open(filename, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    "Timestamp (s)", "Frame Index", "Group Size",
-                    "Peak FFT norm (mV)", "Peak iFFT norm (µV)",
-                    "SPR", "pre_snr", "rms_pre (mV)",
-                    "E_W1", "E_W4", "Decay ratio",
-                    "asym", "τ (ms)", "R²", "SNR", "Notes"
-                ])
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
+                f.write(";".join(HEADER) + "\n")
+
                 for click in self.detected_clicks:
-                    frame_idx = click['frame_idx']
-                    ts = (frame_idx * self.data_manager.frame_duration_ms) / 1000.0
-                    tau = click.get('tau_ms', -1.0)
-                    E_W4 = click.get('E_W4', 1e-12)
-                    notes = []
-                    if click.get('decay_results', {}).get('used_next_frame', False):
-                        notes.append("multi-frame")
-                    if click.get('decay_results', {}).get('near_end', False):
-                        notes.append("near-end")
-                    if click.get('pre_source', ''):
-                        notes.append(f"pre:{click['pre_source']}")
-                    writer.writerow([
-                        f"{ts:.3f}", frame_idx,
-                        click.get('group_size', 1),
-                        f"{click['peak_fft_v']*1000:.4f}",
-                        f"{click['peak_amp']*1e6:.2f}",
-                        f"{click.get('spr', 0.0):.1f}",
-                        f"{click.get('pre_snr', 0.0):.3f}",
-                        f"{click.get('rms_pre', 0.0)*1000:.4f}",
-                        f"{click.get('E_W1', 0.0):.6e}",
-                        f"E_W4:.6e",
-                        f"{click.get('E_W1', 0.0)/E_W4 if E_W4>1e-12 else 999:.1f}",
-                        f"{click.get('asym_ratio', 0.0):.3f}",
-                        f"{tau:.3f}" if tau > 0 else "N/A",
-                        f"{click.get('r2_log', 0.0):.4f}",
-                        f"{click.get('snr', 0.0):.1f}",
-                        "; ".join(notes),
-                    ])
-            QMessageBox.information(self, "Export Successful", f"Results exported to:\n{filename}")
+                    frame_idx  = click['frame_idx']
+                    ts         = (frame_idx * self.data_manager.frame_duration_ms) / 1000.0
+                    peak_iFFT  = click.get('peak_amp', 0.0) * 1e6          # V → µV
+                    pre_snr    = click.get('pre_snr', 0.0)
+
+                    E_W1 = click.get('E_W1', 0.0)
+                    E_W4 = click.get('E_W4', 1e-30)
+                    ew_ratio = E_W1 / E_W4 if E_W4 > 1e-30 else 999.0
+
+                    asym       = click.get('asym_ratio', 0.0)
+                    tau_ms     = click.get('tau_ms', -1.0)
+                    r2_log     = click.get('r2_log', 0.0)
+                    slope_log  = click.get('slope_log', 0.0)
+
+                    # R_spectral: E_low / E_high from the energies dict
+                    energies   = click.get('energies', {})
+                    e_low      = energies.get('low',  0.0)
+                    e_high     = energies.get('high', 1e-30)
+                    r_spectral = e_low / e_high if e_high > 1e-30 else 999.0
+
+                    spr        = click.get('spr', 0.0)
+
+                    decay_res  = click.get('decay_results', {})
+                    near_end   = decay_res.get('near_end', False)
+
+                    row = [
+                        sessione_id,
+                        condizione,
+                        specie,
+                        data,
+                        _fmt(duration_s, 3),
+                        _fmt(noise_rms_uv, 3),
+                        str(n_click_totali),
+                        _fmt(ts, 6),
+                        _fmt(peak_iFFT, 2),
+                        _fmt(pre_snr, 4),
+                        _fmt(ew_ratio, 4),
+                        _fmt(asym, 4),
+                        _fmt(tau_ms, 4) if tau_ms > 0 else "NA",
+                        _fmt(r2_log, 4),
+                        _fmt(slope_log, 6),
+                        _fmt(r_spectral, 4),
+                        _fmt(spr, 2),
+                        "1" if near_end else "0",
+                    ]
+                    f.write(";".join(row) + "\n")
+
+            QMessageBox.information(
+                self, "Export Successful",
+                f"Exported {n_click_totali} clicks to:\n{filename}"
+            )
+            print(f"✅ CSV exported → {filename}  ({n_click_totali} rows, sep=';')")
+
         except Exception as e:
             QMessageBox.critical(self, "Export Failed", f"Error writing file:\n{str(e)}")
+            print(f"❌ CSV export failed: {e}")
