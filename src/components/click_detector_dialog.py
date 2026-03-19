@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox, QCheckBox, QGroupBox, QProgressDialog,
     QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
     QFormLayout, QSpinBox, QLineEdit, QComboBox, QDateEdit,
-    QFileDialog
+    QFileDialog, QScrollArea, QWidget, QSizePolicy, QGridLayout
 )
 from PySide6.QtCore import Qt, Signal, QDate
 from PySide6.QtGui import QFont
@@ -250,7 +250,7 @@ class ClickDetectorDialog(QDialog):
         self.detected_clicks = []
 
         self.setWindowTitle("Automatic Click Detector  v4.0")
-        self.setMinimumSize(1000, 750)
+        self.setMinimumSize(1000, 700)
 
         self.setup_ui()
         self.load_default_parameters()
@@ -260,162 +260,212 @@ class ClickDetectorDialog(QDialog):
             parent.theme_manager.apply_theme(self, saved_theme)
             if 'light' in saved_theme.lower():
                 self.setStyleSheet("QDialog { background-color: white; }")
+                # Force the scroll-area viewport and its container to inherit white
+                self._scroll_area.setStyleSheet(
+                    "QScrollArea { background-color: white; border: none; }"
+                    "QWidget { background-color: white; }"
+                )
 
     # =========================================================================
     # UI SETUP
     # =========================================================================
     def setup_ui(self):
         layout = QVBoxLayout(self)
+        layout.setSpacing(6)
 
         title = QLabel("<b style='font-size:15pt;'>Automatic Click Detector  v4.0</b>")
         title.setAlignment(Qt.AlignLeft)
-        layout.addWidget(title)
+        layout.addWidget(title, 0)
 
         subtitle = QLabel(
             "<i>4-stage pipeline (normalized only): "
             "Energy+Groups → FFT amplitude+SPR → iFFT 6 criteria → Deduplication</i>"
         )
         subtitle.setAlignment(Qt.AlignLeft)
-        layout.addWidget(subtitle)
+        layout.addWidget(subtitle, 0)
 
-        # ── PARAMETERS ───────────────────────────────────────────────────────
+        # ── PARAMETERS (compact 2-column grid) ───────────────────────────────
         params_group = QGroupBox("Detection Parameters")
-        params_layout = QFormLayout()
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(5)
 
-        # Stage 1 — threshold
-        threshold_layout = QHBoxLayout()
+        def _spin_row(label_text, spinbox, row, col, tooltip=None):
+            """Helper: add a label + spinbox pair at (row, col*2) in the grid."""
+            lbl = QLabel(label_text)
+            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if tooltip:
+                spinbox.setToolTip(tooltip)
+            grid.addWidget(lbl,     row, col * 2,     1, 1)
+            grid.addWidget(spinbox, row, col * 2 + 1, 1, 1)
+
+        # ── Stage 1 ── row 0 (full width: label + spinbox + sigma label) ─────
+        lbl_thr = QLabel("Energy Threshold (Stage 1):")
+        lbl_thr.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
         self.threshold_spinbox = QDoubleSpinBox()
         self.threshold_spinbox.setDecimals(3)
         self.threshold_spinbox.setRange(0, 10000)
         self.threshold_spinbox.setSuffix(" mV")
         self.threshold_spinbox.setToolTip("Stage 1: meanFFT energy threshold\nDefault: μ + 5σ")
-        threshold_layout.addWidget(self.threshold_spinbox)
+
         self.threshold_sigma_label = QLabel("(μ + 5.0σ)")
         self.threshold_sigma_label.setStyleSheet("color: gray;")
-        threshold_layout.addWidget(self.threshold_sigma_label)
-        threshold_layout.addStretch()
-        params_layout.addRow("Energy Threshold (Stage 1):", threshold_layout)
 
-        # Stage 2 — Max SPR
+        thr_row_widget = QWidget()
+        thr_row_layout = QHBoxLayout(thr_row_widget)
+        thr_row_layout.setContentsMargins(0, 0, 0, 0)
+        thr_row_layout.addWidget(self.threshold_spinbox)
+        thr_row_layout.addWidget(self.threshold_sigma_label)
+        thr_row_layout.addStretch()
+
+        grid.addWidget(lbl_thr,        0, 0, 1, 1)
+        grid.addWidget(thr_row_widget, 0, 1, 1, 3)   # span rest of row
+
+        # ── Stage 2 ── row 1, two columns ────────────────────────────────────
         self.max_spr_spinbox = QDoubleSpinBox()
         self.max_spr_spinbox.setDecimals(0)
         self.max_spr_spinbox.setRange(3.0, 200.0)
         self.max_spr_spinbox.setSingleStep(1.0)
         self.max_spr_spinbox.setValue(20.0)
-        self.max_spr_spinbox.setToolTip(
-            "Stage 2 – Max Spectral Peak Ratio (SPR)\n"
-            "SPR = max(|X[k]|²) / mean(|X[k]|²)  over 20-80 kHz bins\n"
-            "Click broadband: SPR ≈ 4–15 | Pure tone: SPR ≈ 50–150\n"
-            "Default: 20"
-        )
-        params_layout.addRow("Max SPR (Stage 2):", self.max_spr_spinbox)
+        _spin_row("Max SPR (Stage 2):", self.max_spr_spinbox, 1, 0,
+                  "Stage 2 – Max Spectral Peak Ratio (SPR)\n"
+                  "SPR = max(|X[k]|²) / mean(|X[k]|²)  over 20-80 kHz bins\n"
+                  "Click broadband: SPR ≈ 4–15 | Pure tone: SPR ≈ 50–150\n"
+                  "Default: 20")
 
-        # Stage 2 — Min peak FFT normalized
         self.min_peak_fft_spinbox = QDoubleSpinBox()
         self.min_peak_fft_spinbox.setDecimals(3)
         self.min_peak_fft_spinbox.setRange(0.001, 100.0)
         self.min_peak_fft_spinbox.setSingleStep(0.05)
         self.min_peak_fft_spinbox.setValue(0.85)
         self.min_peak_fft_spinbox.setSuffix(" mV")
-        self.min_peak_fft_spinbox.setToolTip(
-            "Stage 2 – Minimum peak amplitude of normalized FFT\n"
-            "Frames with max(FFT_norm) ≤ threshold are discarded\n"
-            "Default: 0.85 mV"
-        )
-        params_layout.addRow("Min peak FFT norm (Stage 2):", self.min_peak_fft_spinbox)
+        _spin_row("Min peak FFT norm (Stage 2):", self.min_peak_fft_spinbox, 1, 1,
+                  "Stage 2 – Minimum peak amplitude of normalized FFT\n"
+                  "Frames with max(FFT_norm) ≤ threshold are discarded\n"
+                  "Default: 0.85 mV")
 
-        # Stage 3 — Max pre_snr
+        # ── Stage 3 ── rows 2-4, two columns each ────────────────────────────
         self.max_pre_snr_spinbox = QDoubleSpinBox()
         self.max_pre_snr_spinbox.setDecimals(2)
         self.max_pre_snr_spinbox.setRange(1.0, 10.0)
         self.max_pre_snr_spinbox.setSingleStep(0.1)
         self.max_pre_snr_spinbox.setValue(1.8)
-        self.max_pre_snr_spinbox.setToolTip(
-            "Stage 3 – C2: Max pre-click noise level\n"
-            "pre_snr = RMS(signal before peak) / noise_rms\n"
-            "≈ 1.0 → silence before click  (ideal)\n"
-            "Default: 1.8"
-        )
-        params_layout.addRow("Max pre_snr (C2):", self.max_pre_snr_spinbox)
+        _spin_row("Max pre_snr (C2):", self.max_pre_snr_spinbox, 2, 0,
+                  "Stage 3 – C2: Max pre-click noise level\n"
+                  "pre_snr = RMS(signal before peak) / noise_rms\n"
+                  "≈ 1.0 → silence before click  (ideal)\n"
+                  "Default: 1.8")
 
-        # Stage 3 — Min iFFT peak
         self.min_peak_ifft_spinbox = QDoubleSpinBox()
         self.min_peak_ifft_spinbox.setDecimals(1)
         self.min_peak_ifft_spinbox.setRange(10.0, 10000.0)
         self.min_peak_ifft_spinbox.setSingleStep(10.0)
         self.min_peak_ifft_spinbox.setValue(130.0)
         self.min_peak_ifft_spinbox.setSuffix(" µV")
-        self.min_peak_ifft_spinbox.setToolTip(
-            "Stage 3 – Minimum peak amplitude of normalized iFFT\n"
-            "Default: 130 µV"
-        )
-        params_layout.addRow("Min peak iFFT norm (Stage 3):", self.min_peak_ifft_spinbox)
+        _spin_row("Min peak iFFT norm (Stage 3):", self.min_peak_ifft_spinbox, 2, 1,
+                  "Stage 3 – Minimum peak amplitude of normalized iFFT\n"
+                  "Default: 130 µV")
 
-        # Stage 3 — Max asym
         self.max_asym_spinbox = QDoubleSpinBox()
         self.max_asym_spinbox.setDecimals(2)
         self.max_asym_spinbox.setRange(0.1, 20.0)
         self.max_asym_spinbox.setSingleStep(0.1)
         self.max_asym_spinbox.setValue(2.5)
-        self.max_asym_spinbox.setToolTip(
-            "Stage 3 – Max asymmetry ratio (rise_samples / fall_samples)\n"
-            "Real clicks: very fast rise → ratio typically 0.05–0.5\n"
-            "Default: 2.5 (rejects signals with very slow rise relative to fall)"
-        )
-        params_layout.addRow("Max asym (Stage 3):", self.max_asym_spinbox)
+        _spin_row("Max asym (Stage 3):", self.max_asym_spinbox, 3, 0,
+                  "Stage 3 – Max asymmetry ratio (rise_samples / fall_samples)\n"
+                  "Real clicks: very fast rise → ratio typically 0.05–0.5\n"
+                  "Default: 2.5")
 
-        # Stage 3 — tau range
-        tau_layout = QHBoxLayout()
+        self.min_r2_spinbox = QDoubleSpinBox()
+        self.min_r2_spinbox.setDecimals(2)
+        self.min_r2_spinbox.setRange(0.0, 1.0)
+        self.min_r2_spinbox.setSingleStep(0.05)
+        self.min_r2_spinbox.setValue(0.45)
+        _spin_row("Min R² (Stage 3):", self.min_r2_spinbox, 3, 1,
+                  "Stage 3 – Minimum R² of log-linear decay fit\n"
+                  "Default: 0.45")
+
+        # ── τ range ── row 4, full width ──────────────────────────────────────
+        lbl_tau = QLabel("τ range (Stage 3):")
+        lbl_tau.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
         self.tau_min_spinbox = QDoubleSpinBox()
         self.tau_min_spinbox.setDecimals(3)
         self.tau_min_spinbox.setRange(0.001, 5.0)
         self.tau_min_spinbox.setSingleStep(0.005)
         self.tau_min_spinbox.setValue(0.045)
         self.tau_min_spinbox.setSuffix(" ms")
-        tau_layout.addWidget(self.tau_min_spinbox)
-        tau_layout.addWidget(QLabel("≤  τ  ≤"))
+
         self.tau_max_spinbox = QDoubleSpinBox()
         self.tau_max_spinbox.setDecimals(2)
         self.tau_max_spinbox.setRange(0.01, 10.0)
         self.tau_max_spinbox.setSingleStep(0.05)
         self.tau_max_spinbox.setValue(1.3)
         self.tau_max_spinbox.setSuffix(" ms")
+
+        tau_widget = QWidget()
+        tau_layout = QHBoxLayout(tau_widget)
+        tau_layout.setContentsMargins(0, 0, 0, 0)
+        tau_layout.addWidget(self.tau_min_spinbox)
+        tau_layout.addWidget(QLabel("≤  τ  ≤"))
         tau_layout.addWidget(self.tau_max_spinbox)
         tau_layout.addStretch()
-        params_layout.addRow("τ range (Stage 3):", tau_layout)
 
-        # Stage 3 — min R²
-        self.min_r2_spinbox = QDoubleSpinBox()
-        self.min_r2_spinbox.setDecimals(2)
-        self.min_r2_spinbox.setRange(0.0, 1.0)
-        self.min_r2_spinbox.setSingleStep(0.05)
-        self.min_r2_spinbox.setValue(0.45)
-        self.min_r2_spinbox.setToolTip(
-            "Stage 3 – Minimum R² of log-linear decay fit\n"
-            "Default: 0.45"
-        )
-        params_layout.addRow("Min R² (Stage 3):", self.min_r2_spinbox)
+        grid.addWidget(lbl_tau,    4, 0, 1, 1)
+        grid.addWidget(tau_widget, 4, 1, 1, 3)
 
-        params_group.setLayout(params_layout)
-        layout.addWidget(params_group)
+        # make the two halves share width equally
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
 
-        # ── FILE INFO ─────────────────────────────────────────────────────────
+        params_group.setLayout(grid)
+
+        # ── FILE INFO (horizontal, single row) ───────────────────────────────
         info_group = QGroupBox("File Information")
-        info_layout = QFormLayout()
-        self.info_duration   = QLabel("0.0 s")
-        self.info_frames     = QLabel("0")
+        info_h_layout = QHBoxLayout()
+        info_h_layout.setSpacing(20)
+
+        self.info_duration    = QLabel("0.0 s")
+        self.info_frames      = QLabel("0")
         self.info_mean_energy = QLabel("0.000 mV")
         self.info_std_energy  = QLabel("0.000 mV")
-        info_layout.addRow("Total duration:", self.info_duration)
-        info_layout.addRow("Total frames:",   self.info_frames)
-        info_layout.addRow("Mean energy (μ):", self.info_mean_energy)
-        info_layout.addRow("Std deviation (σ):", self.info_std_energy)
-        info_group.setLayout(info_layout)
-        layout.addWidget(info_group)
+
+        for lbl_text, val_widget in [
+            ("Duration:", self.info_duration),
+            ("Frames:", self.info_frames),
+            ("Mean energy (μ):", self.info_mean_energy),
+            ("Std deviation (σ):", self.info_std_energy),
+        ]:
+            lbl = QLabel(f"<b>{lbl_text}</b>")
+            info_h_layout.addWidget(lbl)
+            info_h_layout.addWidget(val_widget)
+
+        info_h_layout.addStretch()
+        info_group.setLayout(info_h_layout)
+
+        # ── Wrap params + info in a scroll area so they never eat the table ──
+        top_container = QWidget()
+        top_container_layout = QVBoxLayout(top_container)
+        top_container_layout.setContentsMargins(2, 2, 2, 2)
+        top_container_layout.setSpacing(4)
+        top_container_layout.addWidget(params_group)
+        top_container_layout.addWidget(info_group)
+        top_container_layout.addStretch(0)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(top_container)
+        scroll_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        scroll_area.setMaximumHeight(260)
+        scroll_area.setMinimumHeight(180)
+        scroll_area.setFrameShape(QScrollArea.NoFrame)
+        self._scroll_area = scroll_area          # keep ref for light-theme fix
+        layout.addWidget(scroll_area, 0)
 
         # ── RESULTS TABLE ─────────────────────────────────────────────────────
         results_label = QLabel("<b>Detected Clicks</b>")
-        layout.addWidget(results_label)
+        layout.addWidget(results_label, 0)
 
         self.results_table = QTableWidget()
         self.results_table.setColumnCount(11)
@@ -426,13 +476,15 @@ class ClickDetectorDialog(QDialog):
         self.results_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.results_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.results_table.setAlternatingRowColors(True)
+        self.results_table.setMinimumHeight(220)
+        self.results_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         hdr = self.results_table.horizontalHeader()
         for c in range(10):
             hdr.setSectionResizeMode(c, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(10, QHeaderView.Stretch)
         self.results_table.verticalHeader().setVisible(False)
-        layout.addWidget(self.results_table)
+        layout.addWidget(self.results_table, 1)
 
         # ── BUTTONS ───────────────────────────────────────────────────────────
         button_layout = QHBoxLayout()
@@ -451,7 +503,7 @@ class ClickDetectorDialog(QDialog):
         self.close_button.clicked.connect(self.accept)
         button_layout.addWidget(self.close_button)
 
-        layout.addLayout(button_layout)
+        layout.addLayout(button_layout, 0)
 
     # =========================================================================
     # PARAMETER LOADING
