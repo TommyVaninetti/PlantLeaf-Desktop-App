@@ -3,3 +3,4 @@ pyqtgraph
 pyserial
 numpy
 scipy
+wakepy

@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QSplitter, QMessageBox, QFileDialog, QProgressDial
 from PySide6.QtCore import Signal, QTimer, Qt, QThread
 
 from core import BaseWindow
+from core.wake_lock_manager import WakeLockManager
 from .ui.ui_MainWindowAudio import Ui_MainWindowAudio
 from core.special_component import replace_widget
 from components.start_stop_button import StartStopButton
@@ -157,6 +158,7 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         self._pending_close_event = False
 
         self.is_acquiring = False
+        self._wake_lock = WakeLockManager()
 
         # mostra a tutto schermo mantenendo le grafiche
         self.showMaximized()
@@ -188,6 +190,7 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         
         # ✅ Solo se tutto OK, procedi
         self.is_acquiring = True
+        self._wake_lock.acquire()  # ☀️ Previeni sleep durante acquisizione
         self.start_chronometer()
         self.serial_worker.start(self.threshold_value)  # PASSA LA SOGLIA CORRENTE AL METODO START
 
@@ -213,6 +216,7 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         if not self.isVisible():  # Se la finestra sta chiudendosi, non salvare
             return
         self.is_acquiring = False
+        self._wake_lock.release()  # 🌙 Rilascia wake lock
         
         # Chiama il metodo sicuro centralizzato in BaseWindow
         self._safe_stop_serial_worker()
