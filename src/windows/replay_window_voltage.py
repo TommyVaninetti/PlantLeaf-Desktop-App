@@ -321,8 +321,8 @@ class ReplayVoltageWindow(ReplayBaseWindow):
             # Gestione timestamp per versione 2.0
             if version >= 2.0:
                 metadata.update({
-                    'start_time': max(0, struct.unpack('<d', header_bytes[41:49])[0]),
-                    'end_time': max(0, struct.unpack('<d', header_bytes[49:57])[0])
+                    'start_time': max(0, struct.unpack('<d', header_bytes[42:50])[0]),
+                    'end_time': max(0, struct.unpack('<d', header_bytes[50:58])[0])
                 })
             else:
                 metadata.update({

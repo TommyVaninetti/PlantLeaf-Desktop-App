@@ -1669,57 +1669,49 @@ class MathOperations(QDialog, Ui_QDialogMath):
 
     #0. prendi gli array di cui hai bisogno
     def get_arrays(self):
-        # ✅ FIX: Calcola dinamicamente quanti campioni "pre" abbiamo
-        # Invece di assumere sempre 1 secondo, usa quello che effettivamente c'è
-        
-        first_time = self.total_time_data[0]
-        # Trova l'indice dove iniziano i "veri" dati selezionati
-        # (tutto prima è considerato "pre" per la baseline)
-        
-        # Calcola quanti punti equivalgono a 1 secondo (per riferimento)
-        n_samples_per_second = int(self.sampling_rate)
-        
-        # Trova il primo punto che è >= al tempo di inizio della selezione vera
-        # Assumiamo che i primi ~1s (o meno) siano "pre"
-        # Cerca il punto dove il tempo fa un "salto" maggiore (transizione pre->main)
-        
-        # Strategia semplice: prendi gli ultimi 50 campioni prima del punto di 1s (se esiste)
-        # altrimenti prendi i primi 50 campioni disponibili come "pre"
-        
-        if len(self.total_time_data) < 50:
-            self.show_error_dialog("Data Error", "Not enough data for analysis (minimum 50 samples required).")
+        n = len(self.total_time_data)
+
+        if n < 2:
+            self.show_error_dialog("Data Error", "Not enough data for analysis (minimum 2 samples required).")
             self.close()
             return
-        
-        # Trova dove iniziano i dati "principali" (dopo ~1s dall'inizio dati)
-        # Se abbiamo meno di n_samples_per_second campioni, usa tutti come "main"
-        if len(self.total_time_data) >= n_samples_per_second + 50:
-            # Caso normale: abbastanza dati per 1s pre + 50 campioni baseline
-            split_idx = n_samples_per_second
-            self.time_data_pre = self.total_time_data[split_idx-50:split_idx]
-            self.signal_data_pre = self.total_signal_data[split_idx-50:split_idx]
-            self.time_data = self.total_time_data[split_idx:]
-            self.signal_data = self.total_signal_data[split_idx:]
+
+        # Quanti campioni corrispondono a 1 secondo di "pre" (baseline)?
+        # ✅ FIX: clamp a [1, n-1] per evitare split_idx negativo o fuori range
+        n_pre = max(1, min(int(self.sampling_rate), n - 1))
+
+        # Vogliamo usare gli ultimi min(50, n_pre) campioni del blocco pre
+        # come finestra di baseline, e tutto il resto come dati principali.
+        # split_idx = quanti campioni totali costituiscono la sezione "pre"
+        split_idx = n_pre
+        pre_start = max(0, split_idx - 50)   # mai indice negativo
+
+        if split_idx > 0 and pre_start < split_idx:
+            # Caso normale: c'è un blocco pre consistente
+            self.time_data_pre   = self.total_time_data[pre_start:split_idx]
+            self.signal_data_pre = self.total_signal_data[pre_start:split_idx]
+            self.time_data       = self.total_time_data[split_idx:]
+            self.signal_data     = self.total_signal_data[split_idx:]
         else:
-            # Caso bordo: pochi dati (es. regione 0-0.5s)
-            # Usa i primi 50 campioni come "pre", il resto come "main"
-            if len(self.total_time_data) > 50:
-                self.time_data_pre = self.total_time_data[:50]
-                self.signal_data_pre = self.total_signal_data[:50]
-                self.time_data = self.total_time_data[50:]
-                self.signal_data = self.total_signal_data[50:]
-            else:
-                # Caso estremo: meno di 50 campioni totali
-                # Usa i primi 10 come "pre" (se possibile), il resto come "main"
-                pre_samples = min(10, len(self.total_time_data) // 3)
-                self.time_data_pre = self.total_time_data[:pre_samples]
-                self.signal_data_pre = self.total_signal_data[:pre_samples]
-                self.time_data = self.total_time_data[pre_samples:]
-                self.signal_data = self.total_signal_data[pre_samples:]
-        
+            # Fallback: prendi i primi ~20% come pre, il resto come main
+            split_idx = max(1, n // 5)
+            self.time_data_pre   = self.total_time_data[:split_idx]
+            self.signal_data_pre = self.total_signal_data[:split_idx]
+            self.time_data       = self.total_time_data[split_idx:]
+            self.signal_data     = self.total_signal_data[split_idx:]
+
+        # Garanzia finale: nessun array può essere vuoto dopo lo split
+        if len(self.time_data_pre) == 0 or len(self.time_data) == 0:
+            mid = max(1, n // 2)
+            self.time_data_pre   = self.total_time_data[:mid]
+            self.signal_data_pre = self.total_signal_data[:mid]
+            self.time_data       = self.total_time_data[mid:]
+            self.signal_data     = self.total_signal_data[mid:]
+
         print(f"   Array split: {len(self.time_data_pre)} pre-samples, {len(self.time_data)} main samples")
-        print(f"   Time range: pre={self.time_data_pre[0]:.3f}-{self.time_data_pre[-1]:.3f}s, "
-              f"main={self.time_data[0]:.3f}-{self.time_data[-1]:.3f}s")
+        if len(self.time_data_pre) > 0 and len(self.time_data) > 0:
+            print(f"   Time range: pre={self.time_data_pre[0]:.3f}-{self.time_data_pre[-1]:.3f}s, "
+                  f"main={self.time_data[0]:.3f}-{self.time_data[-1]:.3f}s")
 
     #1. inizializzo variabili
     def initialize_default_variables(self):
