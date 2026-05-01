@@ -1,9 +1,21 @@
+#cartelle
 .venv/
 old/
 build/
 dist/
+docs/
+firmware/
+implementations_docs/
+test_scripts/
+
 # Python bytecode
 __pycache__/
 *.pyc
 .DS_Store
 **/.DS_Store
+
+#file specifici
+PlantLeaf_aftertext.txt
+PlantLeaf_beforetext.txt
+*.spec
+
