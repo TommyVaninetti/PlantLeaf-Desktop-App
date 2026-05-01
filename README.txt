@@ -49,3 +49,15 @@ If you wish to modify or update PySide6, you may replace the library files inclu
 In addition, this app uses Uicons icons under open-source license that can be found under this link: Uicons by <a href="https://www.flaticon.com/uicons">Flaticon</a>
 
 Complete licenses are available under LICENCES.
+
+
+## Dependencies
+
+| Library | Version | License |
+|---------|---------|---------|
+| PySide6 | 6.9.0 | LGPLv3 |
+| pyqtgraph | latest | MIT |
+| pyserial | latest | BSD |
+| numpy | latest | BSD |
+| scipy | latest | BSD |
+| wakepy | latest | MIT|
