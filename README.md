@@ -1,4 +1,4 @@
-# 🌿 PlantLeaf – *Let plants speak*
+# PlantLeaf – *Let plants speak*
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Version](https://img.shields.io/badge/version-1.0.0-green.svg)]()
@@ -7,7 +7,7 @@
 
 > *Plants respond to stress with both electrical and acoustic signals. PlantLeaf gives you the tools to detect, visualise, and analyse them — with low-cost hardware and rigorous, open-source software.*
 
-**[🌐 Website](https://plantleaf.it) · [📄 Documentation Repo](https://github.com/TommyVaninetti/PlantLeaf---documentation) · [📬 Contact](mailto:tommasovaninetti8@gmail.com)**
+**[Website](https://plantleaf.it) · [Documentation Repo](https://github.com/TommyVaninetti/PlantLeaf---documentation) · [Contact](mailto:tommasovaninetti8@gmail.com)**
 
 ---
 
@@ -19,36 +19,28 @@ The project bridges plant biology, acoustic signal processing, and embedded syst
 
 ---
 
-## Screenshots
-
-![iFFT reconstruction with Hilbert envelope](https://plantleaf.it/static/images/aloemate.png)
-
-![Action Potential from Aloe light stress fitted](https://plantleaf.it/static/images/APM.png)
-
----
-
 ## Key Features
 
-### 🔊 Ultrasonic Click Detection
+### Ultrasonic Click Detection
 - Real-time FFT visualisation of the 20–80 kHz ultrasonic band
 - Automatic 4-stage click detection algorithm (v4.0) with sub-millisecond temporal resolution
 - Time-domain signal reconstruction via inverse FFT (iFFT) with Gibbs suppression
 - Hilbert envelope analysis for click morphology characterisation (decay constant τ, R²)
 - Threshold-based and fully automatic detection modes
 
-### 🔬 Voltage Signal Analysis
+### Voltage Signal Analysis
 - Real-time acquisition and visualisation of plant electrical signals up to 1k samples/s
 - Automatic mathematical fitting of action potential waveforms (sinusoidal depolarisation + exponential repolarisation)
 - Energy calculation and correlation coefficient reporting for each detected event
 - Export of raw voltage recordings and fitted parameters
 
-### 🖥️ Application
+### Application
 - Cross-platform GUI (Windows, macOS, Linux) built with PySide6
 - Unified interface for both voltage and audio acquisition and analysis
 - Interactive spectrograms, time-averaged FFT graphs, and waveform inspection
 - Full session export with per-click feature vectors (τ, R², SPR, amplitude, spectral ratio)
+Complete documentation is available here: [📄 Documentation Repo](https://github.com/TommyVaninetti/PlantLeaf---documentation)
 
-Complete documentation is available at here: [📄 Documentation Repo](https://github.com/TommyVaninetti/PlantLeaf---documentation)
 ---
 
 ## Hardware Requirements
@@ -86,11 +78,11 @@ The ultrasonic click detector is a 4-stage pipeline that processes continuous FF
 | **Stage 3** | Six-criterion temporal validation: amplitude, pre-click silence, energy decay, asymmetry, decay constant τ, exponential fit quality R² |
 | **Stage 4** | Deduplication across consecutive frames |
 
-📄 **Full technical specification:** [CLICK_DETECTION_ALGORITHM.md](https://github.com/TommyVaninetti/PlantLeaf---documentation/blob/main/App/Automatic_click_detection_algorithm/CLICK_DETECTION_ALGORITHM.md)
+**Full technical specification:** [CLICK_DETECTION_ALGORITHM_4.md](https://github.com/TommyVaninetti/PlantLeaf---documentation/blob/main/App/Automatic_click_detection_algorithm/CLICK_DETECTION_ALGORITHM_4.md)
 
-📄 **FFT and phase data specification:** [FFT_PHASE_TECHNICAL_SPECIFICATION.md](https://github.com/TommyVaninetti/PlantLeaf---documentation/blob/main/App/FFT_and_acquisition_specifications/FFT_PHASE_TECHNICAL_SPECIFICATION.md)
+**FFT and phase data specification:** [FFT_PHASE_TECHNICAL_SPECIFICATION.md](https://github.com/TommyVaninetti/PlantLeaf---documentation/blob/main/App/FFT_and_acquisition_specifications/FFT_PHASE_TECHNICAL_SPECIFICATION.md)
 
----
+**A new version of the algorithm (v5) is currently under development.** See [CLICK_DETECTION_ALGORITHM_v5.md](https://github.com/TommyVaninetti/PlantLeaf---documentation/blob/main/App/Automatic_click_detection_algorithm/CLICK_DETECTION_ALGORITHM_5.md) for the documentation and check out the new branches that include code under development.
 
 ## Experimental Results
 
@@ -181,6 +173,14 @@ PlantLeaf-Desktop-App/
 ├── LICENSE                              # AGPL-3.0
 └── README.md
 ```
+
+---
+
+## Screenshots
+
+![iFFT reconstruction with Hilbert envelope](https://plantleaf.it/static/images/aloemate.png)
+
+![Action Potential from Aloe light stress fitted](https://plantleaf.it/static/images/APM.png)
 
 ---
 

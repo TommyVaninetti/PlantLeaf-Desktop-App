@@ -9,9 +9,6 @@ ARCHITETTURA MULTI-LEVEL:
 """
 
 import numpy as np
-import struct
-import json
-import zlib
 import os
 from PySide6.QtWidgets import (QVBoxLayout, QHBoxLayout, QWidget, QTabWidget, 
                               QSplitter, QTableWidget, QTableWidgetItem, 
@@ -1548,9 +1545,6 @@ def compute_decay_r2(post_peak_window: np.ndarray, fs: int = 200000,
     Modello fisico: E(t) = A₀·exp(−t/τ)
     Log-linearizzazione: log(E[n]) = log(A₀) − n/τ_samples   →  regressione lineare
 
-    ⚠️ DESCRITTIVO: R² e τ NON sono usati come criteri di validazione (v3.0+).
-       Sono feature descrittive per analisi statistica post-rilevamento.
-
     Parameters
     ----------
     post_peak_window : np.ndarray
@@ -1729,7 +1723,7 @@ def check_decay(envelope: np.ndarray, peak_idx: int, fs=200000,
     Returns:
     --------
     dict : {
-        # DECAY FIT (DESCRIPTIVE ONLY - not used for validation)
+        # DECAY FIT
         'r_squared_log': float,              # R² del fit logaritmico
         'slope_log': float,                  # Pendenza fit log
         'tau_ms': float,                     # Costante di decadimento in ms
