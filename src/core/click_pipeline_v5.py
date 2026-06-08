@@ -155,6 +155,29 @@ _GAUSS_KERNEL = _GAUSS_KERNEL / _GAUSS_KERNEL.sum()                    # unit-su
 # smaller than this are indistinguishable from zero in double precision and are
 # treated as "no decay" (→ τ = −1). This is NOT a physical threshold on τ.
 _SLOPE_ZERO_GUARD = 1e-10
+
+# FEATURE COMPUTATION (§8)
+LEVEL_STD_FACTOR     = 1.0  # LEVEL = noise_floor + LEVEL_STD_FACTOR × std_noise.
+                              # Defines "the signal has emerged from the noise floor"
+                              # for: rise_time, fall_time, pre-window boundary,
+                              # kurtosis event_start. Factor of 1.0 = 1 σ above floor.
+POST_WINDOW_SAMPLES  = 100  # Length of the post-SNR window P [samples] = 0.5 ms.
+                              # Captures signal level immediately after the click ends.
+PRE_MIN_SAMPLES      = 5    # Minimum samples needed for a meaningful pre-window RMS.
+                              # If fewer samples are available, pre_SNR is set to 1.0
+                              # (neutral — "unknown silence before click").
+ZCR_CLICK_TAU_FACTOR = 1.0  # ZCR_click window half-width = τ_ms × fs/1000 × factor.
+                              # Factor = 1.0 sets window to ±1 decay time constant,
+                              # capturing the main oscillation period of the click.
+ZCR_CLICK_FALLBACK_MS = 0.3 # Fallback ZCR_click half-width [ms] when τ is invalid
+                              # (τ = −1). 0.3 ms covers the typical click duration.
+MIN_CENTROID_SAMPLES  = 6   # Minimum segment length [samples] for a meaningful
+                              # short-time FFT in the centroid_shift computation.
+
+# Derived
+_BIN_MID = int(40_000 / _BIN_FREQ)   # 40 kHz bin index in the full half-spectrum.
+                                       # Splits the analysis band at 40 kHz for
+                                       # R_spectral = E_low[20-40] / E_high[40-80].
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -843,6 +866,109 @@ def run_fit_pipeline_v5(
     return _fit_decay_segment(extended, decay_start, decay_end, fs)
 
 
+def _fit_decay_segment(
+    extended:    np.ndarray,
+    decay_start: int,
+    decay_end:   int,
+    fs:          int = FS,
+) -> dict:
+    """
+    Steps C and D of the fit pipeline: Gaussian smoothing + OLS log-linear fit.
+
+    Operates on a pre-located decay window [decay_start, decay_end] within
+    `extended` (the possibly frame-concatenated envelope). Called internally by
+    run_fit_pipeline_v5; exposed separately so it can be unit-tested in isolation.
+
+    Step C — Gaussian smoothing:
+        Convolve extended[decay_start:decay_end] with _GAUSS_KERNEL (σ=2 samples,
+        mode='valid'). Suppresses high-frequency ripple without distorting the
+        decay shape (kernel width << τ_min).
+
+    Step D — OLS log-linear fit:
+        Fit log(fit_window) vs. sample index. Closed-form formula — no BLAS.
+        Returns τ_ms = −1000 / (slope × fs) and R² in log space.
+
+    Parameters
+    ----------
+    extended : np.ndarray
+        Full (possibly extended) envelope from find_decay_window_v5.
+    decay_start : int
+        Decay window start index in `extended`.
+    decay_end : int
+        Decay window end index in `extended`.
+    fs : int
+        Sampling rate [Hz].
+
+    Returns
+    -------
+    dict with keys:
+        'tau_ms'       : float – decay constant [ms]. −1 if no valid decay.
+        'R2'           : float – goodness of fit in log space.
+        'fit_coverage' : float – len(fit_window) / (decay_end − decay_start).
+        'decay_start'  : int   – echoed back for convenience.
+        'decay_end'    : int   – echoed back for convenience.
+    """
+    decay_len = decay_end - decay_start
+
+    if decay_len < 1:
+        return {'tau_ms': -1.0, 'R2': 0.0, 'fit_coverage': 0.0,
+                'decay_start': decay_start, 'decay_end': decay_end}
+
+    decay_segment = extended[decay_start : decay_end]
+
+    # ── Step C: Gaussian smoothing ────────────────────────────────────────────
+    if len(decay_segment) >= len(_GAUSS_KERNEL):
+        # mode='valid' avoids zero-padding artefacts at segment boundaries.
+        fit_window = np.convolve(decay_segment, _GAUSS_KERNEL, mode='valid')
+    else:
+        fit_window = decay_segment.copy()   # too short to convolve
+
+    n_fit = len(fit_window)
+
+    if n_fit < MIN_FIT_SAMPLES:
+        return {'tau_ms': -1.0, 'R2': 0.0,
+                'fit_coverage': n_fit / max(1, decay_len),
+                'decay_start': decay_start, 'decay_end': decay_end}
+
+    # ── Step D: OLS log-linear fit ────────────────────────────────────────────
+    log_env = np.log(np.maximum(fit_window, FIT_LOG_EPSILON))
+    n_array = np.arange(n_fit, dtype=np.float64)
+
+    n_pts  = float(n_fit)
+    sum_x  = float(np.sum(n_array))
+    sum_y  = float(np.sum(log_env))
+    sum_xx = float(np.sum(n_array * n_array))
+    sum_xy = float(np.sum(n_array * log_env))
+    denom  = n_pts * sum_xx - sum_x * sum_x
+
+    if abs(denom) < 1e-30:
+        return {'tau_ms': -1.0, 'R2': 0.0,
+                'fit_coverage': n_fit / max(1, decay_len),
+                'decay_start': decay_start, 'decay_end': decay_end}
+
+    slope_m     = (n_pts * sum_xy - sum_x * sum_y) / denom
+    intercept_b = (sum_y - slope_m * sum_x) / n_pts
+
+    # Negative slope + above numerical zero-guard → genuine exponential decay
+    if slope_m < -_SLOPE_ZERO_GUARD:
+        tau_ms = -1000.0 / (slope_m * fs)
+    else:
+        tau_ms = -1.0
+
+    y_pred = slope_m * n_array + intercept_b
+    ss_res = float(np.sum((log_env - y_pred)        ** 2))
+    ss_tot = float(np.sum((log_env - sum_y / n_pts) ** 2))
+    R2     = float(1.0 - ss_res / ss_tot) if ss_tot > 1e-30 else 0.0
+
+    return {
+        'tau_ms'      : tau_ms,
+        'R2'          : R2,
+        'fit_coverage': n_fit / max(1, decay_len),
+        'decay_start' : decay_start,
+        'decay_end'   : decay_end,
+    }
+
+
 def find_decay_window_v5(
     envelope:            np.ndarray,
     peak_idx:            int,
@@ -955,105 +1081,643 @@ def find_decay_window_v5(
         'extended_envelope' : extended,
     }
 
+# =============================================================================
+# FEATURE SUB-FUNCTIONS  (§8)
+# Each function computes one logical group of features. All return plain floats
+# or dicts of plain floats — no numpy arrays — so the caller can merge them
+# directly into a flat feature dict.
+# =============================================================================
 
-def _fit_decay_segment(
-    extended:    np.ndarray,
-    decay_start: int,
-    decay_end:   int,
-    fs:          int = FS,
+def _build_pre_window(
+    envelope:            np.ndarray,
+    signal:              np.ndarray,
+    peak_idx:            int,
+    noise_floor:         float,
+    std_noise:           float,
+    prev_frame_envelope: Optional[np.ndarray] = None,
+    prev_frame_signal:   Optional[np.ndarray] = None,
 ) -> dict:
     """
-    Steps C and D of the fit pipeline: Gaussian smoothing + OLS log-linear fit.
+    Build the pre-window for a click candidate, extending into the previous frame.
 
-    Operates on a pre-located decay window [decay_start, decay_end] within
-    `extended` (the possibly frame-concatenated envelope). Called internally by
-    run_fit_pipeline_v5; exposed separately so it can be unit-tested in isolation.
+    The pre-window is defined as all samples before the click emerged from the
+    noise floor — i.e., everything before the first sample above
+    LEVEL = noise_floor + LEVEL_STD_FACTOR × std_noise going backward from peak_idx.
 
-    Step C — Gaussian smoothing:
-        Convolve extended[decay_start:decay_end] with _GAUSS_KERNEL (σ=2 samples,
-        mode='valid'). Suppresses high-frequency ripple without distorting the
-        decay shape (kernel width << τ_min).
+    Why extending into the previous frame matters:
+        If peak_idx is small (e.g. click at sample 20 of a 512-sample frame),
+        the current frame provides only 20 samples of "silence before". This is
+        too few for a reliable RMS estimate (pre_SNR) or ZCR measurement
+        (ZCR_pre). The previous frame contributes up to 512 more samples of
+        genuine pre-click silence, giving much more stable estimates regardless
+        of where in the frame the click lands.
 
-    Step D — OLS log-linear fit:
-        Fit log(fit_window) vs. sample index. Closed-form formula — no BLAS.
-        Returns τ_ms = −1000 / (slope × fs) and R² in log space.
+    Strategy:
+        1. Build an extended array: [prev_tail | current_frame_up_to_peak].
+           If no previous frame is available, work with the current frame only.
+        2. Scan backward from the peak position in the extended array for the
+           last sub-LEVEL sample — this is the true pre-boundary.
+        3. Return the pre-window (envelope and raw signal) as arrays, plus the
+           boundary index mapped back to the current frame's coordinate system
+           (for kurtosis event_start, which operates on the current frame only).
 
     Parameters
     ----------
-    extended : np.ndarray
-        Full (possibly extended) envelope from find_decay_window_v5.
-    decay_start : int
-        Decay window start index in `extended`.
-    decay_end : int
-        Decay window end index in `extended`.
+    envelope : np.ndarray
+        Hilbert envelope of the current frame.
+    signal : np.ndarray
+        Raw iFFT signal of the current frame.
+    peak_idx : int
+        Index of the peak in the current frame.
+    noise_floor : float
+        Adaptive noise floor [V].
+    std_noise : float
+        Adaptive noise std [V].
+    prev_frame_envelope : np.ndarray or None
+        Hilbert envelope of the immediately preceding frame. Appended on the
+        left of the search array to give the boundary search more context.
+    prev_frame_signal : np.ndarray or None
+        Raw iFFT signal of the preceding frame. Used to build pre_sig.
+        If None but prev_frame_envelope is given, pre_sig is extended with
+        zeros for the previous portion (ZCR_pre will be 0 there — conservative).
+
+    Returns
+    -------
+    dict with keys:
+        'pre_env'          : np.ndarray – envelope of the pre-window.
+                             RMS of this / noise_floor → pre_SNR.
+        'pre_sig'          : np.ndarray – raw signal of the pre-window.
+                             Fed to _compute_zcr for ZCR_pre.
+        'boundary_in_frame': int – index in the *current frame* where the click
+                             first emerged above LEVEL. Used as event_start for
+                             kurtosis. Clamped to 0 if the boundary is in the
+                             previous frame (meaning the click filled the entire
+                             current frame before peak_idx, which is unusual).
+    """
+    level = noise_floor + LEVEL_STD_FACTOR * std_noise
+
+    # ── Build extended arrays ─────────────────────────────────────────────────
+    # Include the entire previous frame (512 samples) so a click at any position
+    # in the current frame always has a full frame of pre-click context.
+    if prev_frame_envelope is not None:
+        ext_env = np.concatenate([prev_frame_envelope, envelope[:peak_idx + 1]])
+        if prev_frame_signal is not None:
+            ext_sig = np.concatenate([prev_frame_signal, signal[:peak_idx + 1]])
+        else:
+            # No raw signal for previous frame: fill with zeros.
+            # ZCR_pre will see no crossings in that region (conservative).
+            ext_sig = np.concatenate([
+                np.zeros(len(prev_frame_envelope), dtype=signal.dtype),
+                signal[:peak_idx + 1]
+            ])
+        prev_len = len(prev_frame_envelope)
+    else:
+        ext_env  = envelope[:peak_idx + 1]
+        ext_sig  = signal[:peak_idx + 1]
+        prev_len = 0
+
+    # ── Scan backward for the last sub-LEVEL sample ───────────────────────────
+    # The pre-window is everything BEFORE this index in the extended array.
+    peak_in_ext    = len(ext_env) - 1   # peak position in extended coordinates
+    pre_end_in_ext = 0                  # default: no sub-LEVEL sample found
+    for n in range(peak_in_ext - 1, -1, -1):
+        if ext_env[n] < level:
+            pre_end_in_ext = n + 1   # exclusive upper bound of pre-window
+            break
+
+    # ── Extract pre-window arrays ─────────────────────────────────────────────
+    pre_env = ext_env[:pre_end_in_ext]
+    pre_sig = ext_sig[:pre_end_in_ext]
+
+    # ── Map boundary back to current-frame coordinates ────────────────────────
+    # pre_end_in_ext is in extended coords; subtract prev_len to get current-frame index.
+    # Clamp to [0, peak_idx] — never negative, never past the peak.
+    boundary_in_frame = max(0, min(peak_idx, pre_end_in_ext - prev_len))
+
+    return {
+        'pre_env'          : pre_env,
+        'pre_sig'          : pre_sig,
+        'boundary_in_frame': boundary_in_frame,
+    }
+
+
+def _compute_zcr(
+    signal:    np.ndarray,
+    std_noise: float,
+) -> float:
+    """
+    Compute the hysteresis zero-crossing rate [crossings/ms] for a signal segment.
+
+    A crossing is only counted when the signal COMPLETELY traverses the noise
+    band [-std_noise, +std_noise], eliminating spurious crossings from noise
+    micro-fluctuations:
+
+        upward:   x[n-1] < −std_noise  AND  x[n] > +std_noise
+        downward: x[n-1] > +std_noise  AND  x[n] < −std_noise
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        Raw iFFT signal segment (not the envelope).
+    std_noise : float
+        Noise standard deviation [V] — defines the hysteresis band width.
+
+    Returns
+    -------
+    float
+        Crossings per millisecond [crossings/ms]. Returns 0.0 if segment < 2 samples.
+    """
+    if len(signal) < 2:
+        return 0.0
+
+    n_crossings = 0
+    for i in range(1, len(signal)):
+        upward   = signal[i - 1] < -std_noise and signal[i] > +std_noise
+        downward = signal[i - 1] > +std_noise and signal[i] < -std_noise
+        if upward or downward:
+            n_crossings += 1
+
+    duration_ms = len(signal) / FS * 1000.0
+    return n_crossings / duration_ms if duration_ms > 0 else 0.0
+
+
+def _segment_spectral_centroid(segment: np.ndarray, fs: int) -> float:
+    """
+    Compute the power-weighted mean frequency (spectral centroid) of a short
+    time-domain segment, restricted to the 20–80 kHz analysis band.
+
+    A Hann window is applied before the FFT to reduce spectral leakage from the
+    sharp segment boundaries — essential for short windows (10–100 samples).
+
+    Parameters
+    ----------
+    segment : np.ndarray
+        Time-domain signal segment.
     fs : int
         Sampling rate [Hz].
 
     Returns
     -------
-    dict with keys:
-        'tau_ms'       : float – decay constant [ms]. −1 if no valid decay.
-        'R2'           : float – goodness of fit in log space.
-        'fit_coverage' : float – len(fit_window) / (decay_end − decay_start).
-        'decay_start'  : int   – echoed back for convenience.
-        'decay_end'    : int   – echoed back for convenience.
+    float
+        Spectral centroid [Hz], or 0.0 if the segment is too short or has no energy.
     """
-    decay_len = decay_end - decay_start
+    n = len(segment)
+    if n < MIN_CENTROID_SAMPLES:
+        return 0.0
 
-    if decay_len < 1:
-        return {'tau_ms': -1.0, 'R2': 0.0, 'fit_coverage': 0.0,
-                'decay_start': decay_start, 'decay_end': decay_end}
+    windowed = segment * np.hanning(n)
+    Xf       = np.abs(np.fft.rfft(windowed))
+    freq     = np.fft.rfftfreq(n, d=1.0 / fs)
 
-    decay_segment = extended[decay_start : decay_end]
+    mask  = (freq >= BIN_START_HZ) & (freq <= BIN_END_HZ)
+    power = Xf[mask] ** 2
+    total = float(np.sum(power))
 
-    # ── Step C: Gaussian smoothing ────────────────────────────────────────────
-    if len(decay_segment) >= len(_GAUSS_KERNEL):
-        # mode='valid' avoids zero-padding artefacts at segment boundaries.
-        fit_window = np.convolve(decay_segment, _GAUSS_KERNEL, mode='valid')
+    if total < 1e-30:
+        return 0.0
+
+    return float(np.sum(freq[mask] * power) / total)
+
+
+# ── Individual feature functions ──────────────────────────────────────────────
+
+def _feat_peak_snr(peak_amp: float, noise_floor: float) -> float:
+    """
+    peak_SNR = peak_amp / noise_floor  (§8.1)
+
+    Dimensionless amplitude relative to the adaptive noise floor. Replaces the
+    absolute 130 µV threshold from v4 — invariant to hardware gain changes.
+    """
+    if noise_floor <= 0:
+        return 0.0
+    return peak_amp / noise_floor
+
+
+def _feat_pre_snr(pre_env: np.ndarray, noise_floor: float) -> float:
+    """
+    pre_SNR = RMS(pre_window) / noise_floor  (§8.2)
+
+    The pre-window (pre_env) is built by _build_pre_window, which extends into
+    the previous frame when available — so this function always receives a
+    representative silence window regardless of where in the frame the click is.
+
+    Returns 1.0 (neutral sentinel) if the pre-window is too short or noise_floor
+    is zero. 1.0 means "unknown silence before click" and is conservative.
+
+    A genuine click preceded by silence → pre_SNR ≈ 1.0.
+    An embedded event or sustained noise   → pre_SNR > 1.
+    """
+    if len(pre_env) < PRE_MIN_SAMPLES or noise_floor <= 0:
+        return 1.0
+    rms = float(np.sqrt(np.mean(pre_env ** 2)))
+    return rms / noise_floor
+
+
+def _feat_post_snr(
+    extended_envelope: np.ndarray,
+    decay_end:         int,
+    noise_floor:       float,
+) -> float:
+    """
+    post_SNR = RMS(post_window) / noise_floor  (§8.3)
+
+    The post-window spans [decay_end : decay_end + POST_WINDOW_SAMPLES] in the
+    extended envelope (current frame optionally concatenated with the next frame
+    by find_decay_window_v5). If fewer than POST_WINDOW_SAMPLES are available,
+    uses whatever remains.
+
+    A genuine click returns to silence → post_SNR ≈ 1.0.
+    A sustained event → post_SNR > 1. Complements pre_SNR.
+    """
+    post_window = extended_envelope[decay_end : decay_end + POST_WINDOW_SAMPLES]
+
+    if len(post_window) == 0 or noise_floor <= 0:
+        return 1.0   # neutral sentinel
+
+    rms = float(np.sqrt(np.mean(post_window ** 2)))
+    return rms / noise_floor
+
+
+def _feat_rise_fall_time(
+    envelope:    np.ndarray,
+    peak_idx:    int,
+    noise_floor: float,
+    std_noise:   float,
+    fs:          int,
+) -> dict:
+    """
+    rise_time_ms and fall_time_ms  (§8.4)
+
+    LEVEL = noise_floor + LEVEL_STD_FACTOR × std_noise.
+
+    rise_time_ms : time from last sub-LEVEL sample before peak to peak.
+    fall_time_ms : time from peak to first sub-LEVEL sample after peak.
+
+    Both are computed on the Hilbert envelope. They replace the single
+    asymmetry_ratio of v4 with two independent, physically meaningful quantities.
+    """
+    level = noise_floor + LEVEL_STD_FACTOR * std_noise
+    n     = len(envelope)
+
+    # Rise: scan backward from peak_idx for the last sample below LEVEL
+    rise_start = 0   # default: signal was above LEVEL since frame start
+    for i in range(peak_idx - 1, -1, -1):
+        if envelope[i] < level:
+            rise_start = i
+            break
+    rise_time_ms = (peak_idx - rise_start) / fs * 1000.0
+
+    # Fall: scan forward from peak_idx for the first sample below LEVEL
+    fall_end = n   # default: signal stays above LEVEL until frame end
+    for i in range(peak_idx + 1, n):
+        if envelope[i] < level:
+            fall_end = i
+            break
+    fall_time_ms = (fall_end - peak_idx) / fs * 1000.0
+
+    return {'rise_time_ms': rise_time_ms, 'fall_time_ms': fall_time_ms}
+
+
+def _feat_asymmetry_integral(
+    envelope: np.ndarray,
+    peak_idx: int,
+    decay_end: int,
+) -> float:
+    """
+    Asymmetry integral  (§8.5)
+
+    Measures whether the Hilbert envelope decays more slowly than it rises —
+    the expected signature of a cavitation click.
+
+        W = decay_end − peak_idx
+        right_side   = A[peak_idx : peak_idx + W]
+        left_side    = A[peak_idx − W : peak_idx]
+        left_flipped = left_side[::-1]  (both sides start at peak)
+
+        asymmetry_integral = Σ(right_side − left_flipped) / (W × peak_amp)
+
+    W is capped to the samples actually available before the peak, so the
+    integral is always computed over symmetric windows.
+
+    Returns
+    -------
+    float
+        Dimensionless. Positive → decay slower than rise (genuine click).
+                       ≈ 0     → symmetric (EMI spike, oscillator).
+                       Negative → rise slower than fall (rare).
+    """
+    peak_amp = float(envelope[peak_idx])
+    if peak_amp <= 0:
+        return 0.0
+
+    W = decay_end - peak_idx   # desired window half-width
+    if W <= 0:
+        return 0.0
+
+    # Limit W to the samples available before the peak (left side)
+    W = min(W, peak_idx)
+    if W == 0:
+        return 0.0
+
+    right_side   = envelope[peak_idx          : peak_idx + W]
+    left_side    = envelope[peak_idx - W      : peak_idx]
+    left_flipped = left_side[::-1]   # flip so index 0 = sample nearest peak
+
+    # Both sides should be the same length W; guard against rounding
+    min_len = min(len(right_side), len(left_flipped))
+    if min_len == 0:
+        return 0.0
+
+    diff = right_side[:min_len] - left_flipped[:min_len]
+    return float(np.sum(diff)) / (min_len * peak_amp)
+
+
+def _feat_zcr_triple(
+    signal:    np.ndarray,
+    pre_sig:   np.ndarray,
+    peak_idx:  int,
+    decay_end: int,
+    tau_ms:    float,
+    std_noise: float,
+    fs:        int,
+) -> dict:
+    """
+    Three zero-crossing rate features  (§8.6)
+
+    All ZCRs use the same hysteresis band [-std_noise, +std_noise] on the raw
+    iFFT signal x[n] (not the envelope). Only complete band-traversals count.
+
+    ZCR_pre   : in pre_sig (built by _build_pre_window, may span into previous frame)
+                → low for genuine click (silence before)
+    ZCR_click : in [peak_idx − W_click : peak_idx + W_click] of current-frame signal
+                → measures click oscillation frequency
+    ZCR_post  : in [peak_idx : decay_end] of current-frame signal
+                → oscillation during decay (decreasing for genuine click)
+
+    W_click = τ_ms × fs / 1000 × ZCR_CLICK_TAU_FACTOR  (or fallback if τ invalid).
+
+    All returned as [crossings/ms].
+    """
+    # ZCR_pre: use the pre-window signal built with previous-frame context
+    zcr_pre = _compute_zcr(pre_sig, std_noise)
+
+    # ZCR_click: ±W_click samples around the peak in the current frame
+    if tau_ms > 0:
+        W_click = max(1, int(tau_ms * fs / 1000.0 * ZCR_CLICK_TAU_FACTOR))
     else:
-        fit_window = decay_segment.copy()   # too short to convolve
+        W_click = max(1, int(ZCR_CLICK_FALLBACK_MS * fs / 1000.0))
+    click_start = max(0, peak_idx - W_click)
+    click_end   = min(len(signal), peak_idx + W_click)
+    zcr_click   = _compute_zcr(signal[click_start : click_end], std_noise)
 
-    n_fit = len(fit_window)
+    # ZCR_post: from peak to end of decay in the current frame
+    zcr_post = _compute_zcr(signal[peak_idx : decay_end], std_noise)
 
-    if n_fit < MIN_FIT_SAMPLES:
-        return {'tau_ms': -1.0, 'R2': 0.0,
-                'fit_coverage': n_fit / max(1, decay_len),
-                'decay_start': decay_start, 'decay_end': decay_end}
+    return {'ZCR_pre': zcr_pre, 'ZCR_click': zcr_click, 'ZCR_post': zcr_post}
 
-    # ── Step D: OLS log-linear fit ────────────────────────────────────────────
-    log_env = np.log(np.maximum(fit_window, FIT_LOG_EPSILON))
-    n_array = np.arange(n_fit, dtype=np.float64)
 
-    n_pts  = float(n_fit)
-    sum_x  = float(np.sum(n_array))
-    sum_y  = float(np.sum(log_env))
-    sum_xx = float(np.sum(n_array * n_array))
-    sum_xy = float(np.sum(n_array * log_env))
-    denom  = n_pts * sum_xx - sum_x * sum_x
+def _feat_kurtosis(
+    signal:      np.ndarray,
+    event_start: int,
+    decay_end:   int,
+) -> float:
+    """
+    Excess kurtosis of the raw iFFT signal over the event window  (§8.7)
 
-    if abs(denom) < 1e-30:
-        return {'tau_ms': -1.0, 'R2': 0.0,
-                'fit_coverage': n_fit / max(1, decay_len),
-                'decay_start': decay_start, 'decay_end': decay_end}
+        K_excess = mean((x − mean(x))⁴) / std(x)⁴ − 3
 
-    slope_m     = (n_pts * sum_xy - sum_x * sum_y) / denom
-    intercept_b = (sum_y - slope_m * sum_x) / n_pts
+    Window: [event_start : decay_end] — from first noise-level crossing before
+    peak to end of decay. Captures the full click without surrounding silence
+    (which would dilute the impulsivity measure).
 
-    # Negative slope + above numerical zero-guard → genuine exponential decay
-    if slope_m < -_SLOPE_ZERO_GUARD:
-        tau_ms = -1000.0 / (slope_m * fs)
-    else:
-        tau_ms = -1.0
+    Typical values:
+      Gaussian noise        ≈  0
+      Sustained vibration   :  2 – 7
+      Genuine click         : 15 – 50
+      EMI spike             : > 100
 
-    y_pred = slope_m * n_array + intercept_b
-    ss_res = float(np.sum((log_env - y_pred)        ** 2))
-    ss_tot = float(np.sum((log_env - sum_y / n_pts) ** 2))
-    R2     = float(1.0 - ss_res / ss_tot) if ss_tot > 1e-30 else 0.0
+    Returns 0.0 if the window has fewer than 4 samples or zero variance.
+    """
+    window = signal[event_start:decay_end]
 
-    return {
-        'tau_ms'      : tau_ms,
-        'R2'          : R2,
-        'fit_coverage': n_fit / max(1, decay_len),
-        'decay_start' : decay_start,
-        'decay_end'   : decay_end,
-    }
+    if len(window) < 4:
+        return 0.0
+
+    mu  = float(np.mean(window))
+    std = float(np.std(window))
+    if std < 1e-30:
+        return 0.0
+
+    K = float(np.mean(((window - mu) / std) ** 4))
+    return K - 3.0   # excess kurtosis
+
+
+def _feat_centroid_shift(
+    signal:    np.ndarray,
+    peak_idx:  int,
+    decay_end: int,
+    fs:        int,
+) -> float:
+    """
+    Spectral centroid shift during the click decay  (§8.8)
+
+    For a genuine click, higher frequencies attenuate faster due to
+    frequency-dependent damping → the spectral centroid shifts downward
+    during the decay (SC_early > SC_late → centroid_shift > 0).
+
+    The centroid is computed on short FFTs of two segments of the iFFT
+    signal (not directly from the single-frame FFT magnitudes), so it
+    captures spectral evolution within the frame:
+
+        SC_early : spectral centroid of signal[peak_idx : peak_idx + third]
+        SC_late  : spectral centroid of signal[peak_idx + 2×third : decay_end]
+        centroid_shift = SC_early − SC_late   [Hz]
+
+    A Hann window is applied to each segment before FFT to reduce leakage
+    (segments can be as short as 10–30 samples).
+
+    Returns 0.0 if the decay segment is too short for meaningful computation.
+    """
+    decay_len = decay_end - peak_idx
+    third     = max(1, decay_len // 3)
+
+    early_seg = signal[peak_idx            : peak_idx + third]
+    late_seg  = signal[peak_idx + 2*third  : decay_end]
+
+    if len(early_seg) < MIN_CENTROID_SAMPLES or len(late_seg) < MIN_CENTROID_SAMPLES:
+        return 0.0
+
+    sc_early = _segment_spectral_centroid(early_seg, fs)
+    sc_late  = _segment_spectral_centroid(late_seg,  fs)
+
+    return sc_early - sc_late   # [Hz]; positive → high freqs decayed first ✓
+
+
+def _feat_fft_features(
+    fft_norm:  np.ndarray,
+    freq_axis: np.ndarray,
+) -> dict:
+    """
+    Three FFT-domain features derived from the mic-normalized spectrum  (§8.9)
+
+    All computed over the analysis band only (bins _BIN_START .. _BIN_END,
+    covering 20–80 kHz, 154 bins).
+
+    SPR        : Spectral Peak Ratio = max(power) / mean(power).
+                 Low SPR → broadband (good for genuine click).
+                 High SPR → tonal/narrowband (EMI, oscillator artefact).
+
+    R_spectral : Energy ratio E_low[20-40 kHz] / E_high[40-80 kHz].
+                 Describes the spectral balance of the event.
+
+    FPE        : Frequency of Peak Energy [Hz] = freq at max power bin.
+                 Location of the dominant spectral component.
+    """
+    # Analysis-band magnitudes and power
+    band_mag   = fft_norm[_BIN_START : _BIN_END + 1]
+    band_freq  = freq_axis[_BIN_START : _BIN_END + 1]
+    band_power = band_mag ** 2
+
+    mean_power = float(np.mean(band_power))
+    max_power  = float(np.max(band_power))
+
+    # SPR
+    spr = max_power / mean_power if mean_power > 1e-30 else 0.0
+
+    # R_spectral: split analysis band at 40 kHz
+    # _BIN_MID is the absolute index; relative index within the band slice:
+    mid_rel   = _BIN_MID - _BIN_START
+    low_power = band_power[:mid_rel]
+    high_power= band_power[mid_rel:]
+    e_low     = float(np.mean(low_power))  if len(low_power)  > 0 else 0.0
+    e_high    = float(np.mean(high_power)) if len(high_power) > 0 else 0.0
+    r_spectral = e_low / e_high if e_high > 1e-30 else 0.0
+
+    # FPE: frequency of maximum power bin
+    peak_bin = int(np.argmax(band_power))
+    fpe_hz   = float(band_freq[peak_bin])
+
+    return {'SPR': spr, 'R_spectral': r_spectral, 'FPE_hz': fpe_hz}
+
+
+# =============================================================================
+# MASTER FEATURE FUNCTION
+# =============================================================================
+
+def compute_features_v5(
+    signal:              np.ndarray,
+    envelope:            np.ndarray,
+    fft_norm:            np.ndarray,
+    freq_axis:           np.ndarray,
+    noise_floor:         float,
+    std_noise:           float,
+    peak_idx:            int,
+    fs:                  int = FS,
+    next_frame_envelope: Optional[np.ndarray] = None,
+    prev_frame_envelope: Optional[np.ndarray] = None,
+    prev_frame_signal:   Optional[np.ndarray] = None,
+) -> dict:
+    """
+    Compute all 17 v5 features for a single click candidate.
+
+    This is the single entry point for feature extraction. It:
+      1. Finds the decay window [decay_start, decay_end] via find_decay_window_v5.
+      2. Runs the OLS fit via _fit_decay_segment → τ_ms, R², fit_coverage.
+      3. Builds the pre-window (with previous-frame context) via _build_pre_window.
+      4. Calls each sub-function to compute the remaining 14 features.
+      5. Returns a flat dict with all 17 keys.
+
+    All shared intermediate results (decay window, pre-window) are computed once
+    and reused — no redundant work.
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        Gibbs-suppressed iFFT time-domain signal for this frame [512 samples].
+    envelope : np.ndarray
+        Hilbert amplitude envelope of `signal` [512 samples, all ≥ 0].
+    fft_norm : np.ndarray
+        Mic-normalized FFT magnitudes for the full half-spectrum [256 bins].
+    freq_axis : np.ndarray
+        Frequency axis for `fft_norm` [Hz, 256 values].
+    noise_floor : float
+        Adaptive noise floor estimate [V] from AdaptiveNoiseEstimatorV5.
+    std_noise : float
+        Adaptive noise std estimate [V] from AdaptiveNoiseEstimatorV5.
+    peak_idx : int
+        Index of the amplitude peak in `envelope`.
+    fs : int
+        Sampling rate [Hz].
+    next_frame_envelope : np.ndarray or None
+        Hilbert envelope of the next frame — used to extend the decay_end search
+        (find_decay_window_v5) and the post-SNR window.
+    prev_frame_envelope : np.ndarray or None
+        Hilbert envelope of the previous frame — used by _build_pre_window to
+        give pre_SNR and ZCR_pre a full frame of pre-click context regardless
+        of where in the current frame the peak lands.
+    prev_frame_signal : np.ndarray or None
+        Raw iFFT signal of the previous frame — used by _build_pre_window for
+        ZCR_pre. If None but prev_frame_envelope is given, the signal portion
+        of the previous frame is conservatively treated as zeros.
+
+    Returns
+    -------
+    dict with exactly 17 keys (all floats):
+        peak_SNR, pre_SNR, post_SNR,
+        rise_time_ms, fall_time_ms,
+        asymmetry_integral,
+        ZCR_pre, ZCR_click, ZCR_post,
+        kurtosis,
+        centroid_shift_hz,
+        tau_ms, R2, fit_coverage,
+        SPR, R_spectral, FPE_hz
+    """
+    peak_amp = float(envelope[peak_idx])
+
+    # ── Step 1: decay window (shared by many features) ────────────────────────
+    window      = find_decay_window_v5(envelope, peak_idx, noise_floor, std_noise,
+                                       next_frame_envelope)
+    decay_start = window['decay_start']
+    decay_end   = window['decay_end']
+    extended    = window['extended_envelope']
+
+    # ── Step 2: τ, R², fit_coverage ───────────────────────────────────────────
+    fit = _fit_decay_segment(extended, decay_start, decay_end, fs)
+
+    # ── Step 3: pre-window (shared by pre_SNR, ZCR_pre, kurtosis) ────────────
+    # _build_pre_window extends into the previous frame so a click near the
+    # start of a frame still gets a full pre-window for reliable estimation.
+    pre = _build_pre_window(envelope, signal, peak_idx, noise_floor, std_noise,
+                            prev_frame_envelope, prev_frame_signal)
+
+    # ── Step 4: compute all 17 features ───────────────────────────────────────
+    features = {}
+
+    # Amplitude / SNR (§8.1–8.3)
+    features['peak_SNR'] = _feat_peak_snr(peak_amp, noise_floor)
+    features['pre_SNR']  = _feat_pre_snr(pre['pre_env'], noise_floor)
+    features['post_SNR'] = _feat_post_snr(extended, decay_end, noise_floor)
+
+    # Temporal shape (§8.4–8.5)
+    features.update(_feat_rise_fall_time(envelope, peak_idx, noise_floor, std_noise, fs))
+    features['asymmetry_integral'] = _feat_asymmetry_integral(envelope, peak_idx, decay_end)
+
+    # Zero-crossing rates (§8.6) — ZCR_pre uses previous-frame-aware pre_sig
+    features.update(_feat_zcr_triple(signal, pre['pre_sig'], peak_idx, decay_end,
+                                     fit['tau_ms'], std_noise, fs))
+
+    # Impulsivity (§8.7) — kurtosis event window starts at boundary_in_frame
+    features['kurtosis'] = _feat_kurtosis(signal, pre['boundary_in_frame'], decay_end)
+
+    # Spectral evolution (§8.8)
+    features['centroid_shift_hz'] = _feat_centroid_shift(signal, peak_idx, decay_end, fs)
+
+    # Fit results as features (§10)
+    features['tau_ms']       = fit['tau_ms']
+    features['R2']           = fit['R2']
+    features['fit_coverage'] = fit['fit_coverage']
+
+    # FFT-domain features (§8.9)
+    features.update(_feat_fft_features(fft_norm, freq_axis))
+
+    return features
