@@ -115,8 +115,325 @@ GIBBS_FACTOR        = 2.5  # Both borders must exceed GIBBS_FACTOR × interior R
 # the amplitude error within ±2.9 dB across the analysis band.
 _MIC_FREQ_HZ       = np.array([20, 25, 30, 40, 50, 60, 70, 80], dtype=np.float64) * 1000.0
 _MIC_RESP_DB       = np.array([ 8.0, 10.5,  6.0, -2.0, -6.0, -7.0, -6.0, -4.0], dtype=np.float64)
-_MIC_NORM_FRACTION = 0.5   # 50 % conservative normalization factor
+_MIC_NORM_FRACTION = 0.5   # 50 % conservative normalization factor in order to avoid amplifing
+#                                              noise too much. See documentation for more details
+
+# FIT PIPELINE (§10)
+DECAY_SLOPE_WINDOW        = 4     # Local slope window length W [samples] (§10.2 Step A).
+                                   # slope_local[n] = (A[n+W-1] - A[n]) / (W-1).
+DECAY_SLOPE_THRESHOLD_FRAC = 0.01 # Slope threshold = fraction × peak_amp.
+                                   # A window is "descending" if slope < -threshold.
+DECAY_SLOPE_CONSECUTIVE   = 3     # Number of consecutive descending windows required
+                                   # to confirm that the true decay has started.
+DECAY_START_CAP           = 20    # Hard cap: decay_start ≤ peak_idx + CAP [samples].
+                                   # = 100 µs @ 200 kHz. Enforces τ_min and avoids
+                                   # searching far into the tail.
+DECAY_START_FALLBACK      = 5     # Fallback offset from peak_idx [samples] when the
+                                   # slope criterion is not met within the cap.
+DECAY_END_CONSECUTIVE     = 4     # Y: consecutive sub-threshold samples required to
+                                   # confirm the end of the decay (§10.2 Step B).
+DECAY_END_NOISE_ALPHA     = 1.5   # decay_end threshold: noise_floor + ALPHA × std_noise.
+                                   # 1.5 std above the floor provides a ~93 % confidence
+                                   # level that the signal has returned to background.
+GAUSS_SIGMA               = 2     # Gaussian smoothing kernel σ [samples] = 10 µs.
+                                   # Applied to the decay segment before the OLS fit
+                                   # to suppress high-frequency ripple without distorting
+                                   # the decay shape (σ << τ_min). (§10.2 Step C)
+MIN_FIT_SAMPLES           = 10    # Minimum fit-window length for a valid OLS fit.
+                                   # Shorter windows → unreliable slope estimate.
+FIT_LOG_EPSILON           = 1e-9  # Floor value used in log(max(x, ε)) to prevent
+                                   # log(0) when the envelope touches zero.
+
+# Derived: pre-computed Gaussian kernel (computed once at import time).
+# Truncated at 3σ (covers 99.7 % of the Gaussian mass).
+_GAUSS_RADIUS = int(np.ceil(3 * GAUSS_SIGMA))                          # = 6 samples
+_k            = np.arange(-_GAUSS_RADIUS, _GAUSS_RADIUS + 1, dtype=np.float64)
+_GAUSS_KERNEL = np.exp(-_k**2 / (2.0 * GAUSS_SIGMA**2))
+_GAUSS_KERNEL = _GAUSS_KERNEL / _GAUSS_KERNEL.sum()                    # unit-sum normalisation
+
+# Numerical guard used in run_fit_pipeline_v5: slopes whose absolute value is
+# smaller than this are indistinguishable from zero in double precision and are
+# treated as "no decay" (→ τ = −1). This is NOT a physical threshold on τ.
+_SLOPE_ZERO_GUARD = 1e-10
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+# =============================================================================
+# SIGNAL UTILITIES
+# (migrated from replay_window_audio.py — v4 detection logic removed,
+#  these pure-signal functions remain valid and unchanged)
+# =============================================================================
+
+def suppress_edge_artifacts(signal: np.ndarray) -> np.ndarray:
+    """
+    Suppress Gibbs ringing at the frame borders of the reconstructed iFFT signal.
+
+    Algorithm — symmetric AND condition (§7, Step 3):
+        Gibbs ringing is SYMMETRIC: spectral truncation at bin_start and bin_end
+        produces ringing on BOTH frame borders simultaneously and with comparable
+        intensity. This gives us a reliable detection condition:
+
+          1. Compute RMS energy of the first GIBBS_CHECK_SAMPLES samples (left border).
+          2. Compute RMS energy of the last  GIBBS_CHECK_SAMPLES samples (right border).
+          3. Compute RMS energy of the interior (samples [40 .. N-40]).
+          4. If BOTH borders exceed GIBBS_FACTOR × interior RMS → genuine Gibbs.
+             Apply a half-Hann fade on each border to suppress it.
+          5. Otherwise → do not touch the signal.
+
+        Using AND instead of OR protects real clicks near frame edges:
+          - A click near the left border → left high, right low → AND fails → preserved ✓
+          - Pure Gibbs → both borders high → AND fires → suppressed ✓
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        Time-domain signal output from iFFT, typically FFT_SIZE (512) samples.
+
+    Returns
+    -------
+    np.ndarray
+        Signal with Gibbs-suppressed borders (copy), or unchanged copy if
+        the AND condition was not met.
+    """
+    n      = len(signal) #(with fs=200kHz and fft_size=512, windows lasts 2.56 ms for a total of 512 samples)
+    result = signal.copy()
+
+    if n < 100: 
+        return result  # Too short to apply meaningful suppression
+
+    interior = result[40 : n - 40] # 40 is a safe margin to exclude the borders and capture the true signal energy in the middle of the frame
+    if len(interior) < 10:
+        return result
+
+    energy_interior = float(np.sqrt(np.mean(interior ** 2)))
+    if energy_interior < 1e-15: #veeery small value to avoid division by zero and false positives on silent frames. Even when working with uV-level signals, the interior energy should be above this threshold
+        return result  # Near-zero signal — nothing to suppress
+
+    energy_left  = float(np.sqrt(np.mean(result[:GIBBS_CHECK_SAMPLES] ** 2)))
+    energy_right = float(np.sqrt(np.mean(result[n - GIBBS_CHECK_SAMPLES:] ** 2)))
+
+    left_suspicious  = energy_left  > GIBBS_FACTOR * energy_interior
+    right_suspicious = energy_right > GIBBS_FACTOR * energy_interior
+
+    # Apply fade only when BOTH borders are anomalous (symmetric Gibbs condition)
+    if left_suspicious and right_suspicious: #Hann window (half-cosine) fade for smooth suppression of Gibbs ringing
+        fade = 0.5 * (1.0 - np.cos(
+            np.pi * np.arange(GIBBS_CHECK_SAMPLES) / GIBBS_CHECK_SAMPLES
+        ))
+        result[:GIBBS_CHECK_SAMPLES]       *= fade        # fade-in on left border
+        result[n - GIBBS_CHECK_SAMPLES:]   *= fade[::-1]  # fade-out on right border
+
+    return result
+
+
+def compute_hilbert_envelope(signal: np.ndarray) -> np.ndarray:
+    """
+    Compute the instantaneous amplitude envelope via the Hilbert transform.
+
+    Uses only numpy (no scipy) for thread-safety on macOS: scipy.signal.hilbert
+    calls BLAS/LAPACK through openblas, which can segfault when invoked from a
+    QThread on the Cocoa main run-loop. This implementation uses only np.fft,
+    which is safe in any thread.
+
+    Algorithm:
+        1. Compute the full N-point FFT of the signal.
+        2. Zero out all negative-frequency components and double all positive
+           ones (DC and Nyquist stay at weight 1). This constructs the
+           one-sided spectrum of the complex analytic signal.
+        3. IFFT → complex analytic signal Z[n] = x[n] + j·H{x}[n].
+        4. Return |Z[n]| — the instantaneous amplitude envelope.
+
+    Note on the v4 bug: the previous implementation used rfft + irfft, which
+    reconstructed a real signal from the weighted half-spectrum instead of the
+    complex analytic signal. This caused a systematic amplitude bias and
+    non-constant envelope for pure sinusoids. The correct approach requires
+    the full fft + ifft path.
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        Real-valued time-domain signal (e.g. iFFT output, 512 samples).
+
+    Returns
+    -------
+    np.ndarray
+        Instantaneous amplitude A[n] = |Z[n]|, same length as input, all ≥ 0.
+    """
+
+    N  = len(signal)
+    Xf = np.fft.fft(signal)
+
+    # One-sided weighting vector for the ANALYTIC signal spectrum:
+    #   • DC (k=0) and Nyquist (k=N//2, even N only) → weight 1 (unchanged)
+    #   • Positive frequencies (k=1..N//2-1) → weight 2 (doubled)
+    #   • Negative frequencies (k=N//2+1..N-1) → weight 0 (zeroed)
+    h = np.zeros(N, dtype=np.float64)
+    h[0]         = 1.0            # DC
+    h[1 : N//2]  = 2.0            # positive frequencies
+    if N % 2 == 0:
+        h[N // 2] = 1.0           # Nyquist (only present for even N)
+
+    # IFFT of the one-sided spectrum → complex analytic signal
+    analytic = np.fft.ifft(Xf * h)
+    return np.abs(analytic)   # instantaneous amplitude = |analytic signal|
+
+
+def find_peak(envelope: np.ndarray) -> tuple:
+    """
+    Find the index and amplitude of the maximum of the Hilbert envelope.
+
+    Parameters
+    ----------
+    envelope : np.ndarray
+        Hilbert amplitude envelope A[n] (all values ≥ 0).
+
+    Returns
+    -------
+    (peak_idx, peak_amp) : (int, float)
+        Index of the maximum and its value.
+    """
+    peak_idx = int(np.argmax(envelope))
+    peak_amp = float(envelope[peak_idx])
+    return peak_idx, peak_amp
+
+
+# =============================================================================
+# iFFT RECONSTRUCTION
+# =============================================================================
+
+def _normalize_fft(fft_mags: np.ndarray, freq_axis_hz: np.ndarray) -> np.ndarray:
+    """
+    Apply 50 % conservative microphone normalization to FFT magnitudes.
+
+    Uses the Knowles SPU0410LR5H-QB datasheet frequency-response curve
+    (stored in _MIC_FREQ_HZ / _MIC_RESP_DB) with piecewise-linear interpolation.
+    Applying only _MIC_NORM_FRACTION (50 %) of the correction keeps the amplitude
+    error within ±2.9 dB across the 20–80 kHz analysis band.
+
+    Parameters
+    ----------
+    fft_mags : np.ndarray
+        Raw FFT magnitude values covering the full half-spectrum (fft_size//2 bins).
+    freq_axis_hz : np.ndarray
+        Frequency in Hz for each bin of fft_mags (same length).
+
+    Returns
+    -------
+    np.ndarray
+        Normalized magnitudes (copy), same shape as fft_mags.
+    """
+    analysis_mask = (freq_axis_hz >= BIN_START_HZ) & (freq_axis_hz <= BIN_END_HZ)
+
+    # Interpolate datasheet dB response at every analysis-band frequency
+    mic_db   = np.interp(freq_axis_hz[analysis_mask], _MIC_FREQ_HZ, _MIC_RESP_DB)
+
+    # Convert fractional dB correction to a linear gain factor
+    gain     = 10.0 ** (-mic_db * _MIC_NORM_FRACTION / 20.0)
+
+    normalized = fft_mags.copy()
+    normalized[analysis_mask] *= gain
+    return normalized
+
+
+def reconstruct_frame_v5(
+    fft_mags:   np.ndarray,
+    phase_int8: np.ndarray,
+    fs:         int = FS,
+    fft_size:   int = FFT_SIZE,
+) -> Optional[dict]:
+    """
+    Reconstruct the time-domain signal from a single FFT frame. (inverseFFT)
+
+    Implements the pre-processing pipeline (§7, Steps 1–3):
+
+      Step 1 — Build complex spectrum:
+        • Zero-pad the analysis-band magnitudes into a full half-spectrum array
+          (fft_size // 2 bins).
+        • Apply 50 % conservative microphone normalization.
+        • Decode int8 phase values to radians and combine with magnitudes
+          to form a complex spectrum.
+        • Apply a Tukey (cosine-bell) taper to the analysis-band edges of the
+          complex spectrum to reduce spectral leakage.
+
+      Step 2 — iFFT:
+        • np.fft.irfft → fft_size real samples.
+
+      Step 3 — Gibbs suppression:
+        • suppress_edge_artifacts() with symmetric AND condition.
+
+    Parameters
+    ----------
+    fft_mags : np.ndarray
+        Raw FFT magnitudes for the analysis band only (up to _K_BINS = 154 values).
+    phase_int8 : np.ndarray
+        Phase values for the same bins, encoded as int8 [-127, +127] → [-π, +π].
+    fs : int
+        Sampling rate [Hz].
+    fft_size : int
+        FFT window size [samples].
+
+    Returns
+    -------
+    dict with keys:
+        'signal'      : np.ndarray – Gibbs-suppressed time-domain signal (fft_size samples)
+        'fft_norm'    : np.ndarray – mic-normalized magnitudes (full half-spectrum)
+        'freq_axis'   : np.ndarray – frequency axis for the full half-spectrum [Hz]
+    Returns None if the frame data is invalid (empty phase array or iFFT failure).
+    """
+    if len(phase_int8) == 0:
+        return None
+
+    num_bins  = fft_size // 2           # Half-spectrum length (256 bins)
+    bin_freq  = fs / fft_size           # Hz per bin
+    bin_start = int(BIN_START_HZ / bin_freq)
+    bin_end   = int(BIN_END_HZ   / bin_freq)
+
+    # Frequency axis for the full half-spectrum (used for normalization)
+    freq_axis = np.arange(num_bins, dtype=np.float64) * bin_freq
+
+    # ── Step 1a: zero-pad into full half-spectrum ─────────────────────────────
+    full_mag   = np.zeros(num_bins, dtype=np.float64)
+    full_phase = np.zeros(num_bins, dtype=np.int8)
+
+    # Number of analysis-band bins available in this frame (may be < _K_BINS if
+    # the firmware sent a truncated packet)
+    n_bins = min(len(fft_mags), len(phase_int8), bin_end - bin_start + 1)
+    full_mag  [bin_start : bin_start + n_bins] = fft_mags  [:n_bins]
+    full_phase[bin_start : bin_start + n_bins] = phase_int8[:n_bins]
+
+    # ── Step 1b: mic normalization ────────────────────────────────────────────
+    fft_norm = _normalize_fft(full_mag, freq_axis)
+
+    # ── Step 1c: build complex spectrum ──────────────────────────────────────
+    # int8 phase [-127, +127] maps linearly to [-π, +π]
+    phases_rad       = (full_phase.astype(np.float64) / 127.0) * np.pi
+    complex_spectrum = fft_norm * np.exp(1j * phases_rad)
+
+    # ── Step 1d: Tukey taper on the analysis-band edges ──────────────────────
+    # Smoothly ramp the complex spectrum to zero at the lower and upper edges of
+    # the analysis band to reduce spectral leakage artifacts in the iFFT.
+    taper_len = max(5, round(n_bins * TUKEY_TAPER_FRACTION))
+    for i in range(taper_len):
+        alpha = i / taper_len
+        taper_val = 0.5 * (1.0 - np.cos(np.pi * alpha))
+        complex_spectrum[bin_start + i]              *= taper_val  # left edge
+        complex_spectrum[bin_start + n_bins - 1 - i] *= taper_val  # right edge
+
+    # ── Step 2: iFFT ─────────────────────────────────────────────────────────
+    try:
+        signal_raw = np.fft.irfft(complex_spectrum, n=fft_size)
+    except Exception:
+        print("iFFT reconstruction failed for frame with magnitudes:", fft_mags)
+        return None
+
+    # ── Step 3: Gibbs suppression ─────────────────────────────────────────────
+    signal = suppress_edge_artifacts(signal_raw)
+
+    return {
+        'signal'    : signal,
+        'fft_norm'  : fft_norm,
+        'freq_axis' : freq_axis,
+    }
 
 
 # =============================================================================
@@ -206,6 +523,10 @@ class AdaptiveNoiseEstimatorV5:
             'is_burst'    : bool   – True if this frame was excluded from buffers
             'in_warmup'   : bool   – True if still in the warm-up period
             'buffer_fill' : int    – number of valid entries currently in buffers
+
+        The class includes TWO Noise estimators: one for stage 1 and one for stage 3.
+        Though stage 3 is accessed only when events pass stage 1, both estimators are
+        updated every frame becuase they both need SILENT frames and are not that heavy.
         """
         self._frame_count += 1
         in_warmup = (self._frame_count <= WARM_UP_FRAMES)
@@ -332,280 +653,7 @@ def compute_fft_energy(fft_magnitudes: np.ndarray) -> float:
     return float(np.mean(fft_magnitudes[:k] ** 2))
 
 
-# =============================================================================
-# SIGNAL UTILITIES
-# (migrated from replay_window_audio.py — v4 detection logic removed,
-#  these pure-signal functions remain valid and unchanged)
-# =============================================================================
-
-def suppress_edge_artifacts(signal: np.ndarray) -> np.ndarray:
-    """
-    Suppress Gibbs ringing at the frame borders of the reconstructed iFFT signal.
-
-    Algorithm — symmetric AND condition (§7, Step 3):
-        Gibbs ringing is SYMMETRIC: spectral truncation at bin_start and bin_end
-        produces ringing on BOTH frame borders simultaneously and with comparable
-        intensity. This gives us a reliable detection condition:
-
-          1. Compute RMS energy of the first GIBBS_CHECK_SAMPLES samples (left border).
-          2. Compute RMS energy of the last  GIBBS_CHECK_SAMPLES samples (right border).
-          3. Compute RMS energy of the interior (samples [40 .. N-40]).
-          4. If BOTH borders exceed GIBBS_FACTOR × interior RMS → genuine Gibbs.
-             Apply a half-Hann fade on each border to suppress it.
-          5. Otherwise → do not touch the signal.
-
-        Using AND instead of OR protects real clicks near frame edges:
-          - A click near the left border → left high, right low → AND fails → preserved ✓
-          - Pure Gibbs → both borders high → AND fires → suppressed ✓
-
-    Parameters
-    ----------
-    signal : np.ndarray
-        Time-domain signal output from iFFT, typically FFT_SIZE (512) samples.
-
-    Returns
-    -------
-    np.ndarray
-        Signal with Gibbs-suppressed borders (copy), or unchanged copy if
-        the AND condition was not met.
-    """
-    n      = len(signal) #(with fs=200kHz and fft_size=512, windows lasts 2.56 ms for a total of 512 samples)
-    result = signal.copy()
-
-    if n < 100: 
-        return result  # Too short to apply meaningful suppression
-
-    interior = result[40 : n - 40]
-    if len(interior) < 10:
-        return result
-
-    energy_interior = float(np.sqrt(np.mean(interior ** 2)))
-    if energy_interior < 1e-15: #veeery small value to avoid division by zero and false positives on silent frames
-        return result  # Near-zero signal — nothing to suppress
-
-    energy_left  = float(np.sqrt(np.mean(result[:GIBBS_CHECK_SAMPLES] ** 2)))
-    energy_right = float(np.sqrt(np.mean(result[n - GIBBS_CHECK_SAMPLES:] ** 2)))
-
-    left_suspicious  = energy_left  > GIBBS_FACTOR * energy_interior
-    right_suspicious = energy_right > GIBBS_FACTOR * energy_interior
-
-    # Apply fade only when BOTH borders are anomalous (symmetric Gibbs condition)
-    if left_suspicious and right_suspicious: #Hann window (half-cosine) fade for smooth suppression of Gibbs ringing
-        fade = 0.5 * (1.0 - np.cos(
-            np.pi * np.arange(GIBBS_CHECK_SAMPLES) / GIBBS_CHECK_SAMPLES
-        ))
-        result[:GIBBS_CHECK_SAMPLES]       *= fade        # fade-in on left border
-        result[n - GIBBS_CHECK_SAMPLES:]   *= fade[::-1]  # fade-out on right border
-
-    return result
-
-
-def compute_hilbert_envelope(signal: np.ndarray) -> np.ndarray:
-    """
-    Compute the instantaneous amplitude envelope via the Hilbert transform.
-
-    Uses only numpy (no scipy) for thread-safety on macOS: scipy.signal.hilbert
-    calls BLAS/LAPACK through openblas, which can segfault when invoked from a
-    QThread on the Cocoa main run-loop. This implementation uses only np.fft,
-    which is safe in any thread.
-
-    Algorithm:
-        1. Compute the full N-point FFT of the signal.
-        2. Zero out all negative-frequency components and double all positive
-           ones (DC and Nyquist stay at weight 1). This constructs the
-           one-sided spectrum of the complex analytic signal.
-        3. IFFT → complex analytic signal Z[n] = x[n] + j·H{x}[n].
-        4. Return |Z[n]| — the instantaneous amplitude envelope.
-
-    Note on the v4 bug: the previous implementation used rfft + irfft, which
-    reconstructed a real signal from the weighted half-spectrum instead of the
-    complex analytic signal. This caused a systematic amplitude bias and
-    non-constant envelope for pure sinusoids. The correct approach requires
-    the full fft + ifft path.
-
-    Parameters
-    ----------
-    signal : np.ndarray
-        Real-valued time-domain signal (e.g. iFFT output, 512 samples).
-
-    Returns
-    -------
-    np.ndarray
-        Instantaneous amplitude A[n] = |Z[n]|, same length as input, all ≥ 0.
-    """
-    N  = len(signal)
-    Xf = np.fft.fft(signal)
-
-    # One-sided weighting vector for the analytic signal spectrum:
-    #   • DC (k=0) and Nyquist (k=N//2, even N only) → weight 1 (unchanged)
-    #   • Positive frequencies (k=1..N//2-1) → weight 2 (doubled)
-    #   • Negative frequencies (k=N//2+1..N-1) → weight 0 (zeroed)
-    h = np.zeros(N, dtype=np.float64)
-    h[0]         = 1.0            # DC
-    h[1 : N//2]  = 2.0            # positive frequencies
-    if N % 2 == 0:
-        h[N // 2] = 1.0           # Nyquist (only present for even N)
-
-    # IFFT of the one-sided spectrum → complex analytic signal
-    analytic = np.fft.ifft(Xf * h)
-    return np.abs(analytic)   # instantaneous amplitude = |analytic signal|
-
-
-def find_peak(envelope: np.ndarray) -> tuple:
-    """
-    Find the index and amplitude of the maximum of the Hilbert envelope.
-
-    Parameters
-    ----------
-    envelope : np.ndarray
-        Hilbert amplitude envelope A[n] (all values ≥ 0).
-
-    Returns
-    -------
-    (peak_idx, peak_amp) : (int, float)
-        Index of the maximum and its value.
-    """
-    peak_idx = int(np.argmax(envelope))
-    peak_amp = float(envelope[peak_idx])
-    return peak_idx, peak_amp
-
-
-# =============================================================================
-# iFFT RECONSTRUCTION
-# =============================================================================
-
-def _normalize_fft(fft_mags: np.ndarray, freq_axis_hz: np.ndarray) -> np.ndarray:
-    """
-    Apply 50 % conservative microphone normalization to FFT magnitudes.
-
-    Uses the Knowles SPU0410LR5H-QB datasheet frequency-response curve
-    (stored in _MIC_FREQ_HZ / _MIC_RESP_DB) with piecewise-linear interpolation.
-    Applying only _MIC_NORM_FRACTION (50 %) of the correction keeps the amplitude
-    error within ±2.9 dB across the 20–80 kHz analysis band.
-
-    Parameters
-    ----------
-    fft_mags : np.ndarray
-        Raw FFT magnitude values covering the full half-spectrum (fft_size//2 bins).
-    freq_axis_hz : np.ndarray
-        Frequency in Hz for each bin of fft_mags (same length).
-
-    Returns
-    -------
-    np.ndarray
-        Normalized magnitudes (copy), same shape as fft_mags.
-    """
-    analysis_mask = (freq_axis_hz >= BIN_START_HZ) & (freq_axis_hz <= BIN_END_HZ)
-
-    # Interpolate datasheet dB response at every analysis-band frequency
-    mic_db   = np.interp(freq_axis_hz[analysis_mask], _MIC_FREQ_HZ, _MIC_RESP_DB)
-
-    # Convert fractional dB correction to a linear gain factor
-    gain     = 10.0 ** (-mic_db * _MIC_NORM_FRACTION / 20.0)
-
-    normalized = fft_mags.copy()
-    normalized[analysis_mask] *= gain
-    return normalized
-
-
-def reconstruct_frame_v5(
-    fft_mags:   np.ndarray,
-    phase_int8: np.ndarray,
-    fs:         int = FS,
-    fft_size:   int = FFT_SIZE,
-) -> Optional[dict]:
-    """
-    Reconstruct the time-domain signal from a single FFT frame.
-
-    Implements the pre-processing pipeline (§7, Steps 1–3):
-
-      Step 1 — Build complex spectrum:
-        • Zero-pad the analysis-band magnitudes into a full half-spectrum array
-          (fft_size // 2 bins).
-        • Apply 50 % conservative microphone normalization.
-        • Decode int8 phase values to radians and combine with magnitudes
-          to form a complex spectrum.
-        • Apply a Tukey (cosine-bell) taper to the analysis-band edges of the
-          complex spectrum to reduce spectral leakage.
-
-      Step 2 — iFFT:
-        • np.fft.irfft → fft_size real samples.
-
-      Step 3 — Gibbs suppression:
-        • suppress_edge_artifacts() with symmetric AND condition.
-
-    Parameters
-    ----------
-    fft_mags : np.ndarray
-        Raw FFT magnitudes for the analysis band only (up to _K_BINS = 154 values).
-    phase_int8 : np.ndarray
-        Phase values for the same bins, encoded as int8 [-127, +127] → [-π, +π].
-    fs : int
-        Sampling rate [Hz].
-    fft_size : int
-        FFT window size [samples].
-
-    Returns
-    -------
-    dict with keys:
-        'signal'      : np.ndarray – Gibbs-suppressed time-domain signal (fft_size samples)
-        'fft_norm'    : np.ndarray – mic-normalized magnitudes (full half-spectrum)
-        'freq_axis'   : np.ndarray – frequency axis for the full half-spectrum [Hz]
-    Returns None if the frame data is invalid (empty phase array or iFFT failure).
-    """
-    if len(phase_int8) == 0:
-        return None
-
-    num_bins  = fft_size // 2           # Half-spectrum length (256 bins)
-    bin_freq  = fs / fft_size           # Hz per bin
-    bin_start = int(BIN_START_HZ / bin_freq)
-    bin_end   = int(BIN_END_HZ   / bin_freq)
-
-    # Frequency axis for the full half-spectrum (used for normalization)
-    freq_axis = np.arange(num_bins, dtype=np.float64) * bin_freq
-
-    # ── Step 1a: zero-pad into full half-spectrum ─────────────────────────────
-    full_mag   = np.zeros(num_bins, dtype=np.float64)
-    full_phase = np.zeros(num_bins, dtype=np.int8)
-
-    # Number of analysis-band bins available in this frame (may be < _K_BINS if
-    # the firmware sent a truncated packet)
-    n_bins = min(len(fft_mags), len(phase_int8), bin_end - bin_start + 1)
-    full_mag  [bin_start : bin_start + n_bins] = fft_mags  [:n_bins]
-    full_phase[bin_start : bin_start + n_bins] = phase_int8[:n_bins]
-
-    # ── Step 1b: mic normalization ────────────────────────────────────────────
-    fft_norm = _normalize_fft(full_mag, freq_axis)
-
-    # ── Step 1c: build complex spectrum ──────────────────────────────────────
-    # int8 phase [-127, +127] maps linearly to [-π, +π]
-    phases_rad       = (full_phase.astype(np.float64) / 127.0) * np.pi
-    complex_spectrum = fft_norm * np.exp(1j * phases_rad)
-
-    # ── Step 1d: Tukey taper on the analysis-band edges ──────────────────────
-    # Smoothly ramp the complex spectrum to zero at the lower and upper edges of
-    # the analysis band to reduce spectral leakage artifacts in the iFFT.
-    taper_len = max(5, round(n_bins * TUKEY_TAPER_FRACTION))
-    for i in range(taper_len):
-        alpha = i / taper_len
-        taper_val = 0.5 * (1.0 - np.cos(np.pi * alpha))
-        complex_spectrum[bin_start + i]              *= taper_val  # left edge
-        complex_spectrum[bin_start + n_bins - 1 - i] *= taper_val  # right edge
-
-    # ── Step 2: iFFT ─────────────────────────────────────────────────────────
-    try:
-        signal_raw = np.fft.irfft(complex_spectrum, n=fft_size)
-    except Exception:
-        return None
-
-    # ── Step 3: Gibbs suppression ─────────────────────────────────────────────
-    signal = suppress_edge_artifacts(signal_raw)
-
-    return {
-        'signal'    : signal,
-        'fft_norm'  : fft_norm,
-        'freq_axis' : freq_axis,
-    }
+### STAGES ###
 
 
 # =============================================================================
@@ -638,7 +686,7 @@ def run_stage1_v5(dm, k: float = K_STAGE1_DEFAULT) -> list:
             .total_frames (int)
     k : float
         Stage 1 threshold multiplier (default K_STAGE1_DEFAULT = 1.5 for data
-        collection). After SVM training use a tighter value (e.g. 2.0–3.46).
+        collection). After SVM training use a tighter value (e.g. 2.0, but we'll see).
 
     Returns
     -------
@@ -690,7 +738,7 @@ def run_stage1_v5(dm, k: float = K_STAGE1_DEFAULT) -> list:
         # ── 3. Stage 1 threshold check ────────────────────────────────────────
         E_hat_floor = noise['E_hat_floor']
 
-        # Guard: skip check if we have no floor estimate yet (very first frame
+        # GUARD: skip check if we have no floor estimate yet (very first frame
         # before any warm-up data, E_hat_floor == 0).
         if E_hat_floor > 0 and E_i > k * E_hat_floor:
             above_threshold.append({
@@ -727,3 +775,285 @@ def run_stage1_v5(dm, k: float = K_STAGE1_DEFAULT) -> list:
                 survivors.append({**candidate, 'group_size': len(run)})
 
     return survivors
+
+
+# =============================================================================
+# FIT PIPELINE — τ and R²  (§10)
+# =============================================================================
+
+def run_fit_pipeline_v5(
+    envelope:             np.ndarray,
+    peak_idx:             int,
+    noise_floor:          float,
+    std_noise:            float,
+    fs:                   int = FS,
+    next_frame_envelope:  Optional[np.ndarray] = None,
+) -> dict:
+    """
+    Estimate the exponential decay constant τ and goodness-of-fit R² from the
+    Hilbert envelope of a click candidate (§10 of the v5 spec).
+
+    This is the top-level entry point for the fit pipeline. It delegates to:
+      • find_decay_window_v5 — Steps A+B: locate decay_start and decay_end
+      • _fit_decay_segment   — Steps C+D: Gaussian smoothing + OLS log-linear fit
+
+    Call this function from the feature extraction pipeline. The returned dict
+    contains decay_start and decay_end so all other features (asymmetry_integral,
+    fall_time_ms, ZCR_post, post_SNR) can read them directly without re-running
+    the window search.
+
+    If you only need the window boundaries (e.g. for pre-processing or debugging),
+    call find_decay_window_v5 directly.
+
+    Parameters
+    ----------
+    envelope : np.ndarray
+        Hilbert amplitude envelope A[n] for the current frame (512 samples).
+    peak_idx : int
+        Index of the amplitude peak within `envelope`.
+    noise_floor : float
+        Estimated noise floor [V], from AdaptiveNoiseEstimatorV5.
+    std_noise : float
+        Estimated noise standard deviation [V], from AdaptiveNoiseEstimatorV5.
+    fs : int
+        Sampling rate [Hz]. Default: FS (200 000).
+    next_frame_envelope : np.ndarray or None
+        Hilbert envelope of the immediately following frame, passed through to
+        find_decay_window_v5 to allow cross-frame decay detection.
+
+    Returns
+    -------
+    dict with keys:
+        'tau_ms'       : float – decay constant [ms]. −1 if no valid decay.
+        'R2'           : float – goodness of fit in log space. 0 if invalid.
+        'fit_coverage' : float – len(fit_window) / (decay_end − decay_start).
+        'decay_start'  : int   – index of decay onset in `envelope`.
+        'decay_end'    : int   – index of decay end in the (possibly extended)
+                                 envelope (may exceed len(envelope)).
+    """
+
+    # Steps A and B: locate the decay window.
+    window = find_decay_window_v5(envelope, peak_idx, noise_floor, std_noise,
+                                  next_frame_envelope)
+    decay_start  = window['decay_start']
+    decay_end    = window['decay_end']
+    extended     = window['extended_envelope']
+
+    # Steps C and D: Gaussian smoothing + OLS fit on the located window.
+    return _fit_decay_segment(extended, decay_start, decay_end, fs)
+
+
+def find_decay_window_v5(
+    envelope:            np.ndarray,
+    peak_idx:            int,
+    noise_floor:         float,
+    std_noise:           float,
+    next_frame_envelope: Optional[np.ndarray] = None,
+) -> dict:
+    """
+    Locate the decay window [decay_start, decay_end] of a click candidate.
+
+    This implements Steps A and B of the fit pipeline (§10.2) and is separated
+    from the OLS fit so that other features (asymmetry_integral, fall_time_ms,
+    ZCR_post, post_SNR) can reuse the same window boundaries without re-running
+    the full fit.
+
+    Step A — decay_start (slope criterion):
+        Scan forward from peak_idx. The decay is considered to have started at
+        the first position n where DECAY_SLOPE_CONSECUTIVE consecutive sliding
+        windows (each DECAY_SLOPE_WINDOW wide) all have:
+            slope < −DECAY_SLOPE_THRESHOLD_FRAC × peak_amp
+        Hard-capped at peak_idx + DECAY_START_CAP samples (= 100 µs).
+        Fallback to peak_idx + DECAY_START_FALLBACK if criterion never met.
+
+    Step B — decay_end (noise threshold):
+        Build an extended envelope (current frame + next frame, if provided).
+        Scan forward from decay_start. The decay ends at the first position n
+        where DECAY_END_CONSECUTIVE consecutive samples all satisfy:
+            A[n] < noise_floor + DECAY_END_NOISE_ALPHA × std_noise
+        If not found, decay_end = end of available data.
+
+    Parameters
+    ----------
+    envelope : np.ndarray
+        Hilbert amplitude envelope A[n] for the current frame.
+    peak_idx : int
+        Index of the amplitude peak within `envelope`.
+    noise_floor : float
+        Estimated noise floor [V], from AdaptiveNoiseEstimatorV5.
+    std_noise : float
+        Estimated noise standard deviation [V], from AdaptiveNoiseEstimatorV5.
+    next_frame_envelope : np.ndarray or None
+        Hilbert envelope of the immediately following frame. Appended to allow
+        the decay_end search to extend past the current frame boundary.
+
+    Returns
+    -------
+    dict with keys:
+        'decay_start'       : int        – index of decay onset in `envelope`.
+        'decay_end'         : int        – index of decay end in the (possibly
+                                           extended) envelope. May exceed
+                                           len(envelope) when the click spills
+                                           into the next frame.
+        'extended_envelope' : np.ndarray – envelope used for the search
+                                           (current frame, or current + next).
+                                           Needed by _fit_decay_segment and by
+                                           feature functions that operate on the
+                                           full decay region.
+    """
+    peak_amp = float(envelope[peak_idx])
+
+    # ── Step A — locate decay_start ──────────────────────────────────────────
+    slope_threshold = DECAY_SLOPE_THRESHOLD_FRAC * peak_amp
+    n_env      = len(envelope)
+    cap        = peak_idx + DECAY_START_CAP
+    # Upper bound: the last starting index that allows all consecutive windows
+    # to fit within the current frame.
+    search_end = min(cap, n_env - DECAY_SLOPE_WINDOW - DECAY_SLOPE_CONSECUTIVE + 1)
+
+    decay_start = None
+    for n in range(peak_idx, search_end):
+        all_descending = True
+        for j in range(DECAY_SLOPE_CONSECUTIVE):
+            # Slope over window [n+j .. n+j+DECAY_SLOPE_WINDOW-1]
+            slope = (envelope[n + j + DECAY_SLOPE_WINDOW - 1] - envelope[n + j]) \
+                    / (DECAY_SLOPE_WINDOW - 1)
+            if slope >= -slope_threshold:
+                all_descending = False
+                break
+        if all_descending:
+            decay_start = n
+            break
+
+    if decay_start is None:
+        decay_start = peak_idx + DECAY_START_FALLBACK
+
+    # ── Step B — locate decay_end ─────────────────────────────────────────────
+    # Extend the envelope into the next frame so clicks that spill past the
+    # current frame boundary are fully captured.
+    if next_frame_envelope is not None:
+        extended = np.concatenate([envelope, next_frame_envelope])
+    else:
+        extended = envelope
+
+    level = noise_floor + DECAY_END_NOISE_ALPHA * std_noise
+    Y     = DECAY_END_CONSECUTIVE
+    n_ext = len(extended)
+
+    decay_end = None
+    for n in range(decay_start, n_ext - Y):
+        if np.all(extended[n + 1 : n + 1 + Y] < level):
+            decay_end = n
+            break
+
+    if decay_end is None:
+        decay_end = n_ext - 1
+
+    return {
+        'decay_start'       : decay_start,
+        'decay_end'         : decay_end,
+        'extended_envelope' : extended,
+    }
+
+
+def _fit_decay_segment(
+    extended:    np.ndarray,
+    decay_start: int,
+    decay_end:   int,
+    fs:          int = FS,
+) -> dict:
+    """
+    Steps C and D of the fit pipeline: Gaussian smoothing + OLS log-linear fit.
+
+    Operates on a pre-located decay window [decay_start, decay_end] within
+    `extended` (the possibly frame-concatenated envelope). Called internally by
+    run_fit_pipeline_v5; exposed separately so it can be unit-tested in isolation.
+
+    Step C — Gaussian smoothing:
+        Convolve extended[decay_start:decay_end] with _GAUSS_KERNEL (σ=2 samples,
+        mode='valid'). Suppresses high-frequency ripple without distorting the
+        decay shape (kernel width << τ_min).
+
+    Step D — OLS log-linear fit:
+        Fit log(fit_window) vs. sample index. Closed-form formula — no BLAS.
+        Returns τ_ms = −1000 / (slope × fs) and R² in log space.
+
+    Parameters
+    ----------
+    extended : np.ndarray
+        Full (possibly extended) envelope from find_decay_window_v5.
+    decay_start : int
+        Decay window start index in `extended`.
+    decay_end : int
+        Decay window end index in `extended`.
+    fs : int
+        Sampling rate [Hz].
+
+    Returns
+    -------
+    dict with keys:
+        'tau_ms'       : float – decay constant [ms]. −1 if no valid decay.
+        'R2'           : float – goodness of fit in log space.
+        'fit_coverage' : float – len(fit_window) / (decay_end − decay_start).
+        'decay_start'  : int   – echoed back for convenience.
+        'decay_end'    : int   – echoed back for convenience.
+    """
+    decay_len = decay_end - decay_start
+
+    if decay_len < 1:
+        return {'tau_ms': -1.0, 'R2': 0.0, 'fit_coverage': 0.0,
+                'decay_start': decay_start, 'decay_end': decay_end}
+
+    decay_segment = extended[decay_start : decay_end]
+
+    # ── Step C: Gaussian smoothing ────────────────────────────────────────────
+    if len(decay_segment) >= len(_GAUSS_KERNEL):
+        # mode='valid' avoids zero-padding artefacts at segment boundaries.
+        fit_window = np.convolve(decay_segment, _GAUSS_KERNEL, mode='valid')
+    else:
+        fit_window = decay_segment.copy()   # too short to convolve
+
+    n_fit = len(fit_window)
+
+    if n_fit < MIN_FIT_SAMPLES:
+        return {'tau_ms': -1.0, 'R2': 0.0,
+                'fit_coverage': n_fit / max(1, decay_len),
+                'decay_start': decay_start, 'decay_end': decay_end}
+
+    # ── Step D: OLS log-linear fit ────────────────────────────────────────────
+    log_env = np.log(np.maximum(fit_window, FIT_LOG_EPSILON))
+    n_array = np.arange(n_fit, dtype=np.float64)
+
+    n_pts  = float(n_fit)
+    sum_x  = float(np.sum(n_array))
+    sum_y  = float(np.sum(log_env))
+    sum_xx = float(np.sum(n_array * n_array))
+    sum_xy = float(np.sum(n_array * log_env))
+    denom  = n_pts * sum_xx - sum_x * sum_x
+
+    if abs(denom) < 1e-30:
+        return {'tau_ms': -1.0, 'R2': 0.0,
+                'fit_coverage': n_fit / max(1, decay_len),
+                'decay_start': decay_start, 'decay_end': decay_end}
+
+    slope_m     = (n_pts * sum_xy - sum_x * sum_y) / denom
+    intercept_b = (sum_y - slope_m * sum_x) / n_pts
+
+    # Negative slope + above numerical zero-guard → genuine exponential decay
+    if slope_m < -_SLOPE_ZERO_GUARD:
+        tau_ms = -1000.0 / (slope_m * fs)
+    else:
+        tau_ms = -1.0
+
+    y_pred = slope_m * n_array + intercept_b
+    ss_res = float(np.sum((log_env - y_pred)        ** 2))
+    ss_tot = float(np.sum((log_env - sum_y / n_pts) ** 2))
+    R2     = float(1.0 - ss_res / ss_tot) if ss_tot > 1e-30 else 0.0
+
+    return {
+        'tau_ms'      : tau_ms,
+        'R2'          : R2,
+        'fit_coverage': n_fit / max(1, decay_len),
+        'decay_start' : decay_start,
+        'decay_end'   : decay_end,
+    }
