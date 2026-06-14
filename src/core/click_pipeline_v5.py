@@ -170,6 +170,12 @@ LEVEL_STD_FACTOR     = 1.0  # LEVEL = noise_floor + LEVEL_STD_FACTOR × std_nois
                               # kurtosis event_start. Factor of 1.0 = 1 σ above floor.
 POST_WINDOW_SAMPLES  = 100  # Length of the post-SNR window P [samples] = 0.5 ms.
                               # Captures signal level immediately after the click ends.
+PRE_WINDOW_SAMPLES   = 100  # Length of the pre-SNR window P [samples] = 0.5 ms.
+                              # Symmetric with POST_WINDOW_SAMPLES: captures signal
+                              # level immediately before the click emerged above LEVEL.
+                              # The previous-frame extension ensures 100 samples are
+                              # always available regardless of where in the frame the
+                              # click lands.
 PRE_MIN_SAMPLES      = 5    # Minimum samples needed for a meaningful pre-window RMS.
                               # If fewer samples are available, pre_SNR is set to 1.0
                               # (neutral — "unknown silence before click").
@@ -1160,26 +1166,30 @@ def _build_pre_window(
     """
     Build the pre-window for a click candidate, extending into the previous frame.
 
-    The pre-window is defined as all samples before the click emerged from the
-    noise floor — i.e., everything before the first sample above
-    LEVEL = noise_floor + LEVEL_STD_FACTOR × std_noise going backward from peak_idx.
+    The pre-window is defined as the PRE_WINDOW_SAMPLES samples immediately
+    before the click emerged from the noise floor — i.e., the last 100 samples
+    before the first sample above LEVEL = noise_floor + LEVEL_STD_FACTOR × std_noise
+    going backward from peak_idx.
 
-    Why extending into the previous frame matters:
+    This is symmetric with the post-window (POST_WINDOW_SAMPLES after decay_end):
+    both capture the IMMEDIATE silence around the click event rather than the
+    entire pre/post-click silence region.
+
+    Why extending into the previous frame still matters:
         If peak_idx is small (e.g. click at sample 20 of a 512-sample frame),
-        the current frame provides only 20 samples of "silence before". This is
-        too few for a reliable RMS estimate (pre_SNR) or ZCR measurement
-        (ZCR_pre). The previous frame contributes up to 512 more samples of
-        genuine pre-click silence, giving much more stable estimates regardless
-        of where in the frame the click lands.
+        the current frame provides only 20 samples of pre-click context.
+        The previous frame guarantees that PRE_WINDOW_SAMPLES are always
+        available regardless of where in the frame the click lands.
 
     Strategy:
         1. Build an extended array: [prev_tail | current_frame_up_to_peak].
            If no previous frame is available, work with the current frame only.
-        2. Scan backward from the peak position in the extended array for the
-           last sub-LEVEL sample — this is the true pre-boundary.
-        3. Return the pre-window (envelope and raw signal) as arrays, plus the
-           boundary index mapped back to the current frame's coordinate system
-           (for kurtosis event_start, which operates on the current frame only).
+        2. Scan backward from the peak position for the last sub-LEVEL sample
+           — this is the true pre-boundary (pre_end_in_ext).
+        3. Take the PRE_WINDOW_SAMPLES samples immediately before pre_end_in_ext
+           as the pre-window (symmetric with post_window).
+        4. Return the boundary index mapped back to the current frame's coordinate
+           system (for kurtosis event_start).
 
     Parameters
     ----------
@@ -1204,28 +1214,23 @@ def _build_pre_window(
     Returns
     -------
     dict with keys:
-        'pre_env'          : np.ndarray – envelope of the pre-window.
-                             RMS of this / noise_floor → pre_SNR.
-        'pre_sig'          : np.ndarray – raw signal of the pre-window.
-                             Fed to _compute_zcr for ZCR_pre.
+        'pre_env'          : np.ndarray – last PRE_WINDOW_SAMPLES of the envelope
+                             before the click boundary. RMS of this / noise_floor → pre_SNR.
+        'pre_sig'          : np.ndarray – last PRE_WINDOW_SAMPLES of the raw signal
+                             before the click boundary. Fed to _compute_zcr for ZCR_pre.
         'boundary_in_frame': int – index in the *current frame* where the click
                              first emerged above LEVEL. Used as event_start for
                              kurtosis. Clamped to 0 if the boundary is in the
-                             previous frame (meaning the click filled the entire
-                             current frame before peak_idx, which is unusual).
+                             previous frame.
     """
     level = noise_floor + LEVEL_STD_FACTOR * std_noise
 
     # ── Build extended arrays ─────────────────────────────────────────────────
-    # Include the entire previous frame (512 samples) so a click at any position
-    # in the current frame always has a full frame of pre-click context.
     if prev_frame_envelope is not None:
         ext_env = np.concatenate([prev_frame_envelope, envelope[:peak_idx + 1]])
         if prev_frame_signal is not None:
             ext_sig = np.concatenate([prev_frame_signal, signal[:peak_idx + 1]])
         else:
-            # No raw signal for previous frame: fill with zeros.
-            # ZCR_pre will see no crossings in that region (conservative).
             ext_sig = np.concatenate([
                 np.zeros(len(prev_frame_envelope), dtype=signal.dtype),
                 signal[:peak_idx + 1]
@@ -1237,21 +1242,20 @@ def _build_pre_window(
         prev_len = 0
 
     # ── Scan backward for the last sub-LEVEL sample ───────────────────────────
-    # The pre-window is everything BEFORE this index in the extended array.
-    peak_in_ext    = len(ext_env) - 1   # peak position in extended coordinates
+    peak_in_ext    = len(ext_env) - 1
     pre_end_in_ext = 0                  # default: no sub-LEVEL sample found
     for n in range(peak_in_ext - 1, -1, -1):
         if ext_env[n] < level:
             pre_end_in_ext = n + 1   # exclusive upper bound of pre-window
             break
 
-    # ── Extract pre-window arrays ─────────────────────────────────────────────
-    pre_env = ext_env[:pre_end_in_ext]
-    pre_sig = ext_sig[:pre_end_in_ext]
+    # ── Extract pre-window: last PRE_WINDOW_SAMPLES before the boundary ───────
+    # Symmetric with post_window (POST_WINDOW_SAMPLES samples after decay_end).
+    pre_start_in_ext = max(0, pre_end_in_ext - PRE_WINDOW_SAMPLES)
+    pre_env = ext_env[pre_start_in_ext : pre_end_in_ext]
+    pre_sig = ext_sig[pre_start_in_ext : pre_end_in_ext]
 
     # ── Map boundary back to current-frame coordinates ────────────────────────
-    # pre_end_in_ext is in extended coords; subtract prev_len to get current-frame index.
-    # Clamp to [0, peak_idx] — never negative, never past the peak.
     boundary_in_frame = max(0, min(peak_idx, pre_end_in_ext - prev_len))
 
     return {
