@@ -30,15 +30,34 @@ import os
 from PySide6.QtWidgets import (QVBoxLayout, QHBoxLayout, QWidget, QTabWidget, 
                               QSplitter, QTableWidget, QTableWidgetItem, 
                               QHeaderView, QLabel, QPushButton, QMessageBox,
-                              QSlider, QDoubleSpinBox, QSizePolicy, QDialog)
-from PySide6.QtCore import Qt, QTimer
+                              QSlider, QDoubleSpinBox, QSizePolicy, QDialog,
+                              QProgressDialog)
+from PySide6.QtCore import Qt, QTimer, QCoreApplication
 from PySide6.QtGui import QAction, QFont
 from PySide6 import QtCore
 
-from core.replay_base_window import ReplayBaseWindow, compute_fft_energy, SpectralEnergyDialog
-from core.replay_base_window import ReplayBaseWindow, compute_fft_energy, SpectralEnergyDialog
+from core.replay_base_window import ReplayBaseWindow
 from plotting.plot_manager import BasePlotWidget
 from core.audio_trim_export import AudioTrimExporter
+from core.click_pipeline_v5 import (
+    reconstruct_frame_v5,
+    compute_hilbert_envelope,
+    find_peak,
+    suppress_edge_artifacts,
+    compute_fft_energy as compute_fft_energy_v5,
+    AdaptiveNoiseEstimatorV5,
+    run_fit_pipeline_v5,
+    find_decay_window_v5,
+    _fit_decay_segment,
+    compute_features_v5,
+    _normalize_fft,
+    _feat_fft_features,
+    FS as V5_FS,
+    FFT_SIZE as V5_FFT_SIZE,
+    _BIN_START as V5_BIN_START,
+    _BIN_END   as V5_BIN_END,
+    K_STAGE1_DEFAULT,
+)
 
 
 class AudioDataManager:
@@ -73,87 +92,141 @@ class AudioDataManager:
         self.phase_data = []
         self.frequency_axis = []
 
-        # Array delle medie delle FFT PRECALCOLATE
-        self.fft_means = np.array([]) #media delle magnitude delle FFT
-        self.fft_timestamps = np.array([]) #timestamps corrispondenti alle FFT
-        
+        # Array delle medie delle FFT PRECALCOLATE (normalizzate per default)
+        self.fft_means = np.array([])      # media delle magnitude FFT normalizzate per frame
+        self.fft_timestamps = np.array([]) # timestamps corrispondenti alle FFT
+
+        # Stime adattive del rumore per frame — calcolate da AdaptiveNoiseEstimatorV5
+        # durante precompute_fft_means (un valore per frame).
+        self.E_hat_floor_arr = np.array([])  # Ê_floor(i) [V²] — per la curva soglia Stage 1
+        self.noise_floor_arr = np.array([])  # noise_floor(i) [V] — per le feature v5
+        self.std_noise_arr   = np.array([])  # std_noise(i) [V]   — per le feature v5
+
         # Performance settings (adattivi)
         self.overview_fps = 10      # FPS per overview
         self.streaming_fps = 100    # FPS per streaming buffer
         self.memory_limit_mb = 200  # Limite memoria totale
 
-    def precompute_fft_means(self):
+    def precompute_fft_means(self, progress_callback=None):
         """
-        Precalcola le medie di tutte le FFT per analisi threshold.
-        Chiamato una sola volta all'apertura del file.
+        Pre-calcola le medie FFT normalizzate e le stime adattive del rumore per ogni frame.
+
+        Viene chiamato una sola volta dopo il caricamento del file.
+
+        In un unico passaggio sequenziale su tutti i frame:
+          1. Calcola le magnitudini FFT normalizzate tramite _normalize_fft() (correzione
+             microfono SPU0410LR5H-QB al 50%).
+          2. Calcola la media delle magnitudini normalizzate → fft_means[i].
+          3. Ricostruisce l'iFFT normalizzato e calcola l'inviluppo di Hilbert per ottenere
+             env_mean e env_std → aggiorna AdaptiveNoiseEstimatorV5.
+          4. Salva le stime di rumore per frame (E_hat_floor, noise_floor, std_noise).
+
+        Questi array sono poi usati da:
+          - La curva soglia adattiva nel grafico principale (k × E_hat_floor_arr)
+          - La finestra iFFT / Decay Analysis / Show Fit per il frame corrente
+          - Il filtro above-threshold table
         """
         if len(self.fft_data) == 0:
             return
-        
-        print(f"🔄 Precalcolo medie FFT per {self.total_frames} frame...")
-        
-        # Calcola medie e timestamp
-        means = []
-        timestamps = []
-        
-        for i, fft_frame in enumerate(self.fft_data):
-            mean_val = np.mean(np.abs(fft_frame))
-            means.append(mean_val)
-            timestamps.append((i * self.frame_duration_ms) / 1000.0)
-        
-        self.fft_means = np.array(means)
-        self.fft_timestamps = np.array(timestamps)
-        
-        memory_mb = (self.fft_means.nbytes + self.fft_timestamps.nbytes) / 1024 / 1024
-        print(f"✅ Medie precalcolate: {len(means)} punti, {memory_mb:.1f} MB")
 
-        # ✅ OUTLIER DETECTION: Calcola media e std escludendo SOLO outliers ESTREMI
-        # Target: Rimuovere solo frame completamente corrotti (es. 20000V), 
-        # NON i click normali che sono parte della distribuzione reale
-        if len(self.fft_means) > 0:
-            # STRATEGIA: Usa mediana + soglia adattiva basata su MAD (Median Absolute Deviation)
-            # Più robusta dell'IQR per outliers estremi isolati
-            
+        n = self.total_frames
+        fs       = self.header_info.get('fs',       V5_FS)
+        fft_size = self.header_info.get('fft_size', V5_FFT_SIZE)
+
+        print(f"🔄 Precomputing normalized FFT means + adaptive noise for {n} frames...")
+
+        # Build the FULL half-spectrum frequency axis once (256 bins, 0–100 kHz).
+        # _normalize_fft + compute_fft_energy_v5 must both operate on this axis
+        # so that the analysis-band slice [V5_BIN_START:V5_BIN_END+1] is correct.
+        _full_freq_ax = np.arange(fft_size // 2, dtype=np.float64) * (fs / fft_size)
+
+        means         = np.empty(n, dtype=np.float32)
+        E_hat_floors  = np.empty(n, dtype=np.float32)
+        noise_floors  = np.empty(n, dtype=np.float32)
+        std_noises    = np.empty(n, dtype=np.float32)
+        timestamps    = np.empty(n, dtype=np.float64)
+
+        estimator = AdaptiveNoiseEstimatorV5()
+
+        for i in range(n):
+            fft_frame = self.fft_data[i]
+            timestamps[i] = i * self.frame_duration_ms / 1000.0
+
+            # 1. Pad analysis-band mags (154 bins) into full half-spectrum (256 bins)
+            #    and apply mic normalisation — identical to what reconstruct_frame_v5 does.
+            full_mags = np.zeros(fft_size // 2, dtype=np.float64)
+            n_bins_i  = min(len(fft_frame), V5_BIN_END - V5_BIN_START + 1)
+            full_mags[V5_BIN_START : V5_BIN_START + n_bins_i] = \
+                np.asarray(fft_frame, dtype=np.float64)[:n_bins_i]
+            fft_norm = _normalize_fft(full_mags, _full_freq_ax)   # 256 bins
+
+            # 2. FFT energy over the analysis band (154 bins) [V²].
+            #    FIX: previously used analysis-band freq_axis (154 bins) → the slice
+            #    fft_norm[51:205] silently truncated to [51:154] = only 103 bins.
+            #    Now fft_norm is 256 bins → slice is exactly 154 bins. ✓
+            E_i = compute_fft_energy_v5(fft_norm[V5_BIN_START : V5_BIN_END + 1])
+
+            # FIX (primary): store ENERGY [V²] so that fft_means and E_hat_floor_arr
+            # share the same units. Previously mean amplitude [V] was stored here,
+            # causing the threshold curve (V²) to appear ~1 000× smaller than the
+            # data (V) — effectively zero on the plot.
+            means[i] = E_i
+
+            # 3. Reconstruct iFFT for B2 estimator (env_mean, env_std)
+            if i < len(self.phase_data):
+                frame_data = reconstruct_frame_v5(
+                    np.asarray(fft_frame, dtype=np.float64),
+                    self.phase_data[i],
+                    fs, fft_size, normalize=True
+                )
+            else:
+                frame_data = None
+
+            if frame_data is not None:
+                envelope   = compute_hilbert_envelope(frame_data['signal'])
+                env_mean_i = float(np.mean(envelope))
+                env_std_i  = float(np.std(envelope))
+            else:
+                env_mean_i = float(np.sqrt(max(E_i, 0.0)))  # amplitude fallback
+                env_std_i  = 0.0
+
+            # 4. Update estimator and store per-frame noise estimates
+            noise = estimator.update(E_i, env_mean_i, env_std_i)
+            E_hat_floors[i] = noise['E_hat_floor']
+            noise_floors[i] = noise['noise_floor']
+            std_noises[i]   = noise['std_noise']
+
+            if progress_callback is not None and i % 100 == 0:
+                progress_callback(i, n)
+
+        self.fft_means        = means        # [V²] energy per frame
+        self.fft_timestamps   = timestamps
+        self.E_hat_floor_arr  = E_hat_floors  # [V²]
+        self.noise_floor_arr  = noise_floors
+        self.std_noise_arr    = std_noises
+
+        memory_mb = (means.nbytes + timestamps.nbytes +
+                     E_hat_floors.nbytes + noise_floors.nbytes + std_noises.nbytes) / 1024 / 1024
+        print(f"✅ Precomputed: {n} frames, {memory_mb:.1f} MB total")
+
+        if n > 0:
             median = np.median(self.fft_means)
-            mad = np.median(np.abs(self.fft_means - median))
-            
-            # Modified Z-score threshold (Iglewicz and Hoaglin, 1993)
-            # Soglia 3.5 cattura solo outliers MOLTO estremi (>99.9%)
-            # Se MAD è troppo piccolo (dati molto uniformi), usa fallback
+            mad    = np.median(np.abs(self.fft_means - median))
             if mad > 0:
-                modified_z_scores = 0.6745 * (self.fft_means - median) / mad
-                outlier_mask = np.abs(modified_z_scores) > 3.5
+                modified_z = 0.6745 * (self.fft_means - median) / mad
+                outlier_mask = np.abs(modified_z) > 3.5
             else:
-                # Fallback: soglia assoluta basata su multiplo della mediana
-                # Rimuovi solo valori >20× la mediana (MOLTO conservativo)
-                outlier_mask = self.fft_means > (median * 20)
-            
-            filtered_means = self.fft_means[~outlier_mask]
-            n_outliers = np.sum(outlier_mask)
-            
-            if n_outliers > 0:
-                outlier_values = self.fft_means[outlier_mask]
-                outlier_indices = np.where(outlier_mask)[0]
-                print(f"⚠️ OUTLIER DETECTION: Rimossi {n_outliers} frame ESTREMI anomali dal calcolo statistico")
-                print(f"   Mediana: {median*1000:.3f} mV")
-                print(f"   MAD: {mad*1000:.3f} mV")
-                print(f"   Frame outlier: {outlier_indices[:10]}" + (" ..." if len(outlier_indices) > 10 else ""))
-                print(f"   Valori outlier: min={outlier_values.min()*1000:.1f} mV, max={outlier_values.max()*1000:.1f} mV")
-                print(f"   Frame validi: {len(filtered_means)}/{len(self.fft_means)} ({100*len(filtered_means)/len(self.fft_means):.1f}%)")
-            else:
-                print(f"✅ Nessun outlier estremo rilevato (tutti i frame sono validi)")
-            
-            # Calcola statistiche sui dati filtrati
-            self.fft_mean = np.mean(filtered_means) if len(filtered_means) > 0 else 0
-            self.fft_std = np.std(filtered_means) if len(filtered_means) > 0 else 0
-            
-            print(f"📊 Statistiche FFT (outlier-free):")
-            print(f"   Mean: {self.fft_mean*1000:.3f} mV")
-            print(f"   Std:  {self.fft_std*1000:.3f} mV")
-            print(f"   Threshold μ+4σ: {(self.fft_mean + 4*self.fft_std)*1000:.3f} mV")
-        else:
-            self.fft_mean = 0
-            self.fft_std = 0
+                outlier_mask = self.fft_means > median * 20
+            filtered = self.fft_means[~outlier_mask]
+            self.fft_mean = float(np.mean(filtered)) if len(filtered) > 0 else 0.0
+            self.fft_std  = float(np.std(filtered))  if len(filtered) > 0 else 0.0
+            # fft_mean/std are now in V² — display as sqrt(V²) = V for readability
+            print(f"📊 Normalized FFT energy stats — "
+                  f"mean: {np.sqrt(self.fft_mean)*1000:.3f} mV-rms  "
+                  f"std: {np.sqrt(self.fft_std)*1000:.3f} mV-rms")
+
+        if progress_callback is not None:
+            progress_callback(n, n)
 
     def get_memory_usage_mb(self):
         """Calcola uso memoria corrente in MB"""
@@ -202,11 +275,11 @@ class IFFTWindow(QDialog):
         self.frame_index = frame_index
         self.has_real_phases = has_real_phases
         self.time_data = time_data
-        self.signal_data_raw = suppress_edge_artifacts(signal_data)  # Segnale RAW (bordi corretti)
-        self.signal_data_normalized = None  # Verrà calcolato on-demand
-        self.is_normalized = False
+        self.signal_data_raw = suppress_edge_artifacts(signal_data)
+        self.signal_data_normalized = None  # Computed below if phases available
+        self.is_normalized = False          # Will be set True after normalization
 
-        # ✅ TITOLO CON INFO
+        # TITOLO CON INFO
         title = "Inverse FFT Signal (Reconstructed)"
         if frame_index is not None:
             title += f" - Frame {frame_index}"
@@ -229,7 +302,7 @@ class IFFTWindow(QDialog):
         # Crea il widget del grafico con il range corretto e auto-range per l'asse Y
         self.plot_widget = BasePlotWidget(
             x_label="Time", y_label="Amplitude",
-            x_range=(x_min_val, x_max_val), y_range=(-0.002, 0.002),
+            x_range=(x_min_val, x_max_val), y_range=(-0.00005, 0.00015),
             x_min=x_min_val, x_max=x_max_val, y_min=-1.7, y_max=1.7,
             unit_x="s", unit_y="V", parent=self
         )
@@ -245,7 +318,7 @@ class IFFTWindow(QDialog):
 
         layout.addWidget(self.plot_widget)
 
-        # ✅ AGGIUNGI PULSANTE NORMALIZZAZIONE
+        # AGGIUNGI PULSANTE NORMALIZZAZIONE
         button_layout = QHBoxLayout()
         
         self.normalize_button = QPushButton("Apply 50% Normalization")
@@ -257,7 +330,7 @@ class IFFTWindow(QDialog):
         self.normalize_button.clicked.connect(self.toggle_normalization)
         button_layout.addWidget(self.normalize_button)
         
-        # ✅ AGGIUNGI PULSANTE ENVELOPE ANALYSIS
+        # AGGIUNGI PULSANTE ENVELOPE ANALYSIS
         self.envelope_button = QPushButton("Show Hilbert Envelope")
         self.envelope_button.setToolTip(
             "Calculate and display instantaneous amplitude envelope\n"
@@ -266,7 +339,7 @@ class IFFTWindow(QDialog):
         self.envelope_button.clicked.connect(self.toggle_envelope)
         button_layout.addWidget(self.envelope_button)
         
-        # ✅ AGGIUNGI PULSANTE DECAY ANALYSIS
+        # AGGIUNGI PULSANTE DECAY ANALYSIS
         self.decay_button = QPushButton("Analyze Decay")
         self.decay_button.setToolTip(
             "Check if signal shows exponential decay typical of ultrasonic clicks\n"
@@ -275,16 +348,23 @@ class IFFTWindow(QDialog):
         self.decay_button.clicked.connect(self.analyze_decay)
         button_layout.addWidget(self.decay_button)
 
-        # ✅ PULSANTE TOGGLE FIT CURVE (disabilitato finché non si esegue Analyze Decay)
+        # PULSANTE TOGGLE FIT CURVE (disabilitato finché non si esegue Analyze Decay)
         self.fit_curve_button = QPushButton("Show Fit Curve")
         self.fit_curve_button.setToolTip(
             "Show/hide the exponential fit overlay on the plot\n"
-            "Available after running 'Analyze Decay'"
         )
         self.fit_curve_button.setEnabled(False)
         self.fit_curve_button.clicked.connect(self.toggle_fit_curve)
         button_layout.addWidget(self.fit_curve_button)
-        
+
+        # PULSANTE TOGGLE SHOW IFFT DATA (to show only Hilbert envelope)
+        self.toggle_ifft_button = QPushButton("Show Only Envelope")
+        self.toggle_ifft_button.setToolTip(
+            "Show/hide iFFT signal to focus on envelope analysis\n"
+        )
+        self.toggle_ifft_button.clicked.connect(self.toggle_ifft_signal)
+        button_layout.addWidget(self.toggle_ifft_button)
+
         self.info_label = QLabel("📊 Raw iFFT signal (no correction)")
         self.info_label.setStyleSheet("color: #888; font-size: 10pt;")
         button_layout.addWidget(self.info_label)
@@ -300,8 +380,11 @@ class IFFTWindow(QDialog):
 
         # Variabili per fit curve overlay (populate da analyze_decay)
         self.show_fit_curve = False
-        self._last_decay_peak_idx = None    # picco usato nell'ultimo fit
-        self._last_decay_results = None     # risultati dell'ultimo fit
+        self._last_decay_peak_idx = None
+        self._last_v5_features    = None
+        self._last_noise_floor    = 0.0
+        self._last_std_noise      = 0.0
+        self._last_next_env       = None
 
         # Menubar
         from PySide6.QtWidgets import QMenuBar
@@ -324,7 +407,7 @@ class IFFTWindow(QDialog):
                 plot_instance=self.ifft_curve
             )
 
-        # motra in mezzo allo schermo del parent MA CON DIMENSIONE MINORE E TENENDO CONTO DELLE GRAFICHE SOPRATTUTTO PER WINDOWS
+        # mostra in mezzo allo schermo del parent MA CON DIMENSIONE MINORE E TENENDO CONTO DELLE GRAFICHE SOPRATTUTTO PER WINDOWS
         if parent:
             parent_rect = parent.geometry()
             self.resize(parent_rect.width() * 0.8, parent_rect.height() * 0.6)
@@ -334,202 +417,78 @@ class IFFTWindow(QDialog):
             )
     
     def toggle_normalization(self):
-        """Toggle tra iFFT raw e normalizzato (50%)"""
+        """Toggle between normalized (default) and raw iFFT display."""
         if not self.is_normalized:
-            # APPLICA NORMALIZZAZIONE
             self._compute_normalized_ifft()
             if self.signal_data_normalized is not None:
                 self.is_normalized = True
                 self._update_display()
-                
-                # ✅ RICALCOLA ENVELOPE SE GIÀ VISUALIZZATO
                 if self.show_envelope:
-                    print("🔄 Recalculating envelope for normalized signal...")
                     self._compute_and_show_envelope()
         else:
-            # TORNA A RAW
             self.is_normalized = False
             self._update_display()
-            
-            # ✅ RICALCOLA ENVELOPE SE GIÀ VISUALIZZATO
             if self.show_envelope:
-                print("🔄 Recalculating envelope for raw signal...")
                 self._compute_and_show_envelope()
-    
+
     def _compute_normalized_ifft(self):
-        """Calcola iFFT con correzione 50% dalla FFT normalizzata"""
+        """
+        Compute the 50%-normalized iFFT for this frame using reconstruct_frame_v5.
+
+        Uses the same reconstruction pipeline as click_pipeline_v5 (Tukey taper,
+        Gibbs suppression) for full consistency with the detection algorithm.
+        """
         if not self.parent or not hasattr(self.parent, 'data_manager'):
             QMessageBox.warning(self, "Error", "Cannot access parent data manager.")
             return
-        
-        print("🔧 Computing normalized iFFT (50% correction)...")
-        
-        # === 1. DATI DAL DATASHEET (IDENTICI a normalize_fft_window) ===
-        datasheet_freq_khz = np.array([20, 25, 30, 40, 50, 60, 70, 80])
-        datasheet_response_db = np.array([8.0, 10.5, 6.0, -2.0, -6.0, -7.0, -6.0, -4.0])
-        datasheet_freq_hz = datasheet_freq_khz * 1000
-        
-        # === 2. RECUPERA FFT ORIGINALE DEL FRAME ===
+
+        if not self.has_real_phases:
+            QMessageBox.warning(self, "No Phase Data",
+                                "Normalization requires phase information (file version >= 3.0).")
+            return
+
         if self.frame_index is None or self.frame_index >= len(self.parent.data_manager.fft_data):
             QMessageBox.warning(self, "Error", "Invalid frame index.")
             return
-        
-        fft_magnitudes = self.parent.data_manager.fft_data[self.frame_index]
-        freq_axis = self.parent.data_manager.frequency_axis
-        
-        # === 3. CALCOLA CORREZIONE ===
-        valid_mask = (freq_axis >= 20000) & (freq_axis <= 80000)
-        freq_range = freq_axis[valid_mask]
-        
-        mic_response_db = np.interp(freq_range, datasheet_freq_hz, datasheet_response_db)
-        correction_gain_50 = 10 ** (-mic_response_db * 0.5 / 20.0)
-        
-        full_correction = np.ones(len(freq_axis))
-        full_correction[valid_mask] = correction_gain_50
-        
-        # === 4. VERIFICA COMPATIBILITÀ FASI ===
-        if not self.has_real_phases or not hasattr(self.parent.data_manager, 'phase_data'):
-            QMessageBox.warning(self, "No Phase Data", 
-                              "Normalization requires phase information (file version >= 3.0).")
+
+        dm       = self.parent.data_manager
+        fi       = self.frame_index
+        fs       = dm.header_info.get('fs',       V5_FS)
+        fft_size = dm.header_info.get('fft_size', V5_FFT_SIZE)
+
+        fft_mags   = np.asarray(dm.fft_data[fi],   dtype=np.float64)
+        phase_int8 = np.asarray(dm.phase_data[fi], dtype=np.int8) \
+                     if fi < len(dm.phase_data) else np.array([], dtype=np.int8)
+
+        frame_data = reconstruct_frame_v5(fft_mags, phase_int8, fs, fft_size, normalize=True)
+        if frame_data is None:
+            QMessageBox.warning(self, "Error", "iFFT reconstruction failed.")
             return
-        
-        fft_phases_int8 = self.parent.data_manager.phase_data[self.frame_index]
-        
-        # Parametri FFT
-        fs = self.parent.data_manager.header_info.get('fs', 200000)
-        fft_size = self.parent.data_manager.header_info.get('fft_size', 512)
-        num_bins_full = fft_size // 2
-        
-        bin_freq = fs / fft_size
-        bin_start = int(20000 / bin_freq)
-        bin_end = int(80000 / bin_freq)
-        num_received_bins = bin_end - bin_start + 1
-        
-        # ✅ FIX: Verifica che le dimensioni siano coerenti
-        if len(fft_magnitudes) != len(freq_axis):
-            print(f"⚠️ WARNING: FFT length mismatch: {len(fft_magnitudes)} vs {len(freq_axis)}")
-            QMessageBox.warning(self, "Data Mismatch", "FFT data dimensions inconsistent.")
-            return
-        
-        if len(fft_phases_int8) != num_received_bins:
-            print(f"⚠️ WARNING: Phase data length mismatch: {len(fft_phases_int8)} vs {num_received_bins}")
-        
-        # === 5. APPLICA CORREZIONE SOLO ALLA PARTE 20-80kHz ===
-        # Estrai solo la parte 20-80kHz dalla FFT originale (154 bins)
-        fft_20_80khz = fft_magnitudes[valid_mask]
-        
-        # Applica correzione solo a questa parte
-        normalized_fft_20_80khz = fft_20_80khz * correction_gain_50
-        
-        # === 6. RICOSTRUISCI SPETTRO COMPLETO (0-100kHz, 256 bins) ===
-        full_spectrum_mag = np.zeros(num_bins_full, dtype=np.float32)
-        full_spectrum_phase = np.zeros(num_bins_full, dtype=np.int8)
-        
-        # Inserisci i dati normalizzati 20-80kHz SENZA windowing (sarà applicata dopo)
-        actual_bins_to_copy = min(len(normalized_fft_20_80khz), num_received_bins, len(fft_phases_int8))
-        full_spectrum_mag[bin_start:bin_start + actual_bins_to_copy] = normalized_fft_20_80khz[:actual_bins_to_copy]
-        full_spectrum_phase[bin_start:bin_start + actual_bins_to_copy] = fft_phases_int8[:actual_bins_to_copy]
-        
-        # === 7. CONVERTI FASI E CREA SPETTRO COMPLESSO ===
-        fft_phases_rad = (full_spectrum_phase / 127.0) * np.pi
-        complex_spectrum = full_spectrum_mag * np.exp(1j * fft_phases_rad)
-        
-        # === 7b. APPLICA TUKEY WINDOW ALLO SPETTRO COMPLESSO (FIX GIBBS) ===
-        # ✅ IMPORTANTE: Window applicata allo spettro complesso, non solo alle magnitude
-        # Questo elimina discontinuità sia in Re{X[k]} che in Im{X[k]}
-        taper_bins = max(5, actual_bins_to_copy // 10)
-        
-        # Crea finestra Tukey per la regione 20-80kHz
-        window_full = np.ones(num_bins_full)
-        
-        # Left taper (bins 51-66, cosine fade-in)
-        for i in range(taper_bins):
-            alpha = i / taper_bins
-            window_full[bin_start + i] = 0.5 * (1 - np.cos(np.pi * alpha))
-        
-        # Right taper (bins 189-204, cosine fade-out)
-        for i in range(taper_bins):
-            alpha = i / taper_bins
-            window_full[bin_start + actual_bins_to_copy - i - 1] = 0.5 * (1 - np.cos(np.pi * alpha))
-        
-        # Applica window allo spettro complesso (attenuazione graduale ai bordi)
-        complex_spectrum = complex_spectrum * window_full
-        
-        # === 8. ESEGUI iFFT ===
-        try:
-            time_domain_signal = np.fft.irfft(complex_spectrum, n=fft_size)
-            time_domain_signal = suppress_edge_artifacts(time_domain_signal)
-        except Exception as e:
-            QMessageBox.critical(self, "iFFT Error", f"Failed to compute normalized iFFT:\n{str(e)}")
-            return
-        
-        self.signal_data_normalized = time_domain_signal
-        
-        # Statistiche
-        gain_stats = {
-            'max_gain_db': 20 * np.log10(np.max(correction_gain_50)),
-            'min_gain_db': 20 * np.log10(np.min(correction_gain_50)),
-        }
-        
-        print(f"✅ Normalized iFFT computed:")
-        print(f"   Gain range: {gain_stats['min_gain_db']:.2f} to {gain_stats['max_gain_db']:.2f} dB")
-        print(f"   Samples: {len(time_domain_signal)}")
-    
+
+        self.signal_data_normalized = frame_data['signal']
+        print(f"✅ Normalized iFFT via reconstruct_frame_v5  "
+              f"(peak {np.max(np.abs(self.signal_data_normalized))*1e6:.2f} µV)")
+
     def _update_display(self):
-        """Aggiorna display con curva corretta"""
+        """Show ONLY the selected signal (normalized or raw) — not both overlaid."""
         if self.is_normalized and self.signal_data_normalized is not None:
-            # Mostra normalizzato (ROSSO) + overlay raw (tema)
             self.ifft_curve.setData(self.time_data, self.signal_data_normalized)
-            self.ifft_curve.setPen({'color': 'red', 'width': 2})
-            
-            # Aggiungi overlay raw (accent_color dal tema, sottile, tratteggiato)
-            if not hasattr(self, 'raw_overlay_curve'):
-                self.raw_overlay_curve = self.plot_widget.plot_widget.plot(
-                    self.time_data, self.signal_data_raw,
-                    pen={'width': 1, 'style': QtCore.Qt.DashLine},
-                    name='Raw iFFT'
-                )
-                # Applica accent color del tema alla curva overlay
-                if self.parent and hasattr(self.parent, 'theme_manager'):
-                    self.parent.theme_manager.apply_theme_to_plot(
-                        plot_widget_name=self.plot_widget.plot_widget,
-                        plot_instance=self.raw_overlay_curve
-                    )
-            else:
-                self.raw_overlay_curve.setData(self.time_data, self.signal_data_raw)
-            
+            #As a color, use a darker accent color = border-color of QPushButton:checked
+            self.ifft_curve.setPen({'color': self.parent.theme_manager.get_darker_accent_color(), 'width': 2})
             self.normalize_button.setText("Show Raw iFFT")
-            self.info_label.setText("� Normalized iFFT (50% correction, ±2.9 dB error)")
+            self.info_label.setText("🔧 Normalized iFFT (50% correction, ±2.9 dB)")
             self.info_label.setStyleSheet("color: red; font-weight: bold; font-size: 10pt;")
-            
-            # Aggiorna legenda
-            try:
-                self.plot_widget.plot_widget.addLegend()
-            except:
-                pass
         else:
-            # Mostra raw (ri-applica accent_color del tema)
             self.ifft_curve.setData(self.time_data, self.signal_data_raw)
-            
-            # Ri-applica il tema per ripristinare l'accent color
             if self.parent and hasattr(self.parent, 'theme_manager'):
                 self.parent.theme_manager.apply_theme_to_plot(
                     plot_widget_name=self.plot_widget.plot_widget,
                     plot_instance=self.ifft_curve
                 )
-            
-            # Rimuovi overlay
-            if hasattr(self, 'raw_overlay_curve'):
-                try:
-                    self.plot_widget.plot_widget.removeItem(self.raw_overlay_curve)
-                    del self.raw_overlay_curve
-                except:
-                    pass
-            
             self.normalize_button.setText("Apply 50% Normalization")
             self.info_label.setText("📊 Raw iFFT signal (no correction)")
             self.info_label.setStyleSheet("color: #888; font-size: 10pt;")
-    
+
     def toggle_envelope(self):
         """Toggle visualizzazione inviluppo di Hilbert"""
         self.show_envelope = not self.show_envelope
@@ -546,6 +505,23 @@ class IFFTWindow(QDialog):
                 self.plot_widget.plot_widget.removeItem(self.peak_line)
                 self.peak_line = None
             self.envelope_button.setText("Show Hilbert Envelope")
+
+    def toggle_ifft_signal(self):
+        """Toggle visualizzazione segnale iFFT per focalizzarsi solo sull'envelope"""
+        if self.ifft_curve is not None:
+            if self.ifft_curve.isVisible():
+                self.ifft_curve.hide()
+                #mostra hilbert envelope se è nascosto
+                if self.envelope_curve is not None and not self.envelope_curve.isVisible():
+                    self.envelope_curve.show()
+                else:
+                    self._compute_and_show_envelope()
+                self.toggle_ifft_button.setText("Show iFFT Signal")
+                self.envelope_button.setEnabled(False)
+            else:
+                self.ifft_curve.show()
+                self.toggle_ifft_button.setText("Show Only Envelope")
+                self.envelope_button.setEnabled(True)
     
     def _compute_and_show_envelope(self):
         """Calcola e visualizza l'inviluppo di Hilbert"""
@@ -591,215 +567,137 @@ class IFFTWindow(QDialog):
         self.envelope_button.setText("Hide Hilbert Envelope")
     
     def analyze_decay(self):
-        """Analizza il decadimento post-picco per rilevare click ultrasonici"""
-        # Usa il segnale corrente (raw o normalized)
+        """
+        Compute all 17 v5 features for this frame and display results.
+
+        Uses compute_features_v5() with per-frame noise estimates from
+        AudioDataManager (pre-computed by AdaptiveNoiseEstimatorV5 at load time).
+        Previous / next frame data is fetched for pre-window and post-SNR accuracy.
+        """
         current_signal = self.signal_data_normalized if self.is_normalized else self.signal_data_raw
-        
-        # ✅ RICALCOLA SEMPRE ENVELOPE per assicurare coerenza con segnale corrente
+
+        # Always recompute envelope from the current signal to stay in sync
         self.envelope_data = compute_hilbert_envelope(current_signal)
-        
-        # ✅ BUG FIX: Trova il picco sull'ENVELOPE (non sul segnale raw) per coerenza
-        # check_decay() riceve l'envelope e usa peak_idx come indice in esso.
-        # Se trovassimo il picco sul raw, potremmo puntare in una posizione diversa
-        # dall'envelope a causa delle oscillazioni della portante.
         peak_idx, peak_amp = find_peak(self.envelope_data)
         peak_time = self.time_data[peak_idx]
-        
-        # ✅ GESTIONE SPILL: Recupera frame successivo se necessario
-        next_frame_signal = None
-        if peak_idx > 212:  # Matches near_end threshold in check_decay() (window_samples=300)
-            # Verifica se esiste frame successivo
-            if (self.frame_index is not None and 
-                self.parent and hasattr(self.parent, 'data_manager') and
-                self.frame_index + 1 < len(self.parent.data_manager.fft_data)):
-                
-                try:
-                    # Recupera FFT e fasi del frame successivo
-                    next_fft = self.parent.data_manager.fft_data[self.frame_index + 1]
-                    
-                    if self.is_normalized and self.has_real_phases:
-                        # Se in modalità normalizzata, calcola iFFT normalizzato del prossimo frame
-                        print("   🔧 Computing normalized iFFT for next frame (spill handling)...")
-                        next_frame_signal = self._compute_ifft_for_frame(self.frame_index + 1, normalized=True)
-                    elif self.has_real_phases:
-                        # Se in modalità raw con fasi reali
-                        next_frame_signal = self._compute_ifft_for_frame(self.frame_index + 1, normalized=False)
-                    else:
-                        # Fallback: usa solo dati FFT (senza fasi, qualità ridotta)
-                        print("   ⚠️ Next frame has no phase data, decay analysis may be inaccurate")
-                        next_frame_signal = None
-                        
-                except Exception as e:
-                    print(f"   ⚠️ Failed to load next frame: {e}")
-                    next_frame_signal = None
-        
-        # Analizza decadimento (con o senza frame successivo)
-        print(f"\n🔍 Decay Analysis {'(NORMALIZED)' if self.is_normalized else '(RAW)'}:")
-        print(f"   Peak at t = {peak_time:.6f} s (sample {peak_idx}/{len(current_signal)})")
-        print(f"   Peak amplitude: {peak_amp:.6f} V  ({peak_amp*1e6:.1f} µV)")
 
-        # Recupera noise_rms dalla cache del detector (per truncation B e display)
-        _cached_noise_rms = None
-        if self.parent and hasattr(self.parent, 'data_manager'):
-            _cached_noise_rms = getattr(self.parent.data_manager, '_cached_noise_rms', None)
+        print(f"\n🔍 Decay Analysis v5 ({'NORMALIZED' if self.is_normalized else 'RAW'}):")
+        print(f"   Peak at t = {peak_time:.6f} s (sample {peak_idx})")
+        print(f"   Peak amplitude: {peak_amp*1e6:.2f} µV")
 
-        # Pre-calcola envelope del frame successivo (evita che check_decay lo ricalcoli)
-        next_frame_envelope = None
-        if next_frame_signal is not None:
-            try:
-                next_frame_envelope = compute_hilbert_envelope(next_frame_signal)
-            except Exception:
-                next_frame_envelope = None
+        # ── Retrieve per-frame noise estimates ────────────────────────────────
+        dm = self.parent.data_manager if (self.parent and hasattr(self.parent, 'data_manager')) else None
+        fi = self.frame_index if self.frame_index is not None else 0
 
-        decay_results = check_decay(self.envelope_data, peak_idx,
-                                    next_frame_envelope=next_frame_envelope,
-                                    noise_rms=_cached_noise_rms)
-
-        # ── v4.0: Evaluate all criteria (mirrors the detector pipeline) ──────
-        # Default thresholds (shown in UI — user can run detector to change them)
-        V4_MAX_PRE_SNR   = 1.7
-        V4_MIN_DECAY_RATIO = 2.0
-        V4_MAX_ASYM      = 2.5
-        V4_MIN_PEAK_IFFT = 130e-6   # 130 µV in V
-        V4_TAU_MIN       = 0.045    # ms
-        V4_TAU_MAX       = 1.3      # ms
-        V4_MIN_R2        = 0.45
-
-        E_W1 = decay_results.get('E_W1', 0)
-        E_W4 = decay_results.get('E_W4', 0)
-        r2_log  = decay_results['r_squared_log']
-        tau_ms  = decay_results['tau_ms']
-        decay_ratio = E_W1 / E_W4 if E_W4 > 0 else 0
-
-        # peak iFFT
-        peak_pass = (peak_amp > V4_MIN_PEAK_IFFT)
-
-        # C2: pre_snr (only if normalized and noise available)
-        if self.is_normalized and _cached_noise_rms and _cached_noise_rms > 0:
-            GUARD = 20
-            pre_end = max(0, peak_idx - GUARD)
-            if pre_end >= 50:
-                pre_window = current_signal[:pre_end]
-            else:
-                pre_window = np.array([_cached_noise_rms])
-            rms_pre  = float(np.sqrt(np.mean(pre_window ** 2)))
-            pre_snr  = rms_pre / _cached_noise_rms
-            c2_pass  = (pre_snr < V4_MAX_PRE_SNR)
-            pre_snr_str = f"{pre_snr:.2f}"
+        if dm is not None and fi < len(dm.noise_floor_arr):
+            noise_floor = float(dm.noise_floor_arr[fi])
+            std_noise   = float(dm.std_noise_arr[fi])
         else:
-            pre_snr = None
-            c2_pass = None
-            pre_snr_str = "N/A (run detector to cache noise RMS)"
+            noise_floor = 0.0
+            std_noise   = 0.0
 
-        # C3: global decay
-        c3_pass = (E_W1 > E_W4 * V4_MIN_DECAY_RATIO)
-
-        # asym
-        LEVEL_FRACTION = 0.10
-        FALL_SEARCH    = 40
-        level = peak_amp * LEVEL_FRACTION
-        envelope = self.envelope_data
-        rise_start = peak_idx
-        for i in range(peak_idx - 1, -1, -1):
-            if envelope[i] < level:
-                rise_start = i + 1
-                break
-        rise_s = max(1, peak_idx - rise_start)
-        fall_end_idx = min(peak_idx + FALL_SEARCH, len(envelope))
-        fall_s = FALL_SEARCH
-        for i in range(peak_idx + 1, fall_end_idx):
-            if envelope[i] < level:
-                fall_s = i - peak_idx
-                break
-        asym_ratio = rise_s / fall_s if fall_s > 0 else 1.0
-        asym_pass  = (asym_ratio < V4_MAX_ASYM)
-
-        # tau
-        if tau_ms > 0:
-            tau_pass = (V4_TAU_MIN <= tau_ms <= V4_TAU_MAX)
-            tau_str  = f"{tau_ms:.3f} ms"
+        # ── Build FFT feature inputs ──────────────────────────────────────────
+        if dm is not None and fi < len(dm.fft_data):
+            raw_mags  = np.asarray(dm.fft_data[fi], dtype=np.float64)
+            freq_axis = np.array(dm.frequency_axis)
+            # Pad raw analysis-band magnitudes into full half-spectrum
+            fft_size_full = V5_FFT_SIZE
+            full_freq  = np.arange(fft_size_full // 2) * (V5_FS / fft_size_full)
+            full_mags  = np.zeros(fft_size_full // 2, dtype=np.float64)
+            n_b = min(len(raw_mags), V5_BIN_END - V5_BIN_START + 1)
+            full_mags[V5_BIN_START : V5_BIN_START + n_b] = raw_mags[:n_b]
+            fft_norm_full = _normalize_fft(full_mags, full_freq)
         else:
-            tau_pass = False
-            tau_str  = "N/A → ❌ FAIL"
+            full_freq     = np.zeros(V5_FFT_SIZE // 2)
+            fft_norm_full = np.zeros(V5_FFT_SIZE // 2)
 
-        # R²
-        r2_pass = (r2_log > V4_MIN_R2)
+        # ── Fetch adjacent frame envelopes for pre/post SNR ───────────────────
+        prev_env = None; prev_sig = None
+        next_env = None
 
-        # Overall — normalized only: all criteria matter
-        # For RAW mode: show criteria but note that scan uses normalized
-        if self.is_normalized:
-            all_pass = peak_pass and (c2_pass is not False) and c3_pass and asym_pass and tau_pass and r2_pass
-        else:
-            all_pass = None   # Can't evaluate: scan is normalized-only
+        if dm is not None and fi > 0:
+            prev_frame = reconstruct_frame_v5(
+                np.asarray(dm.fft_data[fi - 1], dtype=np.float64),
+                dm.phase_data[fi - 1] if fi - 1 < len(dm.phase_data) else np.array([], dtype=np.int8),
+                normalize=self.is_normalized
+            )
+            if prev_frame:
+                prev_sig = prev_frame['signal']
+                prev_env = compute_hilbert_envelope(prev_sig)
 
-        if all_pass is True:
-            verdict = "✅ WOULD PASS SCAN (all iFFT criteria met)"
-            color = "green"
-        elif all_pass is False:
-            failed = []
-            if not peak_pass:
-                failed.append(f"peak={peak_amp*1e6:.0f}µV<130µV")
-            if c2_pass is False:
-                failed.append(f"pre_snr={pre_snr:.2f}≥{V4_MAX_PRE_SNR}")
-            if not c3_pass:
-                failed.append(f"E_W1/E_W4={decay_ratio:.2f}<{V4_MIN_DECAY_RATIO}")
-            if not asym_pass:
-                failed.append(f"asym={asym_ratio:.2f}≥{V4_MAX_ASYM}")
-            if not tau_pass:
-                failed.append(f"τ={tau_str}")
-            if not r2_pass:
-                failed.append(f"R²={r2_log:.3f}<{V4_MIN_R2}")
-            verdict = "❌ WOULD FAIL SCAN: " + ", ".join(failed)
-            color = "red"
-        else:
-            verdict = "⚠️ RAW mode — Scan uses normalized iFFT only. Run in normalized mode for scan prediction."
-            color = "orange"
+        if dm is not None and fi + 1 < dm.total_frames:
+            next_frame = reconstruct_frame_v5(
+                np.asarray(dm.fft_data[fi + 1], dtype=np.float64),
+                dm.phase_data[fi + 1] if fi + 1 < len(dm.phase_data) else np.array([], dtype=np.int8),
+                normalize=self.is_normalized
+            )
+            if next_frame:
+                next_env = compute_hilbert_envelope(next_frame['signal'])
 
-        print(f"\n🎯 v4.0 Scan prediction (normalized): {verdict}")
-        
-        # Mostra popup con risultati (CUSTOM DIALOG per temi corretti)
-        self._show_decay_results_dialog(
-            frame_index=self.frame_index,
-            is_normalized=self.is_normalized,
-            peak_time=peak_time,
-            peak_idx=peak_idx,
-            peak_amp=peak_amp,
-            decay_results=decay_results,
-            verdict=verdict,
-            verdict_color=color
+        # ── Compute all 17 features ───────────────────────────────────────────
+        features = compute_features_v5(
+            signal              = current_signal,
+            envelope            = self.envelope_data,
+            fft_norm            = fft_norm_full,
+            freq_axis           = full_freq,
+            noise_floor         = noise_floor,
+            std_noise           = std_noise,
+            peak_idx            = peak_idx,
+            next_frame_envelope = next_env,
+            prev_frame_envelope = prev_env,
+            prev_frame_signal   = prev_sig,
         )
 
-        # ✅ SALVA RISULTATI per il toggle del fit curve
-        self._last_decay_peak_idx = peak_idx
-        self._last_decay_results  = decay_results
+        print(f"   τ = {features['tau_ms']:.4f} ms   R² = {features['R2']:.4f}")
 
-        # ✅ Abilita il pulsante fit curve e (se era già visibile) aggiorna l'overlay
+        self._show_decay_results_dialog(
+            frame_index = fi,
+            peak_time   = peak_time,
+            peak_idx    = peak_idx,
+            peak_amp    = peak_amp,
+            noise_floor = noise_floor,
+            std_noise   = std_noise,
+            features    = features,
+        )
+
+        # Save fit results for the Show Fit overlay
+        self._last_decay_peak_idx  = peak_idx
+        self._last_v5_features     = features
+        self._last_noise_floor     = noise_floor
+        self._last_std_noise       = std_noise
+        self._last_next_env        = next_env
+
         self.fit_curve_button.setEnabled(True)
         if self.show_fit_curve:
-            # L'utente aveva già il fit visibile: aggiorna automaticamente
-            self._overlay_fit_curve(peak_idx, decay_results)
+            self._overlay_fit_curve(peak_idx, features, noise_floor, std_noise, next_env)
         else:
-            # Prima analisi o fit nascosto: rimuovi eventuali overlay vecchi
             self._remove_fit_overlay()
             self.fit_curve_button.setText("Show Fit Curve")
-    
+
     def toggle_fit_curve(self):
         """Toggle: mostra o nasconde la curva esponenziale del fit sul grafico."""
-        if self._last_decay_results is None or self._last_decay_peak_idx is None:
-            return  # Nessun fit disponibile (non dovrebbe succedere, pulsante è disabilitato)
+        if not hasattr(self, '_last_v5_features') or self._last_v5_features is None:
+            return
 
         self.show_fit_curve = not self.show_fit_curve
 
         if self.show_fit_curve:
-            self._overlay_fit_curve(self._last_decay_peak_idx, self._last_decay_results)
+            self._overlay_fit_curve(
+                self._last_decay_peak_idx,
+                self._last_v5_features,
+                getattr(self, '_last_noise_floor', 0.0),
+                getattr(self, '_last_std_noise',   0.0),
+                getattr(self, '_last_next_env',    None),
+            )
             self.fit_curve_button.setText("Hide Fit Curve")
         else:
             self._remove_fit_overlay()
             self.fit_curve_button.setText("Show Fit Curve")
 
     def _remove_fit_overlay(self):
-        """Rimuove tutti gli elementi grafici del fit overlay dal plot."""
-        for attr in ('_fit_curve_item', '_fit_region_item', '_peak_fit_line'):
+        """Remove all fit overlay graphics from the iFFT plot."""
+        for attr in ('_fit_curve_item', '_fit_region_item', '_peak_fit_line',
+                     '_noise_floor_line', '_noise_std_line'):
             item = getattr(self, attr, None)
             if item is not None:
                 try:
@@ -808,403 +706,235 @@ class IFFTWindow(QDialog):
                     pass
                 setattr(self, attr, None)
 
-    def _overlay_fit_curve(self, peak_idx: int, decay_results: dict):
+    def _overlay_fit_curve(self, peak_idx: int, features: dict,
+                           noise_floor: float, std_noise: float,
+                           next_frame_envelope=None):
         """
-        Sovrappone la curva esponenziale del fit log-lineare sul grafico iFFT.
+        Overlay the v5 exponential fit and noise reference lines on the iFFT plot.
 
-        Disegna due elementi:
-          1. Curva esponenziale A·exp(-t/τ) — dal campione (peak + skip) fino
-             all'ultimo campione usato nel fit (dopo truncation).
-          2. Linea verticale tratteggiata al picco.
-
-        La curva è disegnata in verde se il fit è buono (slope < 0),
-        in arancione se slope ≥ 0 (invalido/crescente).
+        Drawn elements:
+          1. Exponential fit curve  A₀·exp(-t/τ)  over [decay_start → decay_end].
+             Green / orange / red depending on R².
+          2. Vertical dashed line at the peak.
+          3. Horizontal dashed line at noise_floor.
+          4. Horizontal dotted line at noise_floor + std_noise  (LEVEL).
         """
-        # ── Rimuovi overlay precedenti ────────────────────────────────────────
         self._remove_fit_overlay()
 
-        slope    = decay_results.get('slope_log', 0.0)
-        tau_ms   = decay_results.get('tau_ms', -1.0)
-        r2       = decay_results.get('r_squared_log', 0.0)
-        fit_skip = decay_results.get('fit_skip', 5)
-        n_fit    = decay_results.get('n_fit_samples', 0)
-
-        # Guard: fit non valido
-        if slope >= 0 or n_fit < 5 or len(self.time_data) == 0:
+        if len(self.time_data) == 0 or self.envelope_data is None:
             return
 
-        fs = 200000  # Hz
-        dt = 1.0 / fs
+        tau_ms  = features.get('tau_ms',  -1.0)
+        R2      = features.get('R2',       0.0)
 
-        # ── Campioni dove il fit è stato eseguito ─────────────────────────────
-        fit_start_idx = peak_idx + fit_skip           # Primo campione del fit
-        fit_end_idx   = fit_start_idx + n_fit         # Ultimo campione (esclusivo)
-        fit_end_idx   = min(fit_end_idx, len(self.time_data))
-
-        if fit_start_idx >= len(self.time_data):
-            return
-
-        # ── Ricostruisci la curva A·exp(slope·n) ─────────────────────────────
-        # Il fit è stato fatto su: log(env[n]) = intercept + slope·n
-        # Recuperiamo l'intercetta dalla envelope al primo campione del fit.
-        # Usiamo l'envelope reale come ampiezza iniziale (più preciso che
-        # usare il valore estrapolato dal fit).
-        if self.envelope_data is not None and fit_start_idx < len(self.envelope_data):
-            A0 = float(self.envelope_data[fit_start_idx])
-        else:
-            # Fallback: stima da peak_amp e skip
-            current_signal = self.signal_data_normalized if self.is_normalized else self.signal_data_raw
-            _, peak_amp = find_peak(current_signal)
-            A0 = peak_amp * np.exp(slope * fit_skip)
-
-        n_curve = fit_end_idx - fit_start_idx
-        n_array = np.arange(n_curve, dtype=float)
-        fit_envelope = A0 * np.exp(slope * n_array)
-
-        # Asse temporale della curva
-        fit_time = self.time_data[fit_start_idx:fit_end_idx]
-        if len(fit_time) != len(fit_envelope):
-            fit_time = fit_time[:len(fit_envelope)]
-            fit_envelope = fit_envelope[:len(fit_time)]
-
-        # ── Colore: verde (buon fit), arancione (R² basso) ───────────────────
-        if r2 >= 0.70:
-            fit_color = '#00E676'   # verde brillante
-        elif r2 >= 0.50:
-            fit_color = '#FFA726'   # arancione
-        else:
-            fit_color = '#EF5350'   # rosso (fit scarso)
-
-        # ── Disegna la curva del fit (linea continua) ────────────────────────
-        self._fit_curve_item = self.plot_widget.plot_widget.plot(
-            fit_time, fit_envelope,
-            pen={'color': fit_color, 'width': 2.5, 'style': QtCore.Qt.DashLine},
-            name=f'Fit exp (τ={tau_ms:.3f} ms, R²={r2:.3f})'
-        )
-
-        # ── Regione grigia: zona saltata post-picco (skip) ───────────────────
-        from pyqtgraph import LinearRegionItem
-        skip_start_time = self.time_data[peak_idx]
-        skip_end_time   = self.time_data[min(fit_start_idx, len(self.time_data) - 1)]
-        if skip_end_time > skip_start_time:
-            self._fit_region_item = LinearRegionItem(
-                values=[skip_start_time, skip_end_time],
-                orientation='vertical',
-                brush=(180, 180, 180, 40),   # grigio semitrasparente
-                movable=False
+        # Guard: no valid decay
+        if tau_ms <= 0:
+            #show only noise floor and level lines without fit curve
+            fit_color = '#EF5350'  # Red for invalid fit
+            self._noise_floor_line = self.plot_widget.plot_widget.addLine(
+                y=noise_floor,
+                pen={'color': '#80DEEA', 'width': 1.2, 'style': QtCore.Qt.DashLine},
+                label=f' noise_floor  {noise_floor*1e6:.2f} µV',
+                labelOpts={'position': 0.05, 'color': '#80DEEA'},
             )
-            self._fit_region_item.setZValue(-10)
-            self.plot_widget.plot_widget.addItem(self._fit_region_item)
+            level = noise_floor + std_noise
+            self._noise_std_line = self.plot_widget.plot_widget.addLine(
+                y=level,
+                pen={'color': '#CE93D8', 'width': 1.2, 'style': QtCore.Qt.DotLine},
+                label=f' noise+σ  {level*1e6:.2f} µV',
+                labelOpts={'position': 0.05, 'color': '#CE93D8'},
+            )   
+            return
 
-        # ── Linea verticale al picco ──────────────────────────────────────────
-        peak_time_val = self.time_data[peak_idx]
-        self._peak_fit_line = self.plot_widget.plot_widget.addLine(
-            x=peak_time_val,
-            pen={'color': '#FFD600', 'width': 1.5, 'style': QtCore.Qt.DotLine},
-            label=f'peak'
+        # Recompute decay window from the envelope to get decay_start/decay_end
+        window = find_decay_window_v5(
+            self.envelope_data, peak_idx, noise_floor, std_noise, next_frame_envelope
+        )
+        decay_start = window['decay_start']
+        decay_end   = min(window['decay_end'], len(self.time_data) - 1)
+
+        if decay_start >= decay_end:
+            return
+
+        # ── Reconstruct the exponential curve A₀·exp(-t/τ) ───────────────────
+        fs = V5_FS
+        A0 = float(self.envelope_data[decay_start]) if decay_start < len(self.envelope_data) else 0.0
+        tau_s = tau_ms / 1000.0
+        n_pts = decay_end - decay_start
+        t_arr = np.arange(n_pts) / fs
+        fit_env = A0 * np.exp(-t_arr / tau_s)
+        fit_time = self.time_data[decay_start : decay_start + n_pts]
+        if len(fit_time) != len(fit_env):
+            min_len = min(len(fit_time), len(fit_env))
+            fit_time = fit_time[:min_len]; fit_env = fit_env[:min_len]
+
+        # ── Colour by R² quality ──────────────────────────────────────────────
+        fit_color = '#00E676' if R2 >= 0.70 else ('#FFA726' if R2 >= 0.45 else '#EF5350')
+
+        self._fit_curve_item = self.plot_widget.plot_widget.plot(
+            fit_time, fit_env,
+            pen={'color': fit_color, 'width': 2.5, 'style': QtCore.Qt.DashLine},
+            name=f'Fit  τ={tau_ms:.3f} ms  R²={R2:.3f}'
         )
 
-        print(f"✅ Fit overlay: τ={tau_ms:.3f} ms, R²={r2:.3f}, "
-              f"{n_curve} samples [{fit_start_idx}→{fit_end_idx}]")
+        # ── Vertical line at peak ─────────────────────────────────────────────
+        self._peak_fit_line = self.plot_widget.plot_widget.addLine(
+            x=self.time_data[peak_idx],
+            pen={'color': '#FFD600', 'width': 1.5, 'style': QtCore.Qt.DotLine},
+        )
 
-    def _compute_ifft_for_frame(self, frame_index, normalized=False):
+        # ── Horizontal line: noise_floor ──────────────────────────────────────
+        self._noise_floor_line = self.plot_widget.plot_widget.addLine(
+            y=noise_floor,
+            pen={'color': '#80DEEA', 'width': 1.2, 'style': QtCore.Qt.DashLine},
+            label=f'noise_floor  {noise_floor*1e6:.2f} µV',
+            labelOpts={'position': 0.05, 'color': '#80DEEA'},
+        )
+
+        # ── Horizontal line: noise_floor + std_noise  (LEVEL) ─────────────────
+        level = noise_floor + std_noise
+        self._noise_std_line = self.plot_widget.plot_widget.addLine(
+            y=level,
+            pen={'color': '#CE93D8', 'width': 1.2, 'style': QtCore.Qt.DotLine},
+            label=f'noise+σ  {level*1e6:.2f} µV',
+            labelOpts={'position': 0.05, 'color': '#CE93D8'},
+        )
+
+        print(f"✅ Fit overlay v5: τ={tau_ms:.3f} ms  R²={R2:.3f}  "
+              f"noise={noise_floor*1e6:.3f} µV  level={level*1e6:.3f} µV")
+
+
+    def _show_decay_results_dialog(self, frame_index, peak_time, peak_idx,
+                                   peak_amp, noise_floor, std_noise, features):
         """
-        Calcola iFFT per un frame specifico (helper per gestione spill).
-        
-        Parameters:
-        -----------
-        frame_index : int
-            Indice del frame da processare
-        normalized : bool
-            Se True, applica correzione 50% microfono
-        
-        Returns:
-        --------
-        np.ndarray : Segnale time-domain (512 samples)
+        Display all 17 v5 features for this frame in a scrollable dialog.
+
+        Shows computed value alongside a physically motivated expected range in
+        parentheses (guidance for the SVM, not hard thresholds).
         """
-        if not self.parent or not hasattr(self.parent, 'data_manager'):
-            return None
-        
-        dm = self.parent.data_manager
-        
-        if frame_index >= len(dm.fft_data):
-            return None
-        
-        # Recupera dati
-        fft_magnitudes = dm.fft_data[frame_index]
-        freq_axis = dm.frequency_axis
-        
-        # Parametri FFT
-        fs = dm.header_info.get('fs', 200000)
-        fft_size = dm.header_info.get('fft_size', 512)
-        num_bins_full = fft_size // 2
-        
-        bin_freq = fs / fft_size
-        bin_start = int(20000 / bin_freq)
-        bin_end = int(80000 / bin_freq)
-        
-        # Inizializza spettro completo
-        full_spectrum_mag = np.zeros(num_bins_full, dtype=np.float32)
-        full_spectrum_phase = np.zeros(num_bins_full, dtype=np.int8)
-        
-        # Se normalizzato, applica correzione
-        if normalized:
-            datasheet_freq_khz = np.array([20, 25, 30, 40, 50, 60, 70, 80])
-            datasheet_response_db = np.array([8.0, 10.5, 6.0, -2.0, -6.0, -7.0, -6.0, -4.0])
-            datasheet_freq_hz = datasheet_freq_khz * 1000
-            
-            valid_mask = (freq_axis >= 20000) & (freq_axis <= 80000)
-            freq_range = freq_axis[valid_mask]
-            
-            mic_response_db = np.interp(freq_range, datasheet_freq_hz, datasheet_response_db)
-            correction_gain_50 = 10 ** (-mic_response_db * 0.5 / 20.0)
-            
-            fft_corrected = fft_magnitudes[valid_mask] * correction_gain_50
-        else:
-            valid_mask = (freq_axis >= 20000) & (freq_axis <= 80000)
-            fft_corrected = fft_magnitudes[valid_mask]
-        
-        # Inserisci magnitude SENZA windowing (sarà applicata dopo)
-        actual_bins = min(len(fft_corrected), bin_end - bin_start + 1)
-        full_spectrum_mag[bin_start:bin_start + actual_bins] = fft_corrected[:actual_bins]
-        
-        # Inserisci fasi (se disponibili)
-        if len(dm.phase_data) > frame_index:
-            phase_data = dm.phase_data[frame_index]
-            actual_phase_bins = min(len(phase_data), actual_bins)
-            full_spectrum_phase[bin_start:bin_start + actual_phase_bins] = phase_data[:actual_phase_bins]
-        
-        # Converti fasi e crea spettro complesso
-        fft_phases_rad = (full_spectrum_phase / 127.0) * np.pi
-        complex_spectrum = full_spectrum_mag * np.exp(1j * fft_phases_rad)
-        
-        # ✅ APPLICA TUKEY WINDOW ALLO SPETTRO COMPLESSO (FIX GIBBS CORRETTO)
-        taper_bins = max(5, actual_bins // 10)
-        window_full = np.ones(num_bins_full)
-        
-        # Left taper (cosine fade-in)
-        for i in range(taper_bins):
-            alpha = i / taper_bins
-            window_full[bin_start + i] = 0.5 * (1 - np.cos(np.pi * alpha))
-        
-        # Right taper (cosine fade-out)
-        for i in range(taper_bins):
-            alpha = i / taper_bins
-            window_full[bin_start + actual_bins - i - 1] = 0.5 * (1 - np.cos(np.pi * alpha))
-        
-        # Applica window allo spettro complesso
-        complex_spectrum = complex_spectrum * window_full
-        
-        # iFFT
-        try:
-            time_domain_signal = np.fft.irfft(complex_spectrum, n=fft_size)
-            time_domain_signal = suppress_edge_artifacts(time_domain_signal)
-            return time_domain_signal
-        except Exception as e:
-            print(f"   ❌ iFFT error for frame {frame_index}: {e}")
-            return None
-    
-    def _show_decay_results_dialog(self, frame_index, is_normalized, peak_time, peak_idx,
-                                   peak_amp, decay_results, verdict, verdict_color):
-        """Mostra dialog con risultati decay analysis v4.0 (tema-aware)."""
-        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QTextEdit, QPushButton, QHBoxLayout
-        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTextEdit,
+                                       QPushButton, QHBoxLayout)
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("Decay Analysis Results  v4.0")
-        dialog.setMinimumSize(680, 820)
+        dialog.setWindowTitle(f"Decay Analysis — Frame {frame_index}  (v5)")
+        dialog.setMinimumSize(700, 780)
 
         layout = QVBoxLayout(dialog)
 
-        title_label = QLabel(f"<b style='font-size:16pt;'>Frame {frame_index if frame_index is not None else '?'}</b>")
-        title_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(title_label)
+        title = QLabel(f"<b style='font-size:16pt;'>Frame {frame_index}</b>")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
 
-        mode_label = QLabel(f"<i>{'50% Normalized iFFT' if is_normalized else 'Raw iFFT (no correction) — Scan uses normalized only'}</i>")
-        mode_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(mode_label)
+        mode = QLabel(f"<i>{'50 % Normalized iFFT' if self.is_normalized else 'Raw iFFT'}</i>")
+        mode.setAlignment(Qt.AlignCenter)
+        layout.addWidget(mode)
 
-        text_widget = QTextEdit()
-        text_widget.setReadOnly(True)
+        text = QTextEdit()
+        text.setReadOnly(True)
 
-        # ── retrieve cached values ──────────────────────────────────────────
-        if self.parent and hasattr(self.parent, 'data_manager'):
-            noise_rms = getattr(self.parent.data_manager, '_cached_noise_rms', None)
-        else:
-            noise_rms = None
+        nf_uv  = noise_floor * 1e6
+        std_uv = std_noise   * 1e6
+        f = features   # shorthand
 
-        current_signal = self.signal_data_normalized if self.is_normalized else self.signal_data_raw
-
-        # ── v4.0 thresholds ─────────────────────────────────────────────────
-        V4_MAX_PRE_SNR    = 1.7
-        V4_MIN_DECAY_RATIO = 2.0
-        V4_MAX_ASYM       = 2.5
-        V4_MIN_PEAK_IFFT  = 130e-6   # 130 µV
-        V4_TAU_MIN        = 0.045
-        V4_TAU_MAX        = 1.3
-        V4_MIN_R2         = 0.45
-
-        E_W1 = decay_results.get('E_W1', 0)
-        E_W4 = decay_results.get('E_W4', 0)
-        decay_ratio_v = E_W1 / E_W4 if E_W4 > 1e-15 else 999.0
-        tau_ms = decay_results.get('tau_ms', -1.0)
-        r2_log = decay_results.get('r_squared_log', 0.0)
-
-        # ── iFFT peak ───────────────────────────────────────────────────────
-        peak_pass = (peak_amp > V4_MIN_PEAK_IFFT)
-        peak_pass_str = f"✅ PASS ({peak_amp*1e6:.1f} µV > 130 µV)" if peak_pass else f"❌ FAIL ({peak_amp*1e6:.1f} µV ≤ 130 µV)"
-
-        # ── C2: pre_snr ─────────────────────────────────────────────────────
-        if noise_rms and noise_rms > 0:
-            GUARD = 20
-            pre_end = max(0, peak_idx - GUARD)
-            pre_window = current_signal[:pre_end] if pre_end >= 50 else np.array([noise_rms])
-            rms_pre   = float(np.sqrt(np.mean(pre_window ** 2)))
-            pre_snr_v = rms_pre / noise_rms
-            c2_pass   = (pre_snr_v < V4_MAX_PRE_SNR)
-            c2_str    = f"{'✅' if c2_pass else '❌'} {pre_snr_v:.2f}  (threshold < {V4_MAX_PRE_SNR})"
-            pre_src   = f"{len(pre_window)} samples"
-        else:
-            pre_snr_v = None
-            c2_pass   = None
-            c2_str    = "⚠️ N/A — run detector first to cache noise RMS"
-            rms_pre   = None
-            pre_src   = "N/A"
-
-        # ── C3: global decay ────────────────────────────────────────────────
-        c3_pass = (E_W1 > E_W4 * V4_MIN_DECAY_RATIO)
-        c3_str  = f"{'✅' if c3_pass else '❌'} {decay_ratio_v:.2f}×  (need > {V4_MIN_DECAY_RATIO}×)"
-
-        # ── asym ────────────────────────────────────────────────────────────
-        LEVEL_FRACTION = 0.10
-        FALL_SEARCH    = 40
-        level = peak_amp * LEVEL_FRACTION
-        env   = self.envelope_data
-        rise_start = peak_idx
-        for i in range(peak_idx - 1, -1, -1):
-            if env[i] < level:
-                rise_start = i + 1
-                break
-        rise_s = max(1, peak_idx - rise_start)
-        fall_end_idx = min(peak_idx + FALL_SEARCH, len(env))
-        fall_s = FALL_SEARCH
-        for i in range(peak_idx + 1, fall_end_idx):
-            if env[i] < level:
-                fall_s = i - peak_idx
-                break
-        asym_ratio = rise_s / fall_s if fall_s > 0 else 1.0
-        asym_pass  = (asym_ratio < V4_MAX_ASYM)
-        asym_str   = f"{'✅' if asym_pass else '❌'} {asym_ratio:.3f}  (rise={rise_s} fall={fall_s} samp, need < {V4_MAX_ASYM})"
-
-        # ── tau ─────────────────────────────────────────────────────────────
-        if tau_ms > 0:
-            tau_pass = (V4_TAU_MIN <= tau_ms <= V4_TAU_MAX)
-            tau_str  = f"{'✅' if tau_pass else '❌'} {tau_ms:.3f} ms  (need [{V4_TAU_MIN}–{V4_TAU_MAX}] ms)"
-        else:
-            tau_pass = False
-            tau_str  = f"❌ N/A (slope ≥ 0 → no valid decay)"
-
-        # ── R² ──────────────────────────────────────────────────────────────
-        r2_pass = (r2_log > V4_MIN_R2)
-        r2_str  = f"{'✅' if r2_pass else '❌'} {r2_log:.4f}  (need > {V4_MIN_R2})"
-
-        # ── normalized flag ─────────────────────────────────────────────────
-        norm_note = "" if is_normalized else "<br><i style='color:orange;'>⚠️ Using RAW iFFT — Scan evaluates normalized only. Switch to normalized for accurate prediction.</i>"
+        def fmt(v, unit='', decimals=4):
+            if v is None: return 'N/A'
+            return f"{v:.{decimals}f}{unit}"
 
         html = f"""
-<div style='font-family: monospace; font-size: 11pt; line-height: 1.6;'>
+<div style='font-family:monospace; font-size:10.5pt; line-height:1.65;'>
 
-<!-- PEAK -->
-<p><b style='font-size:13pt; text-decoration:underline;'>Peak Information</b>{norm_note}</p>
-<table style='margin-left:20px; border-collapse:collapse;'>
-<tr><td style='padding:4px; width:200px;'>Time in frame:</td>
-    <td><b>{peak_time:.6f} s</b>  (sample {peak_idx}/{len(current_signal)})</td></tr>
-<tr><td style='padding:4px;'>Amplitude (envelope):</td>
-    <td><b>{peak_amp*1e6:.2f} µV</b>  =  {peak_amp*1000:.5f} mV</td></tr>
-<tr><td style='padding:4px;'>Noise RMS (cached):</td>
-    <td>{f"{noise_rms*1000:.4f} mV" if noise_rms else "not available – run detector first"}</td></tr>
+<p><b style='font-size:12pt; text-decoration:underline;'>Frame metadata</b></p>
+<table style='margin-left:16px; border-collapse:collapse;'>
+  <tr><td style='width:220px;padding:3px;'>Peak time in frame:</td>
+      <td><b>{peak_time:.6f} s</b>  (sample {peak_idx}/512)</td></tr>
+  <tr><td style='padding:3px;'>Peak amplitude:</td>
+      <td><b>{peak_amp*1e6:.2f} µV</b></td></tr>
+  <tr><td style='padding:3px;'>Noise floor (adaptive):</td>
+      <td>{nf_uv:.3f} µV</td></tr>
+  <tr><td style='padding:3px;'>Noise std (adaptive):</td>
+      <td>{std_uv:.3f} µV</td></tr>
 </table>
 
-<!-- V4.0 CRITERIA -->
-<p style='margin-top:14px;'><b style='font-size:13pt; text-decoration:underline;'>v4.0 Scan Criteria  (normalized iFFT)</b></p>
-<table style='margin-left:20px; border-collapse:collapse; width:96%;'>
+<p style='margin-top:12px;'><b style='font-size:12pt; text-decoration:underline;'>
+  v5 Feature Vector  <span style='font-size:9pt;font-weight:normal;'>(expected ranges are guidance — SVM decides)</span>
+</b></p>
+
+<table style='margin-left:16px; border-collapse:collapse; width:95%;'>
 <tr style='background-color:rgba(100,100,255,0.12);'>
-    <th style='padding:6px; text-align:left;'>Criterion</th>
-    <th style='padding:6px; text-align:left;'>Result</th>
+  <th style='padding:5px;text-align:left;width:50%;'>Feature</th>
+  <th style='padding:5px;text-align:left;'>Value</th>
+  <th style='padding:5px;text-align:left;'>Expected (genuine click)</th>
 </tr>
-<tr>
-    <td style='padding:5px;'><b>Peak iFFT norm &gt; 130 µV</b></td>
-    <td style='padding:5px;'>{peak_pass_str}</td>
-</tr>
-<tr style='background-color:rgba(128,128,128,0.08);'>
-    <td style='padding:5px;'><b>C2: pre_snr &lt; {V4_MAX_PRE_SNR}</b></td>
-    <td style='padding:5px;'>{c2_str}</td>
-</tr>
-<tr>
-    <td style='padding:5px;'><b>C3: E_W1 &gt; {V4_MIN_DECAY_RATIO}× E_W4</b></td>
-    <td style='padding:5px;'>{c3_str}</td>
-</tr>
-<tr style='background-color:rgba(128,128,128,0.08);'>
-    <td style='padding:5px;'><b>asym (rise/fall) &lt; {V4_MAX_ASYM}</b></td>
-    <td style='padding:5px;'>{asym_str}</td>
-</tr>
-<tr>
-    <td style='padding:5px;'><b>τ ∈ [{V4_TAU_MIN}, {V4_TAU_MAX}] ms</b></td>
-    <td style='padding:5px;'>{tau_str}</td>
-</tr>
-<tr style='background-color:rgba(128,128,128,0.08);'>
-    <td style='padding:5px;'><b>R² &gt; {V4_MIN_R2}</b></td>
-    <td style='padding:5px;'>{r2_str}</td>
-</tr>
+
+<tr><td style='padding:4px;'><b>1. peak_SNR</b></td>
+    <td>{fmt(f['peak_SNR'],decimals=1)}</td>
+    <td><i>≫ 1  (typically 10–1000+)</i></td></tr>
+<tr style='background-color:rgba(128,128,128,0.07);'>
+    <td style='padding:4px;'><b>2. pre_SNR</b></td>
+    <td>{fmt(f['pre_SNR'],decimals=3)}</td>
+    <td><i>≈ 1.0  (silence before click)</i></td></tr>
+<tr><td style='padding:4px;'><b>3. post_SNR</b></td>
+    <td>{fmt(f['post_SNR'],decimals=3)}</td>
+    <td><i>≈ 1.0  (return to silence)</i></td></tr>
+<tr style='background-color:rgba(128,128,128,0.07);'>
+    <td style='padding:4px;'><b>4. rise_time_ms</b></td>
+    <td>{fmt(f['rise_time_ms'],' ms',4)}</td>
+    <td><i>0.025 – 0.3 ms</i></td></tr>
+<tr><td style='padding:4px;'><b>5. fall_time_ms</b></td>
+    <td>{fmt(f['fall_time_ms'],' ms',4)}</td>
+    <td><i>&gt; rise_time  (decay slower than rise)</i></td></tr>
+<tr style='background-color:rgba(128,128,128,0.07);'>
+    <td style='padding:4px;'><b>6. asymmetry_integral</b></td>
+    <td>{fmt(f['asymmetry_integral'],decimals=4)}</td>
+    <td><i>positive  (decay &gt; rise)</i></td></tr>
+<tr><td style='padding:4px;'><b>7. ZCR_pre</b></td>
+    <td>{fmt(f['ZCR_pre'],' crossings/ms',2)}</td>
+    <td><i>low  (silence before click)</i></td></tr>
+<tr style='background-color:rgba(128,128,128,0.07);'>
+    <td style='padding:4px;'><b>8. ZCR_click</b></td>
+    <td>{fmt(f['ZCR_click'],' crossings/ms',2)}</td>
+    <td><i>oscillation rate during click</i></td></tr>
+<tr><td style='padding:4px;'><b>9. ZCR_post</b></td>
+    <td>{fmt(f['ZCR_post'],' crossings/ms',2)}</td>
+    <td><i>decreasing during decay</i></td></tr>
+<tr style='background-color:rgba(128,128,128,0.07);'>
+    <td style='padding:4px;'><b>10. kurtosis</b></td>
+    <td>{fmt(f['kurtosis'],decimals=2)}</td>
+    <td><i>15 – 50  (impulsive event)</i></td></tr>
+<tr><td style='padding:4px;'><b>11. centroid_shift_hz</b></td>
+    <td>{fmt(f['centroid_shift_hz']/1000,' kHz',2)}</td>
+    <td><i>&gt; 2–5 kHz  (high freqs decay first)</i></td></tr>
+<tr style='background-color:rgba(128,128,128,0.07);'>
+    <td style='padding:4px;'><b>12. τ (tau_ms)</b></td>
+    <td>{'N/A (no valid decay)' if f['tau_ms'] < 0 else fmt(f['tau_ms'],' ms',4)}</td>
+    <td><i>0.05 – 1.3 ms  (cavitation)</i></td></tr>
+<tr><td style='padding:4px;'><b>13. R²</b></td>
+    <td>{fmt(f['R2'],decimals=4)}</td>
+    <td><i>≥ 0.45  (exponential fit quality)</i></td></tr>
+<tr style='background-color:rgba(128,128,128,0.07);'>
+    <td style='padding:4px;'><b>14. fit_coverage</b></td>
+    <td>{fmt(f['fit_coverage'],decimals=3)}</td>
+    <td><i>0.7 – 1.0  (fraction of decay used)</i></td></tr>
+<tr><td style='padding:4px;'><b>15. SPR</b></td>
+    <td>{fmt(f['SPR'],decimals=2)}</td>
+    <td><i>≤ 20  (broadband, not tonal)</i></td></tr>
+<tr style='background-color:rgba(128,128,128,0.07);'>
+    <td style='padding:4px;'><b>16. R_spectral</b></td>
+    <td>{fmt(f['R_spectral'],decimals=3)}</td>
+    <td><i>descriptive — E[20-40] / E[40-80]</i></td></tr>
+<tr><td style='padding:4px;'><b>17. FPE</b></td>
+    <td>{fmt(f['FPE_hz']/1000,' kHz',1)}</td>
+    <td><i>dominant frequency in analysis band</i></td></tr>
 </table>
-<p style='margin-left:20px; font-size:9pt; color:gray;'>
-pre_snr window: {pre_src}.  Fit: skip={decay_results.get('fit_skip',5)} samp,
-trunc={'YES' if decay_results.get('fit_truncated') else 'NO'},
-smooth={'YES' if decay_results.get('fit_smoothed') else 'NO'},
-n_fit={decay_results.get('n_fit_samples','?')}.
-</p>
 
-<!-- SUB-WINDOW ENERGIES -->
-<p style='margin-top:12px;'><b style='font-size:12pt; text-decoration:underline;'>Post-peak Sub-windows  (1.5 ms / 4 = 0.375 ms each)</b></p>
-<table style='margin-left:20px; border-collapse:collapse; width:70%;'>
-<tr style='background-color:rgba(128,128,128,0.2);'>
-    <th style='padding:5px;'>Win</th><th style='padding:5px;'>Duration</th>
-    <th style='padding:5px; text-align:right;'>Energy (mV²)</th><th style='padding:5px;'>Trend</th>
-</tr>
-<tr><td>W1</td><td>0–375 µs</td>
-    <td style='text-align:right;'><b>{decay_results['energies'][0]*1e6:.4f}</b></td><td>⬆</td></tr>
-<tr style='background-color:rgba(128,128,128,0.08);'>
-    <td>W2</td><td>375–750 µs</td>
-    <td style='text-align:right;'><b>{decay_results['energies'][1]*1e6:.4f}</b></td>
-    <td>{'⬇' if decay_results['energies'][1]<decay_results['energies'][0] else '⬆'}</td></tr>
-<tr><td>W3</td><td>750–1125 µs</td>
-    <td style='text-align:right;'><b>{decay_results['energies'][2]*1e6:.4f}</b></td>
-    <td>{'⬇' if decay_results['energies'][2]<decay_results['energies'][1] else '⬆'}</td></tr>
-<tr style='background-color:rgba(128,128,128,0.08);'>
-    <td>W4</td><td>1125–1500 µs</td>
-    <td style='text-align:right;'><b>{decay_results['energies'][3]*1e6:.4f}</b></td>
-    <td>{'⬇' if decay_results['energies'][3]<decay_results['energies'][2] else '⬆'}</td></tr>
-</table>
+<p style='margin-top:10px; margin-left:16px; font-size:9pt; color:gray;'>
+  No hard thresholds — all features are fed to the SVM classifier.
+  Expected ranges are physically motivated guidance, not pass/fail criteria.
+</p>
+</div>"""
 
-<!-- FLAGS -->
-<p style='margin-top:8px; margin-left:20px;'>
-Near frame end: {'⚠️ YES – spill handled' if decay_results.get('used_next_frame') else '⚠️ near end' if decay_results['near_end'] else '✅ NO'}
-</p>
-
-<!-- VERDICT -->
-<br>
-<p style='text-align:center; font-size:14pt; font-weight:bold; padding:10px;
-          background-color:rgba({self._verdict_color_to_rgb(verdict_color)},0.3); border-radius:5px;'>
-{verdict}
-</p>
-<p style='text-align:center; font-size:9pt; color:gray;'>
-  Thresholds shown are v4.0 defaults (configurable in Click Detector dialog).
-  Stage 2 FFT filters (SPR ≤ 20, peak_fft &gt; 0.85 mV) not evaluated here.
-</p>
-</div>
-"""
-        text_widget.setHtml(html)
-        layout.addWidget(text_widget)
+        text.setHtml(html)
+        layout.addWidget(text)
 
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
@@ -1228,679 +958,9 @@ Near frame end: {'⚠️ YES – spill handled' if decay_results.get('used_next_
                     QPushButton:hover { background-color: #e0e0e0; }
                 """)
         dialog.exec()
-    
-    def _verdict_color_to_rgb(self, color_name):
-        """Converti nome colore in RGB per HTML"""
-        color_map = {
-            'green': '0, 200, 0',
-            'orange': '255, 165, 0',
-            'red': '255, 0, 0'
-        }
-        return color_map.get(color_name, '128, 128, 128')
-    
-
-# ============================================================================
-# HILBERT ENVELOPE ANALYSIS FUNCTIONS (CLICK DETECTION)
-# ============================================================================
-
-def estimate_noise_offline(data_manager, energy_threshold_multiplier=4.0, max_samples=500):
-    """
-    Stima il noise RMS da frame "vuoti" per calcolo SNR offline.
-    
-    **MOTIVAZIONE**: Per validare click tramite SNR (Criterio 1), serve un riferimento
-    di rumore che NON provenga dal frame candidato stesso. In modalità offline (analisi
-    completa file), possiamo campionare frame vuoti rappresentativi dell'intero recording.
-    
-    **STRATEGIA**:
-    1. Pass 1: Calcola energia E_frame per tutti i frame
-    2. Identifica "empty frames" dove E_frame < μ + multiplier*σ (tipicamente 4σ)
-    3. Pass 2: Campiona random ≤max_samples empty frames
-    4. Ricostruisci iFFT di ogni frame campionato
-    5. Calcola RMS di ogni iFFT
-    6. Restituisci noise_rms = mean(tutti i RMS)
-    
-    **VANTAGGI vs rolling buffer**:
-    - Usa campione rappresentativo di tutto il recording (non solo primi 200 frames)
-    - Adattivo al livello di rumore specifico di ogni file
-    - Statisticamente più robusto (500 campioni vs 200)
-    
-    Parameters:
-    -----------
-    data_manager : AudioDataManager
-        Data manager con fft_data, phase_data, header_info
-    energy_threshold_multiplier : float
-        Moltiplicatore per identificare frame vuoti (default: 4.0)
-    max_samples : int
-        Numero massimo di frame da campionare (default: 500)
-    
-    Returns:
-    --------
-    dict : {
-        'noise_rms': float,           # RMS medio dei frame vuoti (V)
-        'noise_std': float,           # Std dev dei RMS (V)
-        'n_samples': int,             # Numero frame campionati
-        'n_empty_frames': int,        # Numero totale frame vuoti nel file
-        'threshold_used': float,      # Threshold energia usato (V)
-    }
-    """
-    print("\n" + "="*80)
-    print("🔍 OFFLINE NOISE ESTIMATION")
-    print("="*80)
-    
-    # Pass 1: Identifica frame vuoti
-    print(f"📊 Pass 1: Identifying empty frames...")
-    
-    # Usa fft_means già precalcolato (con outlier detection)
-    energies = data_manager.fft_means
-    mu_E = data_manager.fft_mean
-    sigma_E = data_manager.fft_std
-    
-    threshold_energy = mu_E + energy_threshold_multiplier * sigma_E
-    
-    # Frame vuoti: energia sotto threshold
-    empty_mask = energies < threshold_energy
-    empty_indices = np.where(empty_mask)[0]
-    
-    n_empty = len(empty_indices)
-    print(f"✅ Found {n_empty}/{len(energies)} empty frames ({n_empty/len(energies)*100:.1f}%)")
-    print(f"   Threshold: {threshold_energy*1000:.3f} mV (μ + {energy_threshold_multiplier}σ)")
-    
-    if n_empty == 0:
-        print("⚠️ WARNING: No empty frames found! Using global mean as fallback.")
-        return {
-            'noise_rms': mu_E,
-            'noise_std': sigma_E,
-            'n_samples': 0,
-            'n_empty_frames': 0,
-            'threshold_used': threshold_energy,
-        }
-    
-    # Pass 2: Campiona e ricostruisci
-    print(f"\n📊 Pass 2: Sampling {min(max_samples, n_empty)} frames and computing iFFT RMS...")
-    
-    # Random sampling (riproducibile)
-    np.random.seed(42)
-    n_to_sample = min(max_samples, n_empty)
-    sampled_indices = np.random.choice(empty_indices, size=n_to_sample, replace=False)
-    
-    rms_values = []
-    
-    # Parametri FFT per ricostruzione
-    fs = data_manager.header_info.get('fs', 200000)
-    fft_size = data_manager.header_info.get('fft_size', 512)
-    num_bins_full = fft_size // 2
-    bin_freq = fs / fft_size
-    bin_start = int(20000 / bin_freq)
-    bin_end = int(80000 / bin_freq)
-    
-    for idx in sampled_indices:
-        # Ottieni FFT
-        fft_mags = data_manager.fft_data[idx]
-        
-        # Ricostruisci spettro completo
-        full_spectrum_mag = np.zeros(num_bins_full, dtype=np.float32)
-        full_spectrum_phase = np.zeros(num_bins_full, dtype=np.int8)
-        
-        actual_bins = min(len(fft_mags), bin_end - bin_start + 1)
-        full_spectrum_mag[bin_start:bin_start + actual_bins] = fft_mags[:actual_bins]
-        
-        # Usa fasi se disponibili
-        if len(data_manager.phase_data) > idx:
-            phase_data = data_manager.phase_data[idx]
-            actual_phase_bins = min(len(phase_data), actual_bins)
-            full_spectrum_phase[bin_start:bin_start + actual_phase_bins] = phase_data[:actual_phase_bins]
-        
-        # Crea spettro complesso
-        fft_phases_rad = (full_spectrum_phase / 127.0) * np.pi
-        complex_spectrum = full_spectrum_mag * np.exp(1j * fft_phases_rad)
-        
-        # ✅ APPLICA TUKEY WINDOW ALLO SPETTRO COMPLESSO (noise estimation non critica, ma consistente)
-        taper_bins = max(5, actual_bins // 10)
-        window_full = np.ones(num_bins_full)
-        
-        for i in range(taper_bins):
-            alpha = i / taper_bins
-            window_full[bin_start + i] = 0.5 * (1 - np.cos(np.pi * alpha))
-            window_full[bin_start + actual_bins - i - 1] = 0.5 * (1 - np.cos(np.pi * alpha))
-        
-        complex_spectrum = complex_spectrum * window_full
-        
-        # iFFT
-        try:
-            time_signal = np.fft.irfft(complex_spectrum, n=fft_size)
-            time_signal = suppress_edge_artifacts(time_signal)
-            rms = np.sqrt(np.mean(time_signal ** 2))
-            rms_values.append(rms)
-        except:
-            continue  # Skip frames con errori
-    
-    if len(rms_values) == 0:
-        print("⚠️ ERROR: Failed to reconstruct any frame! Using energy fallback.")
-        return {
-            'noise_rms': mu_E,
-            'noise_std': sigma_E,
-            'n_samples': 0,
-            'n_empty_frames': n_empty,
-            'threshold_used': threshold_energy,
-        }
-    
-    rms_values = np.array(rms_values)
-    noise_rms = float(np.mean(rms_values))
-    noise_std = float(np.std(rms_values))
-    
-    print(f"✅ Noise estimation complete:")
-    print(f"   RMS (mean): {noise_rms*1000:.6f} mV")
-    print(f"   RMS (std):  {noise_std*1000:.6f} mV")
-    print(f"   Samples:    {len(rms_values)}/{n_to_sample}")
-    print(f"   Min RMS:    {np.min(rms_values)*1000:.6f} mV")
-    print(f"   Max RMS:    {np.max(rms_values)*1000:.6f} mV")
-    print("="*80 + "\n")
-    
-    return {
-        'noise_rms': noise_rms,
-        'noise_std': noise_std,
-        'n_samples': len(rms_values),
-        'n_empty_frames': n_empty,
-        'threshold_used': threshold_energy,
-    }
-
-
-def suppress_edge_artifacts(signal: np.ndarray,
-                             check_samples: int = 15,
-                             gibbs_factor: float = 2.5) -> np.ndarray:
-    """
-    Sopprime artefatti di Gibbs nel segnale time-domain post-iFFT.
-
-    ALGORITMO v3 — RILEVAMENTO SIMMETRICO (AND condition)
-    =====================================================
-    Il fenomeno di Gibbs è SIMMETRICO: deriva dalla troncatura spettrale
-    (bin_start=51, bin_end=204) e produce ringing su ENTRAMBI i bordi del
-    frame simultaneamente e con intensità paragonabile.
-
-    Strategia:
-    - Calcola energia RMS sui primi `check_samples` campioni (bordo sx)
-    - Calcola energia RMS sugli ultimi `check_samples` campioni (bordo dx)
-    - Calcola energia RMS nella zona interna [40 .. n-40] (riferimento sicuro)
-    - Se ENTRAMBI i bordi hanno energia > gibbs_factor × energia_interna
-      → Gibbs confermato → applica half-Hann fade su check_samples per lato
-    - Altrimenti → segnale reale o click a bordo → NON toccare nulla
-
-    Perché AND e non OR:
-    - Un click reale vicino al bordo sx → bordo sx alto, bordo dx basso → AND
-      fallisce → click preservato ✅
-    - Gibbs puro → entrambi i bordi elevati vs interno silenzioso → AND vero
-      → corretto ✅
-    - Caso raro (click che riempie tutto il frame) → τ > 2.56 ms → già
-      escluso dal criterio τ_max = 1.3 ms, nessun danno ✅
-
-    Parametri
-    ---------
-    signal : np.ndarray
-        Segnale time-domain (output di irfft), tipicamente 512 campioni.
-    check_samples : int
-        Campioni di bordo da esaminare (default: 15 ≈ 0.075 ms @ 200 kHz).
-    gibbs_factor : float
-        Soglia: bordo_rms > gibbs_factor × interno_rms → bordo sospetto.
-
-    Returns
-    -------
-    np.ndarray
-        Segnale con bordi corretti se Gibbs rilevato, copia invariata altrimenti.
-    """
-    n = len(signal)
-    if n < 100:
-        return signal.copy()
-
-    result = signal.copy()
-
-    # Zona interna: lontana dai bordi, sicura da artefatti di Gibbs
-    interior = result[40: n - 40]
-    if len(interior) < 10:
-        return result
-
-    energy_interior = float(np.sqrt(np.mean(interior ** 2)))
-    if energy_interior < 1e-15:
-        # Segnale quasi nullo → niente da correggere
-        return result
-
-    # Energie dei bordi
-    energy_left  = float(np.sqrt(np.mean(result[:check_samples] ** 2)))
-    energy_right = float(np.sqrt(np.mean(result[n - check_samples:] ** 2)))
-
-    left_suspicious  = energy_left  > gibbs_factor * energy_interior
-    right_suspicious = energy_right > gibbs_factor * energy_interior
-
-    # Applica correzione SOLO se entrambi i bordi sono anomali (Gibbs = simmetrico)
-    if left_suspicious and right_suspicious:
-        fade_win = 0.5 * (1.0 - np.cos(np.pi * np.arange(check_samples) / check_samples))
-        result[:check_samples]       *= fade_win        # fade-in sinistro
-        result[n - check_samples:]   *= fade_win[::-1]  # fade-out destro
-
-    return result
-
-
-def compute_hilbert_envelope(signal: np.ndarray) -> np.ndarray:
-    """
-    Calcola l'inviluppo istantaneo del segnale usando la trasformata di Hilbert.
-
-    Implementazione pure-numpy (senza scipy) per garantire la thread-safety su
-    macOS: scipy.signal.hilbert chiama internamente BLAS/LAPACK tramite openblas,
-    il che può causare un segfault quando invocato da un QThread sul main run-loop
-    di Cocoa. La versione numpy usa solo np.fft.rfft / np.fft.irfft che sono
-    sicuri in qualsiasi thread.
-
-    Per un click ultrasonico (sinusoide smorzata), l'inviluppo mostra il decadimento
-    esponenziale che lo caratterizza.
-
-    Parameters:
-    -----------
-    signal : np.ndarray
-        Segnale time-domain (es: output di iFFT)
-
-    Returns:
-    --------
-    np.ndarray : Instantaneous amplitude envelope A[n] = |analytic_signal[n]|
-    """
-    N = len(signal)
-    # Spettro a singolo lato (rfft è sufficiente perché il segnale è reale)
-    Xf = np.fft.rfft(signal, n=N)
-    # Costruisce la finestra analitica: DC e Nyquist rimangono invariati,
-    # tutte le frequenze positive vengono raddoppiate
-    h = np.zeros(N // 2 + 1, dtype=np.float64)
-    h[0] = 1.0                  # DC
-    if N % 2 == 0:
-        h[1:-1] = 2.0           # frequenze positive (escluso Nyquist)
-        h[-1]   = 1.0           # Nyquist (solo quando N è pari)
-    else:
-        h[1:]   = 2.0           # frequenze positive
-    # Parte immaginaria del segnale analitico (trasformata di Hilbert)
-    hilbert_part = np.fft.irfft(Xf * h, n=N)
-    # Inviluppo = modulo del segnale analitico = sqrt(x² + H{x}²)
-    return np.sqrt(signal ** 2 + hilbert_part ** 2)
-
-
-def find_peak(signal: np.ndarray) -> tuple:
-    """
-    Trova il picco massimo nel segnale (in valore assoluto).
-    
-    Parameters:
-    -----------
-    signal : np.ndarray
-        Segnale time-domain o inviluppo
-    
-    Returns:
-    --------
-    tuple : (peak_index, peak_amplitude)
-        - peak_index: Indice del massimo assoluto
-        - peak_amplitude: Valore assoluto del picco
-    """
-    abs_signal = np.abs(signal)
-    peak_index = int(np.argmax(abs_signal))
-    peak_amplitude = float(abs_signal[peak_index])
-    
-    return peak_index, peak_amplitude
-
-
-def compute_decay_r2(post_peak_window: np.ndarray, fs: int = 200000,
-                     noise_rms: float = None) -> dict:
-    """
-    Calcola R² e τ del fit log-lineare sull'envelope post-picco.
-
-    Miglioramenti v3.2 (A + B + C + D):
-      A — Skip post-picco: scarta i primi DECAY_FIT_SKIP campioni (transiente d'attacco).
-      B — Truncation al noise floor: il fit usa solo i campioni dove
-          envelope_smooth > DECAY_FIT_NOISE_FACTOR × noise_rms; evita di fittare
-          il rumore di fondo che distorce la pendenza verso zero.
-      C — Smoothing anti-ripple: media mobile di DECAY_FIT_SMOOTH_WIN=4 campioni
-          prima del fit. Poiché la portante a 50 kHz ha periodo esatto di 4 campioni,
-          la media mobile annulla algebricamente il ripple dell'envelope di Hilbert.
-      D — Local-max snap: dopo lo skip fisso, cerca il massimo locale in una finestra
-          di ±DECAY_FIT_SNAP_WIN campioni (±30 µs) e parte da lì. Evita che il fit
-          inizi su una buca dell'envelope, migliorando R² senza spostare l'inizio
-          in modo significativo rispetto al decadimento teorico.
-
-    Modello fisico: E(t) = A₀·exp(−t/τ)
-    Log-linearizzazione: log(E[n]) = log(A₀) − n/τ_samples   →  regressione lineare
-
-    Parameters
-    ----------
-    post_peak_window : np.ndarray
-        Envelope post-picco già estratta (tipicamente 300 campioni, 1.5 ms @ 200 kHz).
-    fs : int
-        Sampling rate in Hz (default: 200000).
-    noise_rms : float, optional
-        Noise RMS in Volt per il truncation (Improvement B).
-        Se None o 0, il truncation non viene applicato.
-
-    Returns
-    -------
-    dict with keys:
-        'r2_log'        : float   — R² fit log-lineare (DESCRIPTIVE ONLY)
-        'slope_log'     : float   — Pendenza (negativa = decay)
-        'tau_ms'        : float   — Costante di tempo in ms (−1 se slope≥0)
-        'n_samples'     : int     — Campioni totali nella finestra di input
-        'n_fit_samples' : int     — Campioni effettivamente usati nel fit
-        'fit_skip'      : int     — Campioni saltati in testa (A + snap D, totale)
-        'fit_snap_offset': int    — Offset del local-max snap (D), ≤ SNAP_WIN
-        'fit_truncated' : bool    — True se la finestra è stata troncata (B)
-        'fit_smoothed'  : bool    — True (smoothing sempre applicato se n≥4) (C)
-    """
-    # ── Costanti ─────────────────────────────────────────────────────────────
-    DECAY_FIT_SKIP         = 5    # A: campioni da saltare post-picco (25 µs @ 200 kHz)
-    DECAY_FIT_NOISE_FACTOR = 2.0  # B: fittare solo dove envelope > 2× noise_rms
-    DECAY_FIT_SMOOTH_WIN   = 4    # C: media mobile 4 camp. → annulla ripple 50 kHz
-    DECAY_FIT_SNAP_WIN     = 6    # D: finestra ±campioni per local-max snap (±30 µs)
-                                  #    evita che il punto di start cada su una "buca"
-                                  #    dell'envelope smoothata, migliorando R²
-    MIN_FIT_SAMPLES        = 10   # Minimo campioni per fit affidabile
-
-    n_samples = len(post_peak_window)
-
-    # Guard: finestra troppo corta
-    if n_samples < DECAY_FIT_SKIP + MIN_FIT_SAMPLES:
-        return {
-            'r2_log': 0.0, 'slope_log': 0.0, 'tau_ms': -1.0,
-            'n_samples': n_samples, 'n_fit_samples': 0,
-            'fit_skip': DECAY_FIT_SKIP, 'fit_truncated': False, 'fit_smoothed': False,
-            'fit_snap_offset': 0,
-        }
-
-    # ── Improvement C: smoothing anti-ripple (media mobile 4 camp.) ──────────
-    if n_samples >= DECAY_FIT_SMOOTH_WIN:
-        kernel = np.ones(DECAY_FIT_SMOOTH_WIN) / DECAY_FIT_SMOOTH_WIN
-        smoothed = np.convolve(post_peak_window, kernel, mode='same')
-        # Ai bordi 'same' usa zero-padding → correggi ignorando i primi/ultimi
-        # (W-1)/2 = 1.5 → 2 campioni di bordo; ma A già salta i primi 5, quindi
-        # il bordo sinistro è coperto. Il bordo destro è irrilevante (fine finestra).
-        fit_smoothed = True
-    else:
-        smoothed = post_peak_window.copy()
-        fit_smoothed = False
-
-    # ── Improvement A: skip post-picco ───────────────────────────────────────
-    after_skip = smoothed[DECAY_FIT_SKIP:]
-
-    # ── Improvement D: local-maximum snap ────────────────────────────────────
-    # Dopo lo skip fisso, il primo campione di after_skip potrebbe cadere su una
-    # buca locale dell'envelope (residuo del ripple a 50 kHz o della portante).
-    # Cerchiamo il massimo locale in una piccola finestra [0, SNAP_WIN] e usiamo
-    # quello come punto di partenza effettivo, così il fit parte sempre da un
-    # punto "alto" della curva di decadimento.
-    # Il vincolo snap_offset ≤ SNAP_WIN garantisce che non ci spostiamo mai
-    # lontano dall'inizio teorico del decadimento (il snap è al massimo ±30 µs).
-    snap_window_end = min(DECAY_FIT_SNAP_WIN + 1, len(after_skip))
-    snap_offset = int(np.argmax(after_skip[:snap_window_end]))  # 0 se già il massimo
-    working = after_skip[snap_offset:]
-
-    # ── Improvement B: truncation al noise floor ─────────────────────────────
-    fit_truncated = False
-    if noise_rms is not None and noise_rms > 0:
-        threshold_floor = DECAY_FIT_NOISE_FACTOR * noise_rms
-        # Primo indice dove l'envelope scende sotto la soglia
-        below = np.where(working < threshold_floor)[0]
-        if len(below) > 0:
-            trunc_idx = int(below[0])
-            if trunc_idx >= MIN_FIT_SAMPLES:
-                working = working[:trunc_idx]
-                fit_truncated = True
-            # else: troncatura troppo aggressiva, usa tutta la finestra
-
-    n_fit = len(working)
-
-    # Guard: dopo skip+truncation campioni insufficienti
-    if n_fit < MIN_FIT_SAMPLES:
-        return {
-            'r2_log': 0.0, 'slope_log': 0.0, 'tau_ms': -1.0,
-            'n_samples': n_samples, 'n_fit_samples': n_fit,
-            'fit_skip': DECAY_FIT_SKIP + snap_offset, 'fit_truncated': fit_truncated,
-            'fit_smoothed': fit_smoothed, 'fit_snap_offset': snap_offset,
-        }
-
-    # ── Fit log-lineare ───────────────────────────────────────────────────────
-    # ⚠️  np.polyfit chiama np.linalg.lstsq → Apple Accelerate LAPACK → segfault
-    #    se invocato da un QThread su macOS. Sostituiamo con la formula chiusa
-    #    della regressione lineare semplice (O(n), zero chiamate BLAS/LAPACK):
-    #        slope = (n·Σ(x·y) − Σx·Σy) / (n·Σ(x²) − (Σx)²)
-    #    che è esattamente quello che polyfit(deg=1) calcola internamente, ma
-    #    usando solo operazioni element-wise su numpy array (thread-safe).
-    epsilon = 1e-9
-    log_env = np.log(np.maximum(working, epsilon))
-    n_array = np.arange(n_fit, dtype=np.float64)
-
-    try:
-        # Regressione lineare con formula chiusa — nessun BLAS/LAPACK
-        n_pts  = float(n_fit)
-        sum_x  = float(np.sum(n_array))
-        sum_y  = float(np.sum(log_env))
-        sum_xx = float(np.sum(n_array * n_array))
-        sum_xy = float(np.sum(n_array * log_env))
-        denom  = n_pts * sum_xx - sum_x * sum_x
-        if abs(denom) < 1e-30:
-            raise ValueError("degenerate fit (all x equal)")
-        slope_log = (n_pts * sum_xy - sum_x * sum_y) / denom
-        intercept = (sum_y - slope_log * sum_x) / n_pts
-
-        log_pred = slope_log * n_array + intercept
-        ss_res = float(np.sum((log_env - log_pred) ** 2))
-        ss_tot = float(np.sum((log_env - (sum_y / n_pts)) ** 2))
-        r2_log = float(1.0 - ss_res / ss_tot) if ss_tot > 1e-30 else 0.0
-
-        if slope_log < 0:
-            tau_ms = (-1.0 / slope_log) * 1000.0 / fs
-        else:
-            tau_ms = -1.0
-
-    except Exception:
-        slope_log = 0.0
-        r2_log    = 0.0
-        tau_ms    = -1.0
-
-    return {
-        'r2_log':          float(r2_log),
-        'slope_log':       float(slope_log),
-        'tau_ms':          float(tau_ms),
-        'n_samples':       int(n_samples),
-        'n_fit_samples':   int(n_fit),
-        'fit_skip':        int(DECAY_FIT_SKIP + snap_offset),  # skip fisso + snap offset
-        'fit_snap_offset': int(snap_offset),                   # solo la parte di snap (D)
-        'fit_truncated':   bool(fit_truncated),
-        'fit_smoothed':    bool(fit_smoothed),
-    }
-
-
-def check_decay(envelope: np.ndarray, peak_idx: int, fs=200000,
-                next_frame_signal=None, next_frame_envelope=None,
-                noise_rms: float = None) -> dict:
-    """
-    Analizza il decadimento post-picco e calcola feature descrittive.
-    
-    Click ultrasonici = sinusoidi smorzate con decadimento esponenziale in 0.1-0.6 ms.
-    
-    ⚠️ IMPORTANTE: Questa funzione calcola SOLO feature descrittive (r2_log, tau_ms, energies).
-    NON valida/classifica il click. La validazione avviene nel pipeline di detect_clicks()
-    usando i nuovi criteri: SNR, pre_snr, E_W1>E_W4.
-    
-    ✅ GESTIONE SPILL: Se il picco cade vicino alla fine del frame e next_frame_signal
-    è fornito, concatena i dati dal frame successivo per analisi completa.
-    
-    Parameters:
-    -----------
-    envelope : np.ndarray
-        Inviluppo di Hilbert del segnale
-    peak_idx : int
-        Indice del picco massimo
-    fs : int
-        Sampling rate (default: 200000 Hz = 200 ksps)
-    next_frame_signal : np.ndarray, optional
-        Segnale del frame successivo per concatenazione in caso di spill
-    noise_rms : float, optional
-        Noise RMS in Volt; passato a compute_decay_r2 per truncation (Improvement B).
-        Se None, il truncation non viene applicato.
-
-    Returns:
-    --------
-    dict : {
-        # DECAY FIT
-        'r_squared_log': float,              # R² del fit logaritmico
-        'slope_log': float,                  # Pendenza fit log
-        'tau_ms': float,                     # Costante di decadimento in ms
-        'n_samples': int,                    # Campioni totali nella finestra
-        'n_fit_samples': int,                # Campioni usati nel fit (dopo A+B)
-        'fit_skip': int,                     # Campioni saltati in testa (A)
-        'fit_truncated': bool,               # True se troncato al noise floor (B)
-        'fit_smoothed': bool,                # True se smoothing applicato (C)
-
-        # SUB-WINDOW ENERGIES (for validation criteria)
-        'energies': [E1, E2, E3, E4],       # Energie medie 4 sub-windows
-        'E_W1': float,                       # First sub-window energy
-        'E_W4': float,                       # Last sub-window energy
-
-        # METADATA
-        'near_end': bool,
-        'used_next_frame': bool,
-        'window_samples': int,
-
-        # LEGACY (backward compatibility)
-        'slope': float,
-        'r_squared': float,
-        'monotone': bool,
-    }
-    """
-    # Parametri finestra: 1.5 ms a 200 ksps = 300 campioni
-    # Motivazione: click con τ lungo (0.4-0.8 ms) necessitano di una finestra più ampia
-    # affinché E_W4 (ultima quarter-window = 75 campioni = 0.375 ms) sia ben al di sotto
-    # di E_W1. Con 120 campioni (0.6 ms) un click con τ=0.5 ms aveva E_W1/E_W4 ≈ 1.9
-    # (margine troppo stretto in presenza di rumore). Con 300 campioni → E_W1/E_W4 ≈ 8.9.
-    window_samples = 300
-    
-    # ✅ GESTIONE SPILL: Controlla se serve concatenare frame successivo
-    near_end = (peak_idx > 212)  # 212/512 samples: beyond this, 300-sample window may spill
-    used_next_frame = False
-    
-    # Finestra post-picco
-    start_idx = peak_idx
-    end_idx = peak_idx + window_samples
-    
-    # ✅ SE PICCO VICINO A FINE FRAME E DATI INSUFFICIENTI
-    if end_idx > len(envelope) and near_end and (next_frame_envelope is not None or next_frame_signal is not None):
-        # Calcola quanti samples mancano
-        missing_samples = end_idx - len(envelope)
-        
-        print(f"   🔗 SPILL DETECTED: Peak at sample {peak_idx}/{len(envelope)}, need {missing_samples} samples from next frame")
-        
-        # Usa l'envelope pre-calcolato se disponibile, altrimenti lo calcola
-        try:
-            if next_frame_envelope is not None:
-                next_env = next_frame_envelope
-            else:
-                # fallback legacy — preferire sempre next_frame_envelope
-                next_env = compute_hilbert_envelope(next_frame_signal)
-            
-            # Concatena: envelope corrente + primi N samples del prossimo
-            extended_envelope = np.concatenate([
-                envelope[start_idx:],
-                next_env[:missing_samples]
-            ])
-            
-            decay_window = extended_envelope
-            used_next_frame = True
-            
-            print(f"   ✅ Extended analysis window: {len(envelope[start_idx:])} + {missing_samples} = {len(decay_window)} samples")
-            
-        except Exception as e:
-            print(f"   ⚠️ Failed to extend window: {e}")
-            # Fallback: usa solo dati disponibili
-            decay_window = envelope[start_idx:]
-            used_next_frame = False
-    else:
-        # Caso normale: finestra completamente nel frame corrente
-        end_idx_clipped = min(end_idx, len(envelope))
-        decay_window = envelope[start_idx:end_idx_clipped]
-    
-    # ========================================================================
-    # FIT LOGARITMICO v3.2 (A+B+C: skip + truncation + smoothing)
-    # ========================================================================
-    # IMPORTANTE: compute_decay_r2 riceve la finestra GIÀ ESTRATTA (post-picco)
-    decay_r2_results = compute_decay_r2(decay_window, fs=fs, noise_rms=noise_rms)
-    
-    # ========================================================================
-    # LEGACY: Calcola anche energie sub-windows per compatibilità
-    # ========================================================================
-    actual_samples = len(decay_window)
-    quarter = actual_samples // 4
-    
-    if quarter >= 5:
-        w1 = decay_window[0:quarter]
-        w2 = decay_window[quarter:2*quarter]
-        w3 = decay_window[2*quarter:3*quarter]
-        w4 = decay_window[3*quarter:4*quarter]
-        
-        E1 = float(np.mean(w1 ** 2))
-        E2 = float(np.mean(w2 ** 2))
-        E3 = float(np.mean(w3 ** 2))
-        E4 = float(np.mean(w4 ** 2))
-        
-        energies = [E1, E2, E3, E4]
-        
-        # Fit lineare legacy (solo per reference) — formula chiusa, no BLAS
-        x_fit = np.array([0, 1, 2, 3], dtype=np.float64)
-        y_fit = np.array(energies,      dtype=np.float64)
-        
-        try:
-            n_pts_l  = 4.0
-            sx  = float(np.sum(x_fit))
-            sy  = float(np.sum(y_fit))
-            sxx = float(np.sum(x_fit * x_fit))
-            sxy = float(np.sum(x_fit * y_fit))
-            den = n_pts_l * sxx - sx * sx
-            slope_legacy = (n_pts_l * sxy - sx * sy) / den if abs(den) > 1e-30 else 0.0
-            intercept_l  = (sy - slope_legacy * sx) / n_pts_l
-            y_pred = slope_legacy * x_fit + intercept_l
-            ss_res = float(np.sum((y_fit - y_pred) ** 2))
-            ss_tot = float(np.sum((y_fit - sy / n_pts_l) ** 2))
-            r2_legacy = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
-        except Exception:
-            slope_legacy = 0.0
-            r2_legacy = 0.0
-        
-        monotone = (E1 > E2 > E3 > E4)
-    else:
-        energies = [0.0, 0.0, 0.0, 0.0]
-        slope_legacy = 0.0
-        r2_legacy = 0.0
-        monotone = False
-    
-    # ========================================================================
-    # RISULTATO FINALE: Feature descrittive + energies per validazione
-    # ========================================================================
-    return {
-        # DECAY FIT (DESCRIPTIVE ONLY)
-        'r_squared_log': decay_r2_results['r2_log'],
-        'slope_log': decay_r2_results['slope_log'],
-        'tau_ms': decay_r2_results['tau_ms'],
-        'n_samples': decay_r2_results['n_samples'],
-        'n_fit_samples': decay_r2_results['n_fit_samples'],
-        'fit_skip': decay_r2_results['fit_skip'],
-        'fit_snap_offset': decay_r2_results.get('fit_snap_offset', 0),
-        'fit_truncated': decay_r2_results['fit_truncated'],
-        'fit_smoothed': decay_r2_results['fit_smoothed'],
-
-        # SUB-WINDOW ENERGIES (for validation)
-        'energies': energies,
-        'E_W1': energies[0],
-        'E_W4': energies[3],
-
-        # METADATA
-        'near_end': near_end,
-        'used_next_frame': used_next_frame,
-        'window_samples': actual_samples,
-
-        # LEGACY (backward compatibility)
-        'slope': slope_legacy,
-        'r_squared': r2_legacy,
-        'monotone': monotone,
-    }
-
+# Signal processing utilities (compute_hilbert_envelope, find_peak,
+# suppress_edge_artifacts, run_fit_pipeline_v5, etc.) are now in
+# core/click_pipeline_v5.py and imported at the top of this file.
 
 class ReplayWindowAudio(ReplayBaseWindow):
     """Finestra replay audio con architettura multi-livello ottimizzata"""
@@ -1917,7 +977,10 @@ class ReplayWindowAudio(ReplayBaseWindow):
         self.playback_rate = 1.0
         self.is_playing = False
         self.last_update_time = 0
-        
+
+        # Flag to indicate if normalized means are being used for FFT analysis
+        self._using_normalized_means = True #defualt, always normalized
+
         # Timer per playback
         self.playback_timer = QTimer()
         self.playback_timer.timeout.connect(self._update_playback)
@@ -1930,11 +993,9 @@ class ReplayWindowAudio(ReplayBaseWindow):
         self.setup_toolbar()
         
         # ✅ CONNETTI AZIONI AUDIO-SPECIFIC
-        if hasattr(self, 'actionClickDetector'):
-            self.actionClickDetector.triggered.connect(self.open_click_detector_dialog)
-        if hasattr(self, 'actionBatchExport'):
-            self.actionBatchExport.triggered.connect(self.open_batch_export_screenshots)
-        
+        if hasattr(self, 'actionToggleNormalized'):
+            self.actionToggleNormalized.triggered.connect(self.toggle_normalized_data)
+
         # Applica tema
         self._load_saved_settings()
         
@@ -1946,57 +1007,13 @@ class ReplayWindowAudio(ReplayBaseWindow):
         self.velocity.setRange(0.1, 1.0)
 
         #imposta la vista iniziale dell'asse x del tempo sui primi 20s
-        # ✅ IMPOSTA LA VISTA INIZIALE SULLA DIMENSIONE DELLA FINESTRA DI STREAMING
+        # IMPOSTA LA VISTA INIZIALE SULLA DIMENSIONE DELLA FINESTRA DI STREAMING
         self.plot_widget_time.set_axis_limits(0, self.data_manager.streaming_window_size)
         self.plot_widget_time.set_x_range(0, self.data_manager.streaming_window_size)
 
         # mostra a tutto schermo mantenendo le grafiche
         self.showMaximized()
 
-    def show_spectral_energy_analysis(self):
-        """Show spectral energy analysis for the current frame (OVERRIDE)"""
-        if self.data_manager.total_frames == 0:
-            QMessageBox.warning(self, "No Data", "No FFT data available for analysis.")
-            return
-        
-        # Get current frame index (FIX: use round() to match step_frame behavior)
-        frame_index = int(round(self.current_position_ms / self.data_manager.frame_duration_ms))
-        frame_index = max(0, min(frame_index, self.data_manager.total_frames - 1))
-        
-        if frame_index >= len(self.data_manager.fft_data):
-            QMessageBox.warning(self, "Error", f"Invalid frame index: {frame_index}")
-            return
-        
-        # Get FFT magnitudes for current frame
-        fft_magnitudes = self.data_manager.fft_data[frame_index]
-        
-        # Compute energy
-        try:
-            energies = compute_fft_energy(fft_magnitudes)
-        except Exception as e:
-            QMessageBox.critical(self, "Analysis Error", f"Failed to compute energy:\n{str(e)}")
-            print(f"❌ Energy computation error: {e}")
-            import traceback
-            traceback.print_exc()
-            return
-        
-        # Show results in dialog
-        dialog = SpectralEnergyDialog(energies, frame_index=frame_index, parent=self)
-        dialog.exec()
-        
-        # Print to console for reference (includi ratio)
-        ratio_raw = energies['low'] / energies['high'] if energies['high'] > 0 else 0.0
-        frame_time_sec = frame_index * self.data_manager.frame_duration_ms / 1000.0
-        print(f"\n📊 Spectral Energy Analysis - Frame {frame_index}")
-        print(f"   Time: {frame_time_sec:.3f}s")
-        print(f"   Total (20-80 kHz):  {energies['total']:.6f} V² = {energies['total']*1e6:.3f} mV²")
-        print(f"   Low   (20-40 kHz):  {energies['low']:.6f} V² = {energies['low']*1e6:.3f} mV²")
-        print(f"   High  (40-80 kHz):  {energies['high']:.6f} V² = {energies['high']*1e6:.3f} mV²")
-        print(f"   Ratio R (E_low/E_high): {ratio_raw:.3f}")
-        print(f"   Band 1 (20-30 kHz): {energies['b1']:.6f} V² = {energies['b1']*1e6:.3f} mV²")
-        print(f"   Band 2 (30-40 kHz): {energies['b2']:.6f} V² = {energies['b2']*1e6:.3f} mV²")
-        print(f"   Band 3 (40-60 kHz): {energies['b3']:.6f} V² = {energies['b3']*1e6:.3f} mV²")
-        print(f"   Band 4 (60-80 kHz): {energies['b4']:.6f} V² = {energies['b4']*1e6:.3f} mV²")
 
     # === PLAYBACK CONTROL METHODS ===
     
@@ -2146,23 +1163,19 @@ class ReplayWindowAudio(ReplayBaseWindow):
         frame_index = max(0, min(frame_index, self.data_manager.total_frames - 1))
         
         if frame_index < len(self.data_manager.fft_data):
-            self.fft_curve.setData(self.data_manager.frequency_axis, 
-                                self.data_manager.fft_data[frame_index])
-            
-            # ✅ RIMUOVI CURVA NORMALIZZATA quando cambi frame
-            if hasattr(self, 'normalized_fft_curve'):
-                try:
-                    self.plot_widget_fft.plot_widget.removeItem(self.normalized_fft_curve)
-                    del self.normalized_fft_curve
-                except:
-                    pass
-            
-            # ✅ RESET colore curva raw a accent_color del tema
-            if hasattr(self, 'theme_manager'):
-                self.theme_manager.apply_theme_to_plot(
-                    plot_widget_name=self.plot_widget_fft.plot_widget,
-                    plot_instance=self.fft_curve
-                )
+            # Respect normalization state instead of always showing raw
+            freq_axis, display_mags = self._compute_fft_for_display(frame_index)
+            self.fft_curve.setData(freq_axis, display_mags)
+
+            # Color: darker accent for normalized, theme accent for raw
+            if getattr(self, '_using_normalized_means', True):
+                self.fft_curve.setPen({'color': self.theme_manager.get_darker_accent_color(), 'width': 2})
+            else:
+                if hasattr(self, 'theme_manager'):
+                    self.theme_manager.apply_theme_to_plot(
+                        plot_widget_name=self.plot_widget_fft.plot_widget,
+                        plot_instance=self.fft_curve
+                    )
         
         # UPDATE TIME DOMAIN
         if self.data_manager.contains_streaming_time(current_time_sec):
@@ -2243,10 +1256,12 @@ class ReplayWindowAudio(ReplayBaseWindow):
         
         for i in range(0, self.data_manager.total_frames, frame_step):
             frame_time = (i * self.data_manager.frame_duration_ms) / 1000.0
-            fft_data = self.data_manager.fft_data[i]
-            
-            # Energia media per overview veloce
-            energy = np.mean(np.abs(fft_data)) 
+
+            # Use pre-computed normalized means (fast — already computed at load time)
+            if i < len(self.data_manager.fft_means):
+                energy = float(self.data_manager.fft_means[i])
+            else:
+                energy = float(np.mean(np.abs(self.data_manager.fft_data[i])))
             
             overview_x.append(frame_time)
             overview_y.append(energy)
@@ -2285,11 +1300,13 @@ class ReplayWindowAudio(ReplayBaseWindow):
                 break
             
             frame_time = (frame_idx * self.data_manager.frame_duration_ms) / 1000.0
-            fft_data = self.data_manager.fft_data[frame_idx]
-            
-            # iFFT semplificata per streaming
-            # Per performance, usa solo campione centrale
-            signal_sample = np.mean(np.abs(fft_data))  # MEDIA DELLE MAGNITUDE NELLA FFT (anche se non c'è la fase, lascio abs)
+
+            # Use pre-computed normalized fft_means when available (fast path).
+            # fft_means are pre-computed in precompute_fft_means using normalized magnitudes.
+            if frame_idx < len(self.data_manager.fft_means):
+                signal_sample = float(self.data_manager.fft_means[frame_idx])
+            else:
+                signal_sample = float(np.mean(np.abs(self.data_manager.fft_data[frame_idx])))
             
             stream_x.append(frame_time)
             stream_y.append(signal_sample)
@@ -2365,28 +1382,20 @@ class ReplayWindowAudio(ReplayBaseWindow):
 
         # Mostra primo frame FFT
         if len(self.data_manager.fft_data) > 0:
-            self.fft_curve.setData(self.data_manager.frequency_axis, 
-                                   self.data_manager.fft_data[0])
-        
+            freq_axis, display_mags = self._compute_fft_for_display(0)
+            self.fft_curve.setData(freq_axis, display_mags)
+            if getattr(self, '_using_normalized_means', True):
+                self.fft_curve.setPen({'color': self.theme_manager.get_darker_accent_color(), 'width': 2})
+
         # Setup position line
         if hasattr(self, 'time_position_line'):
             self.time_position_line.setPos(0)
 
         self._update_time_labels()
     
-        # Imposta threshold automatico DOPO che i dati sono stati caricati
-        if hasattr(self.data_manager, 'fft_mean') and hasattr(self.data_manager, 'fft_std'):
-            self.automatic_click_threshold = self.data_manager.fft_mean + 4 * self.data_manager.fft_std
-            # Converti V in mV per lo spinbox
-            self.PeakThresholdSpinBox.setValue(self.automatic_click_threshold * 1000.0)
-            # Applica il filtro automaticamente
-            self._apply_threshold_filter()
-            # Aggiorna lo step della spinbox per cambiare di deviazioni standard (convertito in mV)
-            self.PeakThresholdSpinBox.setSingleStep(self.data_manager.fft_std * 1000.0)
-            print(f"✅ Auto-threshold impostato a: {self.automatic_click_threshold*1000:.3f} mV")
-        else:
-            print("⚠️ WARNING: fft_mean/fft_std non disponibili, usando threshold di default")
-            self.PeakThresholdSpinBox.setValue(10.0)  # Default 10 mV
+        # Build the adaptive threshold curve and apply the above-threshold filter
+        self._update_threshold_line()
+        self._apply_threshold_filter()
     
     
     def _populate_click_table(self):
@@ -2483,10 +1492,10 @@ class ReplayWindowAudio(ReplayBaseWindow):
         time_layout.addWidget(self.time_info_label)
         
         self.plot_widget_time = BasePlotWidget(
-            x_label="Time", y_label="Average Amplitude per FFT",
-            x_range=(0, 20), y_range=(0, 0.003),
-            x_min=0, x_max=None, y_min=0, y_max=3.3,
-            unit_x="s", unit_y="V", parent=self
+            x_label="Time", y_label="Mean FFT Energy",
+            x_range=(0, 20), y_range=(0.00000005, 0.0000002),
+            x_min=0, x_max=None, y_min=0, y_max=1e-4,
+            unit_x="s", unit_y="V²", parent=self
         )
         
         self.time_curve = self.plot_widget_time.plot_widget.plot(
@@ -2598,7 +1607,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
         font_peak.setPointSize(16)
         font_peak.setBold(True)
         self.PeakThresholdLabel.setFont(font_peak)
-        self.PeakThresholdLabel.setText("Threshold on Average Amplitude:")
+        self.PeakThresholdLabel.setText("Stage 1 threshold multiplier  k :")
         self.PeakThresholdLabel.setAlignment(Qt.AlignCenter)
         table_layout.addWidget(self.PeakThresholdLabel)
 
@@ -2606,32 +1615,44 @@ class ReplayWindowAudio(ReplayBaseWindow):
         threshold_layout = QHBoxLayout()
         table_layout.addLayout(threshold_layout)
 
+        # SpinBox: controls k — the Stage 1 multiplier (E_i > k × Ê_floor)
         self.PeakThresholdSpinBox = QDoubleSpinBox(table_container)
         self.PeakThresholdSpinBox.setObjectName(u"PeakThresholdSpinBox")
-        self.PeakThresholdSpinBox.setDecimals(3)
-        self.PeakThresholdSpinBox.setRange(0, 3300) # Valori in mV = 0-3.3V
-        self.PeakThresholdSpinBox.setSingleStep(0.001) #dopo viene sovrascritto con valore della deviazione standard
-        self.PeakThresholdSpinBox.setValue(10) # Valore di default
-        self.PeakThresholdSpinBox.setSuffix(" mV")
+        self.PeakThresholdSpinBox.setDecimals(2)
+        self.PeakThresholdSpinBox.setRange(0.5, 20.0)
+        self.PeakThresholdSpinBox.setSingleStep(0.5)
+        self.PeakThresholdSpinBox.setValue(K_STAGE1_DEFAULT)  # default k = 1.5
+        self.PeakThresholdSpinBox.setSuffix("  ×")
         self.PeakThresholdSpinBox.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.PeakThresholdSpinBox.setToolTip(
+            "Stage 1 threshold multiplier k.\n"
+            "A frame is a candidate if  E_i > k × Ê_floor.\n"
+            "1.5 = wide net (data collection).  2–3.5 = tighter."
+        )
         threshold_layout.addWidget(self.PeakThresholdSpinBox)
 
-        # Crea una linea orizzontale sul grafico del time domain per indicare la soglia
-        self.threshold_line = self.plot_widget_time.plot_widget.addLine(
-            y=self.PeakThresholdSpinBox.value() / 1000.0,  # Converti mV a V
-            pen={'color': 'red', 'width': 2, 'style': QtCore.Qt.DashLine}
+        # The adaptive threshold curve — built after data is loaded (see _setup_ui_with_data).
+        # Stored as a pyqtgraph PlotDataItem so it can be updated when k changes.
+        self.threshold_curve = self.plot_widget_time.plot_widget.plot(
+            [], [],
+            pen={'color': 'r', 'width': 1.5, 'style': QtCore.Qt.DashLine},
+            name='k × Ê_floor'
         )
         self.PeakThresholdSpinBox.valueChanged.connect(self._update_threshold_line)
 
+        # Raw noise floor line — shows Ê_floor(i) directly (without k multiplier).
+        self.noise_floor_curve = self.plot_widget_time.plot_widget.plot(
+            [], [],
+            pen={'color': '#80DEEA', 'width': 2.5},
+            name='Ê_floor'
+        )
 
         self.PeakThresholdButton = QPushButton("Apply", table_container)
         self.PeakThresholdButton.setObjectName(u"PeakThresholdButton")
-        self.PeakThresholdButton.setToolTip("Filter peaks above the set threshold")
+        self.PeakThresholdButton.setToolTip("Show all frames above current k × Ê_floor threshold")
         self.PeakThresholdButton.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.PeakThresholdButton.clicked.connect(self._apply_threshold_filter)
         threshold_layout.addWidget(self.PeakThresholdButton)
-
-        ####### AGGIUNTA DELLA LOGICA PER FILTRARE I PICCHI NELLA TABELLA
 
         self.click_table_widget = table_container
 
@@ -2663,136 +1684,127 @@ class ReplayWindowAudio(ReplayBaseWindow):
         # Assicurati che anche lo slider si aggiorni visivamente al valore esatto
         self.time_slider.setValue(int(new_position_ms))
 
+    def show_fft_parameters(self):
+        """Show FFT parameters for the current frame that are fed to the SVM.
+        
+        NOTE: SPR, R_spectral, FPE are ALWAYS computed on normalized data because
+        _feat_fft_features normalizes internally — matching exactly what the SVM sees.
+        The user normalization toggle does NOT affect these values by design.
+        """
+        if self.data_manager.total_frames == 0:
+            QMessageBox.warning(self, "No Data", "No FFT data available for analysis.")
+            return
+
+        frame_index = int(round(self.current_position_ms / self.data_manager.frame_duration_ms))
+        frame_index = max(0, min(frame_index, self.data_manager.total_frames - 1))
+
+        if frame_index >= len(self.data_manager.fft_data):
+            QMessageBox.warning(self, "Error", f"Invalid frame index: {frame_index}")
+            return
+
+        fs       = self.data_manager.header_info.get('fs',       V5_FS)
+        fft_size = self.data_manager.header_info.get('fft_size', V5_FFT_SIZE)
+        raw_mags  = np.asarray(self.data_manager.fft_data[frame_index], dtype=np.float64)
+        full_freq = np.arange(fft_size // 2) * (fs / fft_size)
+        full_mags = np.zeros(fft_size // 2, dtype=np.float64)
+        n_bins = min(len(raw_mags), V5_BIN_END - V5_BIN_START + 1)
+        full_mags[V5_BIN_START : V5_BIN_START + n_bins] = raw_mags[:n_bins]
+
+        # Always normalize: _feat_fft_features normalizes internally, so these
+        # values are invariant to the display toggle — they match what the SVM uses.
+        fft_norm = _normalize_fft(full_mags, full_freq)
+
+        try:
+            fft_params = _feat_fft_features(fft_norm, full_freq)
+        except Exception as e:
+            QMessageBox.critical(self, "Analysis Error", f"Failed to compute FFT parameters:\n{str(e)}")
+            import traceback; traceback.print_exc()
+            return
+
+        params_text = (
+            f"Frame index: {frame_index}\n"
+            f"(Always normalized — matches SVM input)\n"
+            f"SPR: {fft_params['SPR']:.2f}\n"
+            f"R_spectral: {fft_params['R_spectral']:.3f}\n"
+            f"FPE: {fft_params['FPE_hz'] / 1000:.2f} kHz\n"
+        )
+        QMessageBox.information(self, "FFT Parameters (SVM)", params_text)
+        
 
     def show_ifft_window(self):
         """
-        Mostra iFFT del frame FFT CORRENTE usando le fasi reali.
-        ✅ RICOSTRUISCE SPETTRO COMPLETO 0-100kHz prima di irfft()
+        Show the iFFT of the current frame, follows normalization decided in main window.
+
+        Uses reconstruct_frame_v5 for the raw iFFT. The IFFTWindow then
+        auto-applies normalization so the user sees the normalized signal first.
         """
         if self.data_manager.total_frames == 0:
             QMessageBox.warning(self, "No Data", "No data loaded to perform iFFT.")
             return
-        
-        # ✅ CHECK VERSIONE FILE E FASI
+
         file_version = self.data_manager.header_info.get('version', 0)
-        has_phases = (file_version >= 3.0) and hasattr(self.data_manager, 'phase_data') and len(self.data_manager.phase_data) > 0
-        
+        has_phases   = (file_version >= 3.0 and
+                        hasattr(self.data_manager, 'phase_data') and
+                        len(self.data_manager.phase_data) > 0)
+
         if not has_phases:
-            QMessageBox.warning(self, "No Phase Data", "iFFT requires phase information (file version >= 3.0).")
+            QMessageBox.warning(self, "No Phase Data",
+                                "iFFT requires phase information (file version ≥ 3.0).")
             return
-        
-        # ✅ CALCOLA FRAME CORRENTE (FIX: use round() for consistent frame index)
-        current_frame_index = int(round(self.current_position_ms / self.data_manager.frame_duration_ms))
-        current_frame_index = max(0, min(current_frame_index, self.data_manager.total_frames - 1))
-        
-        # ✅ ESTRAI DATI FFT (154 bins, 20-80kHz)
-        try:
-            fft_magnitudes = self.data_manager.fft_data[current_frame_index]  # 154 bins
-            fft_phases_int8 = self.data_manager.phase_data[current_frame_index]  # 154 bins
-        except IndexError:
-            QMessageBox.warning(self, "Data Error", "Frame index out of range.")
+
+        fi = int(round(self.current_position_ms / self.data_manager.frame_duration_ms))
+        fi = max(0, min(fi, self.data_manager.total_frames - 1))
+
+        fs       = self.data_manager.header_info.get('fs',       V5_FS)
+        fft_size = self.data_manager.header_info.get('fft_size', V5_FFT_SIZE)
+
+        fft_mags   = np.asarray(self.data_manager.fft_data[fi],   dtype=np.float64)
+        phase_int8 = np.asarray(self.data_manager.phase_data[fi], dtype=np.int8) \
+                     if fi < len(self.data_manager.phase_data) else np.array([], dtype=np.int8)
+
+        # Use reconstruct_frame_v5 for a consistent raw iFFT (Tukey + Gibbs suppression)
+        #NOTE: normalize=False to get raw iFFT, IFFTWindow will handle normalization separately
+        frame_data = reconstruct_frame_v5(fft_mags, phase_int8, fs, fft_size, normalize=False)
+        if frame_data is None:
+            QMessageBox.critical(self, "iFFT Error", "Failed to reconstruct iFFT for this frame.")
             return
-        
-        # ✅ PARAMETRI FFT DAL FIRMWARE
-        fs = self.data_manager.header_info.get('fs', 200000)
-        fft_size = self.data_manager.header_info.get('fft_size', 512)
-        num_bins_full = fft_size // 2  # 256 bins (0-100kHz)
-        
-        # ✅ CALCOLA RANGE BINS (come nel firmware)
-        bin_freq = fs / fft_size  # 200000/512 = 390.625 Hz/bin
-        bin_start = int(20000 / bin_freq)  # 20000/390.625 = 51
-        bin_end = int(80000 / bin_freq)    # 80000/390.625 = 204
-        num_received_bins = bin_end - bin_start + 1  # 204-51+1 = 154 ✅
-        
-        # ✅ VERIFICA COERENZA DATI
-        if len(fft_magnitudes) != num_received_bins:
-            print(f"⚠️ WARNING: Expected {num_received_bins} bins, got {len(fft_magnitudes)}")
-            num_received_bins = len(fft_magnitudes)  # Usa quello che hai
-        
-        # ✅ RICOSTRUISCI SPETTRO COMPLETO (0-100kHz, 256 bins)
-        full_spectrum_mag = np.zeros(num_bins_full, dtype=np.float32)
-        full_spectrum_phase = np.zeros(num_bins_full, dtype=np.int8)
-        
-        # Inserisci i dati 20-80kHz SENZA windowing (sarà applicata dopo)
-        full_spectrum_mag[bin_start:bin_start + num_received_bins] = fft_magnitudes
-        full_spectrum_phase[bin_start:bin_start + num_received_bins] = fft_phases_int8
-        
-        # ✅ CONVERTI FASI E CREA SPETTRO COMPLESSO
-        fft_phases_rad = (full_spectrum_phase / 127.0) * np.pi
-        complex_spectrum = full_spectrum_mag * np.exp(1j * fft_phases_rad)
-        
-        # ✅ APPLICA TUKEY WINDOW ALLO SPETTRO COMPLESSO (FIX GIBBS CORRETTO)
-        # IMPORTANTE: Window applicata allo spettro complesso, non solo alle magnitude
-        # Questo elimina discontinuità sia in Re{X[k]} che in Im{X[k]}
-        taper_bins = max(5, num_received_bins // 10)
-        
-        # Crea finestra Tukey per la regione completa (256 bins)
-        window_full = np.ones(num_bins_full)
-        
-        # Left taper (bins 51-66, cosine fade-in)
-        for i in range(taper_bins):
-            alpha = i / taper_bins
-            window_full[bin_start + i] = 0.5 * (1 - np.cos(np.pi * alpha))
-        
-        # Right taper (bins 189-204, cosine fade-out)
-        for i in range(taper_bins):
-            alpha = i / taper_bins
-            window_full[bin_start + num_received_bins - i - 1] = 0.5 * (1 - np.cos(np.pi * alpha))
-        
-        # Applica window allo spettro complesso (attenuazione graduale ai bordi)
-        complex_spectrum = complex_spectrum * window_full
-        
-        # ✅ ESEGUI iFFT (ORA con spettro completo 256 bins FORZANDO n=fft_size (512)
-        try:
-            time_domain_signal = np.fft.irfft(complex_spectrum, n=fft_size)
-            time_domain_signal = suppress_edge_artifacts(time_domain_signal)  # ✅ FIX Gibbs
-        except Exception as e:
-            QMessageBox.critical(self, "iFFT Error", f"Failed to compute iFFT:\n{str(e)}")
-            return
-        
-        # ✅ CREA ASSE TEMPORALE CORRETTO
-        num_samples = len(time_domain_signal)  # Dovrebbe essere 512
-        duration_sec = num_samples / fs        # 512/200000 = 2.56ms ✅
-        
-        # ✅ CALCOLA TEMPO INIZIO FRAME (preciso)
-        frame_start_time = current_frame_index * (fft_size / fs)  # t = frame_idx * 2.56ms
-        time_axis = np.linspace(frame_start_time, 
-                            frame_start_time + duration_sec, 
-                            num_samples)
-        
-        # ✅ DEBUG: Verifica risultato
-        actual_duration_ms = duration_sec * 1000
-        print(f"📊 iFFT Window Debug:")
-        print(f"   Frame index: {current_frame_index}")
-        print(f"   Start time: {frame_start_time:.6f}s")
-        print(f"   Duration: {actual_duration_ms:.2f}ms (expected: 2.56ms)")
-        print(f"   Samples: {num_samples} (expected: 512)")
-        print(f"   Bins used: {bin_start}-{bin_start+num_received_bins} ({num_received_bins} bins)")
-        print(f"   Frequency range: {bin_start*bin_freq:.0f} Hz - {(bin_start+num_received_bins)*bin_freq:.0f} Hz")
-        print(f"   ✅ Tukey window applied ({taper_bins} bins taper per side) to reduce edge artifacts")
-        
-        if abs(actual_duration_ms - 2.56) > 0.1:
-            print(f"⚠️ WARNING: Duration mismatch! Got {actual_duration_ms:.2f}ms, expected 2.56ms")
-        
-        if num_samples != fft_size:
-            print(f"⚠️ WARNING: Sample count mismatch! Got {num_samples}, expected {fft_size}")
-        
-        # ✅ CHIUDI FINESTRA PRECEDENTE
+
+        raw_signal = frame_data['signal']
+        num_samples = len(raw_signal)
+        frame_start_time = fi * (fft_size / fs)
+        time_axis = np.linspace(frame_start_time,
+                                frame_start_time + num_samples / fs,
+                                num_samples)
+
+        print(f"📊 iFFT frame {fi}: start={frame_start_time:.6f}s  "
+              f"duration={num_samples/fs*1000:.2f}ms  samples={num_samples}")
+
+        # Close previous window if open
         if hasattr(self, 'ifft_win') and self.ifft_win is not None:
             try:
                 self.ifft_win.close()
                 self.ifft_win.deleteLater()
             except RuntimeError:
                 pass
-        
-        # ✅ CREA FINESTRA
+
         self.ifft_win = IFFTWindow(
-            time_axis, 
-            time_domain_signal, 
-            parent=self,
-            frame_index=current_frame_index,
-            has_real_phases=True
+            time_axis, raw_signal, parent=self,
+            frame_index=fi, has_real_phases=True
         )
+
+        # Respect main window normalization state instead of always normalizing
+        should_normalize = getattr(self, '_using_normalized_means', True)
+        #follow _using_normalized_means to decide whether to show normalized or raw iFFT 
+
+        if has_phases and should_normalize:
+            self.ifft_win._compute_normalized_ifft()
+            if self.ifft_win.signal_data_normalized is not None:
+                self.ifft_win.is_normalized = True
+                self.ifft_win._update_display()
+        else:
+            # Open in raw mode — signal_data_raw already set, is_normalized already False
+            self.ifft_win._update_display()
+
         self.ifft_win.show()
 
 
@@ -2844,7 +1856,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
             freq_item = self.peak_table.item(row, 1)
             amp_item = self.peak_table.item(row, 2)
             event_freq = float(freq_item.text().replace(' Hz', '')) if freq_item else 0
-            event_amp = float(amp_item.text().replace(' V', '')) if amp_item else 0
+            event_amp = float(amp_item.text().replace(' mV', '')) if amp_item else 0
             event_type = "Auto-detected Peak"
         
         else:
@@ -2883,38 +1895,30 @@ class ReplayWindowAudio(ReplayBaseWindow):
     # === PEAK THRESHOLD FILTER METHODS ===
     def _apply_threshold_filter(self):
         """
-        Filtra e mostra tutti i picchi sopra la soglia impostata.
-        """
-        threshold = self.PeakThresholdSpinBox.value() * 0.001  # Converti mV in V
+        Show all frames whose normalized FFT mean exceeds k × Ê_floor.
 
-        if len(self.data_manager.fft_means) == 0:
-            QMessageBox.warning(self, "No Data", "No FFT data available for analysis.")
-            return
-        
-        print(f"🔍 Ricerca picchi sopra {threshold:.6f} V...")
-        
-        # ✅ Trova tutti i picchi sopra soglia (MOLTO VELOCE con NumPy)
-        peak_indices = np.where(self.data_manager.fft_means >= threshold)[0]
-        
-        if len(peak_indices) == 0:
-            #QMessageBox.information(self, "No Peaks Found", 
-            #                        f"No peaks found above {threshold:.6f} V")
+        k is read from PeakThresholdSpinBox. Ê_floor(i) is the per-frame
+        adaptive noise floor estimate from AdaptiveNoiseEstimatorV5.
+        Consecutive above-threshold frames are grouped (MAX_GAP = 5 frames).
+        """
+        k = self.PeakThresholdSpinBox.value()
+
+        if (len(self.data_manager.fft_means) == 0 or
+                len(self.data_manager.E_hat_floor_arr) == 0):
             self.peak_table.setRowCount(0)
             return
-        
-        # ✅ OTTIMIZZAZIONE: Raggruppa picchi consecutivi (evita duplicati)
-        peaks_grouped = self._group_consecutive_peaks(peak_indices)
-        
-        # Popola tabella
-        self._populate_peak_table(peaks_grouped, threshold)
-        
-        #Imposta la vista sulla tabella dei picchi
-        self.click_tab_widget.setCurrentWidget(self.peak_table)
 
-        # Feedback
-        print(f"✅ Trovati {len(peaks_grouped)} picchi sopra soglia")
-        #QMessageBox.information(self, "Analysis Complete", 
-         #                       f"Found {len(peaks_grouped)} peaks above {threshold:.6f} V")
+        threshold_arr = k * self.data_manager.E_hat_floor_arr
+        peak_indices  = np.where(self.data_manager.fft_means >= threshold_arr)[0]
+
+        if len(peak_indices) == 0:
+            self.peak_table.setRowCount(0)
+            return
+
+        peaks_grouped = self._group_consecutive_peaks(peak_indices)
+        self._populate_peak_table(peaks_grouped, threshold_arr)
+        self.click_tab_widget.setCurrentWidget(self.peak_table)
+        print(f"✅ Found {len(peaks_grouped)} candidate groups above k={k:.2f} × Ê_floor")
 
     def _group_consecutive_peaks(self, indices, max_gap_frames=5):
         """
@@ -2938,239 +1942,90 @@ class ReplayWindowAudio(ReplayBaseWindow):
         
         return groups
 
-    def _populate_peak_table(self, peak_groups, threshold):
-        """Popola la tabella peak_table con i risultati"""
+    def _populate_peak_table(self, peak_groups, threshold_arr):
+        """Populate the above-threshold table. threshold_arr may be scalar or per-frame array."""
         self.peak_table.setRowCount(len(peak_groups))
-        
+
         for row, group in enumerate(peak_groups):
-            # Prendi il frame con ampiezza massima nel gruppo
             max_idx_in_group = np.argmax([self.data_manager.fft_means[i] for i in group])
             peak_frame = group[max_idx_in_group]
-            
-            timestamp = self.data_manager.fft_timestamps[peak_frame]
-            amplitude = self.data_manager.fft_means[peak_frame]
-            
-            # Calcola durata del gruppo
+
+            timestamp       = self.data_manager.fft_timestamps[peak_frame]
+            energy          = self.data_manager.fft_means[peak_frame]   # [V²]
             duration_frames = len(group)
-            duration_us = duration_frames * 2560  # 2560 μs per frame
-            
-            # ✅ Stima frequenza (se disponibile FFT del frame)
+
+            # Convert energy [V²] → RMS amplitude [mV] for display
+            amp_rms_mv = float(np.sqrt(max(energy, 0.0))) * 1000.0
+
             if peak_frame < len(self.data_manager.fft_data):
                 fft_frame = self.data_manager.fft_data[peak_frame]
-                peak_freq_idx = np.argmax(fft_frame)
-                frequency = self.data_manager.frequency_axis[peak_freq_idx] if len(self.data_manager.frequency_axis) > peak_freq_idx else 0
+                freq_axis = np.array(self.data_manager.frequency_axis)
+                peak_freq_idx = int(np.argmax(np.abs(fft_frame)))
+                frequency = float(freq_axis[peak_freq_idx]) if peak_freq_idx < len(freq_axis) else 0.0
             else:
-                frequency = 0
-            
-            # Popola riga
+                frequency = 0.0
+
+            if hasattr(threshold_arr, '__len__') and peak_frame < len(threshold_arr):
+                thr_at_frame = float(threshold_arr[peak_frame])
+            else:
+                thr_at_frame = float(threshold_arr)
+
             self.peak_table.setItem(row, 0, QTableWidgetItem(f"{timestamp:.3f}s"))
             self.peak_table.setItem(row, 1, QTableWidgetItem(f"{frequency:.0f} Hz"))
-            self.peak_table.setItem(row, 2, QTableWidgetItem(f"{amplitude:.6f} V"))
+            self.peak_table.setItem(row, 2, QTableWidgetItem(f"{amp_rms_mv:.4f} mV"))   # FIX: sqrt(E)
             self.peak_table.setItem(row, 3, QTableWidgetItem(f"{duration_frames} FFT"))
-            self.peak_table.setItem(row, 4, QTableWidgetItem("Auto-detected"))
+            self.peak_table.setItem(row, 4, QTableWidgetItem(
+                f"SNR {energy/thr_at_frame:.1f}×" if thr_at_frame > 0 else ""))
 
     def _update_threshold_line(self):
-        """Aggiorna la linea di soglia sul grafico del time domain"""
-        threshold_value = self.PeakThresholdSpinBox.value() * 0.001  # Converti mV a V
-        self.threshold_line.setValue(threshold_value)
+        """
+        Rebuild the adaptive threshold curve on the time-domain plot.
+
+        The curve shows  k × Ê_floor(i)  over all frames, where k is set by
+        the SpinBox and Ê_floor(i) is the per-frame noise floor estimate from
+        AdaptiveNoiseEstimatorV5 (pre-computed at load time).
+        """
+        k = self.PeakThresholdSpinBox.value()
+
+        if (len(self.data_manager.E_hat_floor_arr) == 0 or
+                len(self.data_manager.fft_timestamps) == 0):
+            return
+
+        threshold_y = k * self.data_manager.E_hat_floor_arr
+        self.threshold_curve.setData(self.data_manager.fft_timestamps, threshold_y)
+
+        # Update the raw noise floor line (Ê_floor without k).
+        # This is the same array the threshold is derived from — showing it
+        # directly lets you verify that the estimator tracks the background correctly.
+        self.noise_floor_curve.setData(
+            self.data_manager.fft_timestamps,
+            self.data_manager.E_hat_floor_arr   # [V²], no k multiplier
+        )
 
     
-    def normalize_fft_window(self):
+    def _compute_fft_for_display(self, frame_index: int) -> tuple:
         """
-        Applica normalizzazione CONSERVATIVA (50%) per risposta in frequenza del microfono.
-        
-        APPROCCIO:
-        - Non modifica dati originali (display-only overlay)
-        - Correzione al 50% basata su datasheet SPU0410LR5H-QB
-        - Mostra entrambe le curve (raw + normalized) per confronto
-        
-        ERRORE STIMATO: ±2.9 dB (95% confidence)
-        ADATTO PER: Analisi qualitative (forma spettro, confronti relativi)
-        NON ADATTO PER: Misure assolute di pressione sonora (dB SPL)
-        
-        DOCUMENTAZIONE: Vedi docs/MICROPHONE_NORMALIZATION_TECHNICAL_REPORT.md
+        Return (freq_axis, magnitudes) for the FFT plot, normalized or raw
+        depending on _using_normalized_means.
+        Always returns data in the analysis-band slice (len = freq_axis).
         """
-        if self.data_manager.total_frames == 0:
-            QMessageBox.warning(self, "No Data", "No FFT data loaded.")
-            return
-        
-        print("🔧 Starting 50% conservative microphone normalization...")
-        
-        # === 1. DATI DAL DATASHEET (SPU0410LR5H-QB) ===
-        # Fonte: Fig. 4 - "Ultrasonic Free Field Response Normalized to 1kHz"
-        # Valori letti manualmente dal grafico (±0.5 dB accuracy)
-        datasheet_freq_khz = np.array([20, 25, 30, 40, 50, 60, 70, 80])
-        datasheet_response_db = np.array([8.0, 10.5, 6.0, -2.0, -6.0, -7.0, -6.0, -4.0])
-        
-        datasheet_freq_hz = datasheet_freq_khz * 1000
-        
-        # === 2. OTTIENI SPETTRO FFT CORRENTE (FIX: use round() for consistent frame index) ===
-        frame_index = int(round(self.current_position_ms / self.data_manager.frame_duration_ms))
-        frame_index = max(0, min(frame_index, self.data_manager.total_frames - 1))
-        
-        if frame_index >= len(self.data_manager.fft_data):
-            QMessageBox.warning(self, "Invalid Frame", "Cannot access FFT data for current frame.")
-            return
-        
-        original_fft = self.data_manager.fft_data[frame_index]
-        freq_axis = self.data_manager.frequency_axis
-        
-        # === 3. FILTRA RANGE 20-80 kHz ===
-        valid_mask = (freq_axis >= 20000) & (freq_axis <= 80000)
-        freq_range = freq_axis[valid_mask]
-        
-        if len(freq_range) == 0:
-            QMessageBox.warning(self, "Invalid Range", "No frequencies in 20-80 kHz range.")
-            return
-        
-        # === 4. INTERPOLAZIONE RISPOSTA MICROFONO ===
-        mic_response_db = np.interp(freq_range, datasheet_freq_hz, datasheet_response_db)
-        
-        # === 5. CALCOLA CORREZIONE AL 50% (CONSERVATIVA) ===
-        # Se mic attenua di -5 dB, amplifico solo +2.5 dB (50%)
-        correction_gain_50 = 10 ** (-mic_response_db * 0.5 / 20.0)
-        
-        # === 6. CREA ARRAY DI CORREZIONE PER INTERO SPETTRO ===
-        full_correction = np.ones(len(freq_axis))
-        full_correction[valid_mask] = correction_gain_50
-        
-        # === 7. APPLICA CORREZIONE ===
-        normalized_fft = original_fft * full_correction
-        
-        # === 8. STATISTICHE CORREZIONE ===
-        max_gain = np.max(correction_gain_50)
-        min_gain = np.min(correction_gain_50)
-        max_gain_db = 20 * np.log10(max_gain)
-        min_gain_db = 20 * np.log10(min_gain)
-        
-        print(f"📊 Normalization stats (50% conservative):")
-        print(f"   Gain range: {min_gain_db:.2f} dB to {max_gain_db:.2f} dB")
-        print(f"   Max gain at: {freq_range[np.argmax(correction_gain_50)]/1000:.1f} kHz")
-        print(f"   Min gain at: {freq_range[np.argmin(correction_gain_50)]/1000:.1f} kHz")
-        print(f"   Estimated error: ±2.9 dB (95% confidence)")
-        
-        # === 9. MOSTRA OVERLAY GRAFICO ===
-        # Rimuovi curve esistenti (se presenti)
-        if hasattr(self, 'normalized_fft_curve'):
-            try:
-                self.plot_widget_fft.plot_widget.removeItem(self.normalized_fft_curve)
-            except:
-                pass
-        
-        # Aggiungi curva normalizzata (overlay ROSSO)
-        self.normalized_fft_curve = self.plot_widget_fft.plot_widget.plot(
-            freq_axis, normalized_fft,
-            pen={'color': 'red', 'width': 2},
-            name='Normalized (50%)'
-        )
-        
-        # Assicurati che la curva raw mantenga l'accent_color del tema
-        if hasattr(self, 'theme_manager'):
-            self.theme_manager.apply_theme_to_plot(
-                plot_widget_name=self.plot_widget_fft.plot_widget,
-                plot_instance=self.fft_curve
-            )
-        self.fft_curve.setData(freq_axis, original_fft)
-        
-        # Aggiorna legenda
-        if hasattr(self.plot_widget_fft.plot_widget, 'addLegend'):
-            try:
-                self.plot_widget_fft.plot_widget.addLegend()
-            except:
-                pass  # Legenda già presente
-        
-        # === 10. STAGE 2 FFT FILTER EVALUATION (v4.0) ===
-        # Thresholds (align with click_detector_dialog defaults)
-        STAGE2_MAX_SPR   = 20.0
-        STAGE2_MIN_PEAK  = 0.00085   # 0.85 mV in V (FFT data in V)
+        raw_mags  = np.asarray(self.data_manager.fft_data[frame_index], dtype=np.float64)
+        freq_axis = np.array(self.data_manager.frequency_axis)
 
-        # Peak amplitude of normalized spectrum (in range 20-80 kHz)
-        peak_fft_norm = float(np.max(normalized_fft[valid_mask]))
+        if not getattr(self, '_using_normalized_means', True):
+            # Raw — show as-is
+            return freq_axis, raw_mags
 
-        # SPR = peak / (mean of neighbours in full spectrum, simple approximation)
-        peak_bin = int(np.argmax(normalized_fft))
-        N = len(normalized_fft)
-        NEIGHBOUR_HALF = max(1, N // 40)   # ~2.5% of bins as neighbour window
-        n_lo = max(0, peak_bin - NEIGHBOUR_HALF)
-        n_hi = min(N, peak_bin + NEIGHBOUR_HALF + 1)
-        # Exclude peak bin itself, use surrounding bands
-        side_lo = normalized_fft[max(0, n_lo - NEIGHBOUR_HALF * 2):n_lo]
-        side_hi = normalized_fft[n_hi:min(N, n_hi + NEIGHBOUR_HALF * 2)]
-        sides = np.concatenate([side_lo, side_hi])
-        mean_neighbours = float(np.mean(sides)) if len(sides) > 0 else 1e-12
-        spr_val = peak_fft_norm / mean_neighbours if mean_neighbours > 0 else 999.0
+        # Normalized — pad into full half-spectrum then apply mic correction
+        fs       = self.data_manager.header_info.get('fs',       V5_FS)
+        fft_size = self.data_manager.header_info.get('fft_size', V5_FFT_SIZE)
+        full_freq = np.arange(fft_size // 2) * (fs / fft_size)
+        full_mags = np.zeros(fft_size // 2, dtype=np.float64)
+        n_bins = min(len(raw_mags), V5_BIN_END - V5_BIN_START + 1)
+        full_mags[V5_BIN_START : V5_BIN_START + n_bins] = raw_mags[:n_bins]
+        norm_mags = _normalize_fft(full_mags, full_freq)
+        return freq_axis, norm_mags[V5_BIN_START : V5_BIN_START + len(freq_axis)]
 
-        peak_pass_s2  = (peak_fft_norm >= STAGE2_MIN_PEAK)
-        spr_pass_s2   = (spr_val <= STAGE2_MAX_SPR)
-        stage2_pass   = peak_pass_s2 and spr_pass_s2
-
-        s2_icon = "✅" if stage2_pass else "❌"
-        peak_icon = "✅" if peak_pass_s2 else "❌"
-        spr_icon  = "✅" if spr_pass_s2  else "❌"
-
-        stage2_html = (
-            f"<hr>"
-            f"<b>Stage 2 FFT Filter (v4.0)</b><br>"
-            f"{s2_icon} <b>{'PASS' if stage2_pass else 'FAIL'}</b> — normalized FFT<br>"
-            f"&nbsp;&nbsp;{peak_icon} Peak FFT: <b>{peak_fft_norm*1000:.3f} mV</b>"
-            f"  (need ≥ 0.85 mV)<br>"
-            f"&nbsp;&nbsp;{spr_icon} SPR: <b>{spr_val:.1f}</b>"
-            f"  (need ≤ 20)<br>"
-            f"<span style='font-size:9pt; color:gray;'>"
-            f"Peak bin: {freq_axis[peak_bin]/1000:.1f} kHz"
-            f"</span>"
-        )
-
-        # === 11. FEEDBACK UTENTE ===
-        msg = QMessageBox(self)
-        msg.setIcon(QMessageBox.Information)
-        msg.setWindowTitle("Normalization Applied (Display Only)")
-        msg.setText(
-            f"<b>50% Conservative Normalization Applied</b><br><br>"
-            f"<b>Correction Range:</b> {min_gain_db:.1f} to {max_gain_db:.1f} dB<br>"
-            f"<b>Estimated Error:</b> ±2.9 dB (95% confidence)<br>"
-            f"<b>Peak correction:</b> {freq_range[np.argmax(correction_gain_50)]/1000:.1f} kHz<br><br>"
-            f"<b>Theme color curve:</b> Raw data<br>"
-            f"<font color='red'><b>Red curve:</b> Normalized (50%)</font><br><br>"
-            f"⚠️ <b>Original data unchanged</b> (overlay display only)<br>"
-            f"📝 Suitable for <b>qualitative analysis</b> only<br>"
-            f"📖 See technical report for details<br>"
-            f"{stage2_html}"
-        )
-        msg.setStyleSheet("""
-            QMessageBox {
-                background-color: #2b2b2b;
-                color: #e0e0e0;
-            }
-            QLabel {
-                color: #e0e0e0;
-            }
-            QTextEdit {
-                background-color: #2b2b2b;
-                color: #e0e0e0;
-            }
-            QPushButton {
-                background-color: #3a3a3a;
-                color: #e0e0e0;
-                border-radius: 6px;
-                padding: 8px 16px;
-            }
-            QPushButton:hover {
-                background-color: #4a4a4a;
-            }
-        """)
-        msg.exec()
-
-        print(f"✅ Normalization overlay displayed  |  Stage 2: {'PASS' if stage2_pass else 'FAIL'}"
-              f"  peak={peak_fft_norm*1000:.3f} mV  SPR={spr_val:.1f}")
-        
-        # Salva dati normalizzati per iFFT window
-        self._normalized_fft_cache = {
-            'frame_index': frame_index,
-            'normalized_fft': normalized_fft,
-            'correction_gain': full_correction
-        }
-    
     def _execute_trim_export(self, params):
         """
         Esegue l'export trimmed del file audio.
@@ -3189,47 +2044,81 @@ class ReplayWindowAudio(ReplayBaseWindow):
         # Esegui export
         return exporter.execute_trim_export(params)
     
-    def open_click_detector_dialog(self):
+    def toggle_normalized_data(self):
         """
-        Apre il dialog per l'algoritmo di rilevamento automatico dei click.
-        
-        Pipeline a 4 stadi:
-        1. Energy threshold (μ + Nσ)
-        2. Spectral ratio check (broadband test)
-        3. Decay analysis (Hilbert envelope)
-        4. Deduplication (frame consecutivi)
-        """
-        if self.data_manager.total_frames == 0:
-            QMessageBox.warning(self, "No Data", "No audio data loaded.\nPlease open a .paudio file first.")
-            return
-        
-        # Verifica che le fasi siano disponibili (necessarie per iFFT)
-        file_version = self.data_manager.header_info.get('version', 0)
-        has_phases = (file_version >= 3.0) and hasattr(self.data_manager, 'phase_data') and len(self.data_manager.phase_data) > 0
-        
-        if not has_phases:
-            QMessageBox.warning(
-                self, 
-                "Phase Data Required", 
-                "Automatic click detection requires phase information for iFFT reconstruction.\n\n"
-                "File version must be ≥ 3.0 with phase data included."
-            )
-            return
-        
-        # Importa dialog
-        from components.click_detector_dialog import ClickDetectorDialog
-        
-        # Crea e mostra dialog
-        dialog = ClickDetectorDialog(self.data_manager, parent=self)
-        dialog.exec()
-        
-        print("✅ Click Detector Dialog closed")
+        Toggle between normalized and raw FFT means for the main energy timeline PLUS FFT window.
 
-    def open_batch_export_screenshots(self):
+        Recomputes fft_means using normalized (default) or raw magnitudes,
+        rebuilds the adaptive threshold curve, and refreshes the above-threshold table.
+        This affects: the time-domain energy plot, the threshold curve, and the table.
+        Also affects the FFT window.
+        The iFFT window has its own independent toggle.
         """
-        Lancia il sistema di export batch screenshot per tutti i click rilevati.
-        Richiede che il Click Detector sia stato eseguito prima.
-        Usa pyqtgraph off-screen (nessuna dipendenza da matplotlib).
-        """
-        from components.batch_export_screenshots import launch_batch_export
-        launch_batch_export(self)
+        # Determine new mode (if E_hat_floor_arr exists we're post-load)
+        if self.data_manager.total_frames == 0:
+            return
+
+        # Toggle the fft_means array between normalized and raw
+        if not hasattr(self, '_using_normalized_means'):
+            self._using_normalized_means = True   # we start in normalized mode
+
+        self._using_normalized_means = not self._using_normalized_means
+
+        n = self.data_manager.total_frames
+        # ── Progress dialog ───────────────────────────────────────────────────
+        label = ("Recomputing normalized FFT means…"
+                 if self._using_normalized_means
+                 else "Switching to raw FFT means…")
+
+        progress = QProgressDialog(label, None, 0, n, self)  # no Cancel button
+        progress.setWindowTitle("Please wait")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)   # show immediately, no delay
+        progress.setValue(0)
+        progress.show()
+        QCoreApplication.processEvents()
+
+        def _cb(current, total):
+            progress.setValue(current)
+            QCoreApplication.processEvents()
+
+        # ── Recompute ─────────────────────────────────────────────────────────
+        if self._using_normalized_means:
+            self.data_manager.precompute_fft_means(progress_callback=_cb)
+            print("✅ Switched to normalized FFT means")
+        else:
+            # FIX: store energy [V²] (not mean amplitude [V]) to stay consistent
+            # with E_hat_floor_arr units and Stage 1 criterion.
+            raw_means = np.empty(n, dtype=np.float32)
+            for i in range(n):
+                raw_means[i] = float(compute_fft_energy_v5(
+                    np.asarray(self.data_manager.fft_data[i], dtype=np.float64)
+                ))
+                if i % 50 == 0:
+                    _cb(i, n)
+            self.data_manager.fft_means = raw_means
+            _cb(n, n)
+            print("✅ Switched to raw FFT means")
+
+        progress.close()
+
+        # Refresh the energy plot
+        stream_x, stream_y = self.data_manager.get_streaming_data()
+        # Re-map streaming Y to the current fft_means values
+        if len(self.data_manager.fft_timestamps) > 0:
+            # Rebuild streaming Y from fft_means (which are already per-frame)
+            start_frame = int(self.data_manager.streaming_start_time * 1000
+                              / self.data_manager.frame_duration_ms)
+            end_frame   = int(self.data_manager.streaming_end_time   * 1000
+                              / self.data_manager.frame_duration_ms)
+            end_frame   = min(end_frame, self.data_manager.total_frames)
+            new_y = self.data_manager.fft_means[start_frame:end_frame]
+            new_x = self.data_manager.fft_timestamps[start_frame:end_frame]
+            self.time_curve.setData(new_x, new_y)
+
+        # Rebuild threshold curve and table
+        self._update_threshold_line()
+        self._apply_threshold_filter()
+
+        # Update FFT window
+        self.update_display()

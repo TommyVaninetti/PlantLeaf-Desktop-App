@@ -93,8 +93,23 @@ class ThemeManager:
         try:
             with open(theme_path, 'r', encoding='utf-8') as f:
                 css = f.read()
-            # Cerca un colore "accent" (es: background-color di QPushButton:checked)
+            # Cerca un colore "accent" (background-color di QPushButton:checked)
             accent = re.search(r'QPushButton:checked\s*{[^}]*background-color:\s*([^;]+);', css)
+            if accent:
+                return accent.group(1).strip()
+        except Exception as e:
+            print(f"Errore lettura accent color: {e}")
+        return "#007bff"  # fallback
+    
+    def get_darker_accent_color(self, theme_name=None):
+        if theme_name is None:
+            theme_name = self.current_theme
+        theme_path = os.path.join(self.themes_dir, theme_name)
+        try:
+            with open(theme_path, 'r', encoding='utf-8') as f:
+                css = f.read()
+            # Cerca un colore "accent" (border-color di QPushButton:checked)
+            accent = re.search(r'QPushButton:checked\s*{[^}]*border-color:\s*([^;]+);', css)
             if accent:
                 return accent.group(1).strip()
         except Exception as e:

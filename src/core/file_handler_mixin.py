@@ -227,9 +227,12 @@ class FileHandlerMixin:
         dm.streaming_start_time = data['streaming_start_time']
         dm.streaming_end_time = data['streaming_end_time']
         
-        # ✅ PRECALCOLA LE MEDIE FFT
-        print("🔄 Precalcolo medie FFT...")
-        dm.precompute_fft_means()
+        # Pre-computed arrays
+        dm.fft_means       = data['fft_means']        # np.float32[n_frames]
+        dm.fft_timestamps  = data['fft_timestamps']   # np.float64[n_frames]
+        dm.E_hat_floor_arr = data['E_hat_floor_arr']  # np.float32[n_frames]
+        dm.noise_floor_arr = data['noise_floor_arr']  # np.float32[n_frames]
+        dm.std_noise_arr   = data['std_noise_arr']    # np.float32[n_frames]
         
         # Setup UI
         replay_window._setup_metadata()
