@@ -19,7 +19,7 @@ QPushButton:pressed {
 QPushButton:checked {
     background-color: #689f67;
     color: white;
-    border-color: #5a8859;
+    border-color: #517e50;
 }
 
 /* ==== QMainWindow ==== */

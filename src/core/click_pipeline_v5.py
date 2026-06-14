@@ -57,14 +57,21 @@ W_NOISE        = 750    # Circular-buffer length for the noise estimator.
                         # <7% of entries and barely shifts the minimum.
                         # Short enough to track 1-5 s environmental transitions
                         # (wind gusts, passing vehicles).
+M_SUBWINDOWS   = 10                        # Number of sub-windows
+SUBWINDOW_SIZE = W_NOISE // M_SUBWINDOWS   # = 75 frames per sub-window (~192 ms at 390 FPS)
+                        # Robustness argument: a single glitch frame affects at most 1 of 10 sub-window
+                        # minima. The median of 10 values is insensitive to a single outlier — it would
+                        # require ≥ 5/10 sub-windows contaminated to shift the median, which is
+                        # physically implausible for isolated glitches. (Martin 2001)
 
-BETA           = 1.5    # Martin (2001) minimum-statistics bias correction.
+BETA           = 1.3    # Martin (2001) minimum-statistics bias correction.
                         # The minimum of a finite buffer of noisy values
                         # systematically underestimates the true floor;
-                        # β = 1.5 corrects this bias (validated in the original
+                        # β = 1.3 corrects this bias (validated in the original
                         # Martin 2001 paper on speech noise estimation).
+                        # Slightly lower than usually used 1.5 since we operate on the median.
 
-ALPHA          = 2.0    # Burst exclusion multiplier: a frame is considered
+ALPHA          = 4.0    # Burst exclusion multiplier: a frame is considered
                         # energetic (and excluded from buffers) when
                         #   E_i  >  ALPHA × Ê_floor(i-1).
                         # → verify experimentally on outdoor recordings.
@@ -363,6 +370,7 @@ def reconstruct_frame_v5(
     phase_int8: np.ndarray,
     fs:         int = FS,
     fft_size:   int = FFT_SIZE,
+    normalize:  bool = True #False = skip mic correction (raw FFT)
 ) -> Optional[dict]:
     """
     Reconstruct the time-domain signal from a single FFT frame. (inverseFFT)
@@ -425,7 +433,10 @@ def reconstruct_frame_v5(
     full_phase[bin_start : bin_start + n_bins] = phase_int8[:n_bins]
 
     # ── Step 1b: mic normalization ────────────────────────────────────────────
-    fft_norm = _normalize_fft(full_mag, freq_axis)
+    if normalize: #default True
+        fft_norm = _normalize_fft(full_mag, freq_axis)
+    else:
+        fft_norm = full_mag.copy()   # skip correction
 
     # ── Step 1c: build complex spectrum ──────────────────────────────────────
     # int8 phase [-127, +127] maps linearly to [-π, +π]
@@ -516,6 +527,53 @@ class AdaptiveNoiseEstimatorV5:
         self._noise_floor = 0.0
         self._std_noise   = 0.0
 
+    def _median_of_local_minima(self, buffer: np.ndarray) -> float:
+        """
+        Compute  median(m_1, …, m_M)  where  m_j = min(sub-window j).
+
+        Divides `buffer` into M_SUBWINDOWS non-overlapping sub-windows of
+        SUBWINDOW_SIZE entries each (§4.5, §4.6).
+
+        Partial buffer (during warm-up):
+          - If fewer than SUBWINDOW_SIZE entries are present → global min fallback
+            (same conservative behaviour as before, only for the first 75 frames).
+          - Otherwise: as many complete sub-windows as fit, plus a partial final
+            sub-window for the remainder — median over however many m_j exist.
+
+        NOTE: β (BETA) correction is NOT applied here — the caller multiplies
+        by BETA so that the correction is clearly visible at the call site.
+        """
+        n = len(buffer)
+        if n == 0:
+            return 0.0
+
+        if n < SUBWINDOW_SIZE:
+            # Fewer entries than one sub-window: no basis for median yet.
+            # Fall back to global minimum — same as previous behaviour.
+            # This only occurs for the very first SUBWINDOW_SIZE = 75 frames.
+            return float(np.min(buffer))
+
+        local_mins = []
+        for j in range(M_SUBWINDOWS):
+            start = j * SUBWINDOW_SIZE
+            end   = start + SUBWINDOW_SIZE
+            if end <= n:
+                # Complete sub-window
+                local_mins.append(float(np.min(buffer[start:end])))
+            elif start < n:
+                # Partial final sub-window (warm-up: buffer not yet full)
+                local_mins.append(float(np.min(buffer[start:n])))
+                break  # no more sub-windows can start
+            else:
+                break  # start >= n: nothing left
+
+        # Should never be empty here (n >= SUBWINDOW_SIZE guarantees ≥1 window),
+        # but guard defensively.
+        if not local_mins:
+            return float(np.min(buffer))
+
+        return float(np.median(local_mins))
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -551,6 +609,7 @@ class AdaptiveNoiseEstimatorV5:
         Though stage 3 is accessed only when events pass stage 1, both estimators are
         updated every frame becuase they both need SILENT frames and are not that heavy.
         """
+        
         self._frame_count += 1
         in_warmup = (self._frame_count <= WARM_UP_FRAMES)
 
@@ -575,21 +634,21 @@ class AdaptiveNoiseEstimatorV5:
                 self._fill += 1
 
         # ── Estimate update ───────────────────────────────────────────────────
-        # Compute new floor and std estimates from whatever is in the buffers.
-        # We must read only valid entries (indices 0.._fill-1 when not yet full,
-        # or all W entries once the buffer has wrapped).
+        # media of local minima instead of global minimum to reduce bias from outliers and non-stationary noise.
         if self._fill > 0:
             valid_B1      = self._B1[:self._fill]
             valid_B2_mean = self._B2_mean[:self._fill]
             valid_B2_std  = self._B2_std[:self._fill]
 
-            # BETA corrects the systematic downward bias of the minimum
-            # (Martin 2001 — see module constants for details).
-            self._E_hat_floor = BETA * float(np.min(valid_B1))
-            self._noise_floor = BETA * float(np.min(valid_B2_mean))
+            # §4.5: Ê_floor = β · median(m_1,…,m_M)  where m_j = min(sub-window j of B1)
+            # β = BETA = 1.5 corrects the systematic downward bias of local minima (Martin 2001).
+            self._E_hat_floor = BETA * self._median_of_local_minima(valid_B1)
 
-            # std_noise uses the MEAN of per-frame stds, not the minimum.
-            # We want the typical noise variability, not its lowest value.
+            # §4.6: same method for noise_floor (B2_mean)
+            self._noise_floor = BETA * self._median_of_local_minima(valid_B2_mean)
+
+            # §4.6: std_noise uses MEAN of per-frame stds — captures typical
+            # variability, not its floor. Unchanged from previous implementation.
             self._std_noise   = float(np.mean(valid_B2_std))
 
         return {
@@ -738,7 +797,8 @@ def run_stage1_v5(dm, k: float = K_STAGE1_DEFAULT) -> list:
         # (not just candidates) so that the B2 buffer stays current.
         if frame_idx < len(dm.phase_data):
             frame_data = reconstruct_frame_v5(
-                dm.fft_data[frame_idx], dm.phase_data[frame_idx], fs, fft_size
+                dm.fft_data[frame_idx], dm.phase_data[frame_idx], 
+                fs, fft_size, normalize=True ###DEFAULT MIC CORRECTION ENABLED
             )
         else:
             frame_data = None
@@ -1582,7 +1642,7 @@ def _feat_fft_features(
     max_power  = float(np.max(band_power))
 
     # SPR
-    spr = max_power / mean_power if mean_power > 1e-30 else 0.0
+    spr = max_power / mean_power if mean_power > 1e-30 else 0.0 #avoid 0 division
 
     # R_spectral: split analysis band at 40 kHz
     # _BIN_MID is the absolute index; relative index within the band slice:

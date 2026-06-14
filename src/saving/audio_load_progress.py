@@ -21,6 +21,17 @@ import struct
 import json
 import zlib
 import os
+from core.click_pipeline_v5 import (  #keep functions and constants in sync with click_pipeline_v5.py
+    _normalize_fft,
+    reconstruct_frame_v5,
+    compute_hilbert_envelope,
+    compute_fft_energy as _compute_fft_energy_v5,
+    AdaptiveNoiseEstimatorV5,
+    _BIN_START as V5_BIN_START,
+    _BIN_END   as V5_BIN_END,
+    FS         as V5_FS,
+    FFT_SIZE   as V5_FFT_SIZE,
+)
 
 class AudioLoadWorker(QObject):
     progress = Signal(int)      # percentuale
@@ -144,7 +155,7 @@ class AudioLoadWorker(QObject):
                         
                         # Progress throttling
                         if frame_count % 500 == 0 and frame_count > 0:
-                            new_progress = 5 + int((offset / total_bytes) * 80)
+                            new_progress = 5 + int((offset / total_bytes) * 53) # 5-58%
                             if new_progress > last_progress:
                                 self.progress.emit(new_progress)
                                 last_progress = new_progress
@@ -178,7 +189,7 @@ class AudioLoadWorker(QObject):
                     
                     current_fft = []
                     frame_idx = 0
-                    last_progress = 5  # ✅ INIZIA DA 5
+                    last_progress = 5
 
                     for i, value in enumerate(fft_array):
                         if self._cancelled:
@@ -192,9 +203,9 @@ class AudioLoadWorker(QObject):
                         else:
                             current_fft.append(value)
                         
-                        # ✅ THROTTLING: Ogni 5000 campioni (non 1000)
+                        # THROTTLING: Ogni 5000 campioni
                         if i % 5000 == 0 and i > 0:
-                            new_progress = 5 + int((i / len(fft_array)) * 80)  # 5-85%
+                            new_progress = 5 + int((i / len(fft_array)) * 53)  # 5-58%
                             if new_progress > last_progress:
                                 self.progress.emit(new_progress)
                                 last_progress = new_progress
@@ -203,8 +214,8 @@ class AudioLoadWorker(QObject):
                         fft_data.append(np.array(current_fft))
                         phase_data.append(np.zeros(samples_per_fft, dtype=np.int8))
 
-                # ✅ CHECKPOINT 85%
-                self.progress.emit(85)
+                # CHECKPOINT 58%
+                self.progress.emit(58)
                 
                 total_frames = len(fft_data)
                 if total_frames == 0:
@@ -219,8 +230,8 @@ class AudioLoadWorker(QObject):
                 frequency_axis = np.linspace(freq_min, freq_max, samples_per_fft)
 
                 # STEP 3: Click events
-                # ✅ CHECKPOINT 90%
-                self.progress.emit(90)
+                # CHECKPOINT 59%
+                self.progress.emit(59)
                 
                 click_events = []
                 try:
@@ -238,85 +249,137 @@ class AudioLoadWorker(QObject):
                 except:
                     click_events = []
 
-                # STEP 4: Metadata
-                # ✅ CHECKPOINT 93%
-                self.progress.emit(93)
-                
+                # STEP 4: Metadata and timing calculations
+                                
                 estimated_fft_rate = 390.0
                 frame_duration_ms = 1000.0 / estimated_fft_rate
                 total_duration_sec = (total_frames * frame_duration_ms / 1000.0)
 
-                # STEP 5: Overview
-                # ✅ CHECKPOINT 95%
-                self.progress.emit(95)
-                
-                overview_fps = 10
-                overview_points = int(total_duration_sec * overview_fps)
-                frame_step = max(1, total_frames // overview_points)
-                overview_x = []
-                overview_y = []
-                
-                for i in range(0, total_frames, frame_step):
-                    if self._cancelled:
-                        return
-                    frame_time = (i * frame_duration_ms) / 1000.0
-                    energy = np.mean(np.abs(fft_data[i]))
-                    overview_x.append(frame_time)
-                    overview_y.append(energy)
-                
-                overview_x = np.array(overview_x)
-                overview_y = np.array(overview_y)
+            # NEW STEP 4.5: Precompute FFT means + adaptive noise  (was in main thread)
+            # Runs in the worker thread so the UI never freezes.
+            # Progress goes from 60 → 92 % during this loop.
+            self.progress.emit(60)
 
-                # STEP 6: Streaming buffer
-                # ✅ CHECKPOINT 97%
-                self.progress.emit(97)
-                
-                streaming_fps = 100
-                window_size = 20.0
-                start_time = 0
-                end_time = min(total_duration_sec, window_size)
-                start_frame = int((start_time * 1000) / frame_duration_ms)
-                end_frame = int((end_time * 1000) / frame_duration_ms)
-                end_frame = min(end_frame, total_frames)
-                
-                stream_x = []
-                stream_y = []
-                for frame_idx in range(start_frame, end_frame, 1):
-                    if self._cancelled:
-                        return
-                    frame_time = (frame_idx * frame_duration_ms) / 1000.0
-                    signal_sample = np.mean(np.abs(fft_data[frame_idx]))
-                    stream_x.append(frame_time)
-                    stream_y.append(signal_sample)
-                
-                streaming_x = np.array(stream_x)
-                streaming_y = np.array(stream_y)
+            fs_h       = header_info.get('fs',       V5_FS)
+            fft_size_h = header_info.get('fft_size', V5_FFT_SIZE)
+            full_freq_axis = np.arange(fft_size_h // 2) * (fs_h / fft_size_h)
 
-                # STEP 7: Emit result
-                # ✅ CHECKPOINT 98%
-                self.progress.emit(98)
-                
-                data_dict = {
-                    'header_info': header_info,
-                    'fft_data': fft_data,
-                    'phase_data': phase_data,
-                    'frequency_axis': frequency_axis.tolist(),
-                    'total_frames': total_frames,
-                    'frame_duration_ms': frame_duration_ms,
-                    'total_duration_sec': total_duration_sec,
-                    'click_events': click_events,
-                    'overview_x': overview_x.tolist(),
-                    'overview_y': overview_y.tolist(),
-                    'streaming_x': streaming_x.tolist(),
-                    'streaming_y': streaming_y.tolist(),
-                    'streaming_start_time': start_time,
-                    'streaming_end_time': end_time,
-                }
-                
-                self.finished.emit(data_dict)
+            n = total_frames
+            fft_means_arr   = np.empty(n, dtype=np.float32)
+            E_hat_floors    = np.empty(n, dtype=np.float32)
+            noise_floors    = np.empty(n, dtype=np.float32)
+            std_noises      = np.empty(n, dtype=np.float32)
+            fft_timestamps  = np.empty(n, dtype=np.float64)
 
-                # ✅ FINALE 100%
-                self.progress.emit(100)
+            estimator = AdaptiveNoiseEstimatorV5()
+
+            for i in range(n):
+                if self._cancelled:
+                    return
+
+                fft_frame = fft_data[i]
+                fft_timestamps[i] = i * frame_duration_ms / 1000.0
+
+                # Pad into full half-spectrum and normalize
+                full_mags = np.zeros(fft_size_h // 2, dtype=np.float64)
+                mags_raw  = np.asarray(fft_frame, dtype=np.float64)
+                n_bins = min(len(mags_raw), V5_BIN_END - V5_BIN_START + 1)
+                full_mags[V5_BIN_START : V5_BIN_START + n_bins] = mags_raw[:n_bins]
+                fft_norm = _normalize_fft(full_mags, full_freq_axis)
+
+                # FIX: compute energy [V²] FIRST, store it in fft_means_arr
+                # (previously stored mean amplitude [V] → mismatch with E_hat_floors [V²])
+                E_i = float(_compute_fft_energy_v5(fft_norm[V5_BIN_START : V5_BIN_END + 1]))
+                fft_means_arr[i] = E_i   # [V²] — now matches E_hat_floor_arr units
+
+                # iFFT + Hilbert for B2 buffer
+                if i < len(phase_data):
+                    frame_data_r = reconstruct_frame_v5(
+                        mags_raw, phase_data[i], fs_h, fft_size_h, normalize=True
+                    )
+                else:
+                    frame_data_r = None
+
+                if frame_data_r is not None:
+                    env        = compute_hilbert_envelope(frame_data_r['signal'])
+                    env_mean_i = float(np.mean(env))
+                    env_std_i  = float(np.std(env))
+                else:
+                    # FIX: fallback must pass amplitude [V], not energy [V²]
+                    env_mean_i = float(np.sqrt(max(E_i, 0.0)))
+                    env_std_i  = 0.0
+
+                noise = estimator.update(E_i, env_mean_i, env_std_i)
+                E_hat_floors[i] = noise['E_hat_floor']
+                noise_floors[i] = noise['noise_floor']
+                std_noises[i]   = noise['std_noise']
+
+                # Report progress: map i/n → 60..92 %
+                if i % 500 == 0:
+                    pct = 60 + int((i / n) * 32)
+                    self.progress.emit(pct)
+
+            self.progress.emit(93)
+
+            # STEP 5: Overview — now instant (reads fft_means_arr)
+            self.progress.emit(94)
+            overview_fps    = 10
+            overview_points = int(total_duration_sec * overview_fps)
+            frame_step      = max(1, total_frames // overview_points)
+            overview_x = []
+            overview_y = []
+            for i in range(0, total_frames, frame_step):
+                if self._cancelled:
+                    return
+                overview_x.append(i * frame_duration_ms / 1000.0)
+                overview_y.append(float(fft_means_arr[i]))
+            overview_x = np.array(overview_x)
+            overview_y = np.array(overview_y)
+
+            # STEP 6: Streaming buffer — also instant
+            self.progress.emit(96)
+            start_time  = 0.0
+            end_time    = min(total_duration_sec, 20.0)
+            start_frame = 0
+            end_frame   = min(int(end_time * 1000 / frame_duration_ms), total_frames)
+            stream_x = []
+            stream_y = []
+            for frame_idx in range(start_frame, end_frame):
+                if self._cancelled:
+                    return
+                stream_x.append(frame_idx * frame_duration_ms / 1000.0)
+                stream_y.append(float(fft_means_arr[frame_idx]))
+            streaming_x = np.array(stream_x)
+            streaming_y = np.array(stream_y)
+
+            # STEP 7: Emit result
+            self.progress.emit(98)
+
+            data_dict = {
+                'header_info'          : header_info,
+                'fft_data'             : fft_data,
+                'phase_data'           : phase_data,
+                'frequency_axis'       : frequency_axis.tolist(),
+                'total_frames'         : total_frames,
+                'frame_duration_ms'    : frame_duration_ms,
+                'total_duration_sec'   : total_duration_sec,
+                'click_events'         : click_events,
+                'overview_x'           : overview_x.tolist(),
+                'overview_y'           : overview_y.tolist(),
+                'streaming_x'          : streaming_x.tolist(),
+                'streaming_y'          : streaming_y.tolist(),
+                'streaming_start_time' : start_time,
+                'streaming_end_time'   : end_time,
+                # pre-computed arrays — main thread just assigns, no recompute
+                'fft_means'            : fft_means_arr,
+                'fft_timestamps'       : fft_timestamps,
+                'E_hat_floor_arr'      : E_hat_floors,
+                'noise_floor_arr'      : noise_floors,
+                'std_noise_arr'        : std_noises,
+            }
+
+            self.finished.emit(data_dict)
+            self.progress.emit(100)
 
         except Exception as e:
             self.error.emit(str(e))
