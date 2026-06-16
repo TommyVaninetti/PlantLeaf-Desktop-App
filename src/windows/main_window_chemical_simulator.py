@@ -236,8 +236,8 @@ class MainWindowChemicalSimulator(QMainWindow):
         time_layout.addWidget(self.time_info_label)
         self.plot_time = BasePlotWidget(
             x_label="Time", y_label="Amplitude",
-            x_range=(0, 1e-4), y_range=(-1, 1),
-            x_min=0, x_max=1e-3, y_min=-10, y_max=10,
+            x_range=(0, 150), y_range=(-1.2, 1.2),
+            x_min=0, x_max=200, y_min=-2, y_max=2,
             unit_x="s", unit_y="", parent=self
         )
         self.curve_sim_time = self.plot_time.plot_widget.plot(name="Simulated", pen={'color': '#689f67', 'width': 2})
@@ -738,7 +738,8 @@ class MainWindowChemicalSimulator(QMainWindow):
                 fs = self.paudio_data['fs']
                 fft_size = self.paudio_data['fft_size']
                 t = np.linspace(0, fft_size/fs, fft_size)
-                self.curve_real_time.setData(t, signal)
+                sig_norm = signal / (np.max(np.abs(signal)) + 1e-30)
+                self.curve_real_time.setData(t * 1e6, sig_norm)
 
     def _reconstruct_ifft(self, frame_idx):
         pd = self.paudio_data
@@ -819,7 +820,8 @@ class MainWindowChemicalSimulator(QMainWindow):
 
         t      = bubble['t']
         signal = propagation['signal']
-        self.curve_sim_time.setData(t, signal)
+        sim_norm = signal / (np.max(np.abs(signal)) + 1e-30)
+        self.curve_sim_time.setData(t * 1e6, sim_norm)
 
         freq = plantleaf['freq']
         spec = plantleaf['spectrum']
@@ -827,7 +829,7 @@ class MainWindowChemicalSimulator(QMainWindow):
 
         R_um = bubble['R'] * 1e6
         t_us = t * 1e6
-        self.curve_bubble.setData(t_us, R_um)
+        self.curve_bubble.setData(t * 1e6, R_um)
 
     def _update_diagnostics(self, result):
         diag   = result['diagnostics']
