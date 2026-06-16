@@ -305,7 +305,7 @@ class MainWindowHome(BaseWindow):
         """Open the acoustic chemical simulator"""
         print("🧪 Starting chemical simulator...")
         try:
-            from main_window_chemical_simulator import MainWindowChemicalSimulator
+            from windows.main_window_chemical_simulator import MainWindowChemicalSimulator
             self.hide()
             chemical_window = MainWindowChemicalSimulator()
             self.layout_manager.center_window_on_screen(chemical_window)

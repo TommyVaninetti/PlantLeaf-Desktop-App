@@ -16,7 +16,7 @@ from acoustic_parameters import (
     BubbleParameters,
     XylemPressure
 )
-from chemical_simulators.run_acoustic_simulation import run_simulation # type: ignore
+from run_acoustic_simulation import run_simulation # type: ignore
 
 
 # =============================================================================
@@ -220,7 +220,7 @@ def estimate_p_inf(stress_results, tau_measured):
             'P_inf_curve_pa'      : array P∞ della curva [Pa]
             'tau_mean_curve_ms'   : array τ medio per ogni P∞ [ms]
     """
-    from chemical_simulators.acoustic_parameters import XylemPressure
+    from acoustic_parameters import XylemPressure
 
     tau_matrix  = stress_results['tau_matrix']
     P_inf_grid  = stress_results['P_inf_grid']

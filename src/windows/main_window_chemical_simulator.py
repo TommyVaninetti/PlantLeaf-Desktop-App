@@ -1,15 +1,15 @@
-"""
-Finestra principale del simulatore chimico acustico PlantLeaf.
-Modella la cavitazione xilematica e genera click ultrasonici sintetici.
-"""
+import sys
+import os
+sys.path.insert(0, "/Users/fridatirari/PlantLeaf development /PlantLeaf-Desktop-App/src/chemical_simulators")
+sys.path.insert(0, "/Users/fridatirari/PlantLeaf development /PlantLeaf-Desktop-App/src")
 
 import numpy as np
-import os
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QLabel, QPushButton, QDoubleSpinBox, QSlider, QGroupBox,
     QFileDialog, QMessageBox, QProgressDialog, QTabWidget,
-    QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QFrame
+    QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QFrame,
+    QApplication
 )
 from PySide6.QtCore import Qt, QThread, Signal, QObject
 from PySide6.QtGui import QIcon, QAction, QFont
@@ -21,30 +21,39 @@ from core.theme_manager import ThemeManager
 from config.app_config import AppConfig
 from plotting.plot_manager import BasePlotWidget
 
+SLIDER_CSS = (
+    "QSlider::groove:horizontal { background: #a5d6a7; height: 6px; border-radius: 3px; }"
+    "QSlider::handle:horizontal { background: #5a7559; border: 2px solid #5a7559;"
+    " width: 16px; height: 16px; margin: -5px 0; border-radius: 8px; }"
+    "QSlider::sub-page:horizontal { background: #689f67; border-radius: 3px; }"
+    "QSlider::add-page:horizontal { background: #c8e6c9; border-radius: 3px; }"
+)
 
-# =============================================================================
-# WORKER THREAD PER LA SIMULAZIONE
-# =============================================================================
 
 class SimulationWorker(QObject):
-    """Worker per eseguire la simulazione in un thread separato."""
     finished = Signal(dict)
     error = Signal(str)
     progress = Signal(int)
 
-    def __init__(self, R0, P_inf, distance_m):
+    def __init__(self, R0, P_inf, distance_m, tau_target_ms=None):
         super().__init__()
         self.R0 = R0
         self.P_inf = P_inf
         self.distance_m = distance_m
+        self.tau_target_ms = tau_target_ms
 
     def run(self):
         try:
             import sys
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'chemical_simulators'))
+            sys.path.insert(0, "/Users/fridatirari/PlantLeaf development /PlantLeaf-Desktop-App/src/chemical_simulators")
             from run_acoustic_simulation import run_simulation
             self.progress.emit(30)
-            result = run_simulation(R0=self.R0, P_inf=self.P_inf, distance_m=self.distance_m)
+            result = run_simulation(
+                R0=self.R0,
+                P_inf=self.P_inf,
+                distance_m=self.distance_m,
+                tau_target_ms=self.tau_target_ms
+            )
             self.progress.emit(100)
             self.finished.emit(result)
         except Exception as e:
@@ -52,46 +61,35 @@ class SimulationWorker(QObject):
             self.error.emit(f"{str(e)}\n{traceback.format_exc()}")
 
 
-# =============================================================================
-# FINESTRA PRINCIPALE
-# =============================================================================
-
 class MainWindowChemicalSimulator(QMainWindow):
-    """Finestra del simulatore chimico acustico PlantLeaf."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-
-        # Manager
         self.settings_manager = SettingsManager()
         self.font_manager = FontManager(self.settings_manager.settings)
         self.layout_manager = LayoutManager(self.font_manager)
         self.theme_manager = ThemeManager(self.settings_manager.settings, self.font_manager)
 
-        self.setWindowTitle("🧪 Audio Chemical Simulator")
+        self.setWindowTitle("Audio Chemical Simulator")
         self.setWindowIcon(QIcon(AppConfig.LOGO_DIR))
         self.setMinimumSize(1100, 650)
 
-        # Stato simulazione
         self.sim_result = None
-        self.real_clicks_tau = []
+        self.real_clicks = []
         self.sim_thread = None
         self.sim_worker = None
+        self.paudio_data = None
 
-        # Costruisci UI
         self._setup_ui()
         self._setup_menubar()
         self._setup_toolbar()
-
-        # Applica tema salvato
         self._load_saved_settings()
         self.setStatusBar(None)
-
+        self._apply_plot_themes()
+        self.r0_slider.setStyleSheet(SLIDER_CSS)
+        self.pinf_slider.setStyleSheet(SLIDER_CSS)
+        self.dist_slider.setStyleSheet(SLIDER_CSS)
         self.showMaximized()
-
-    # =========================================================================
-    # SETUP UI
-    # =========================================================================
 
     def _setup_ui(self):
         central = QWidget()
@@ -99,41 +97,29 @@ class MainWindowChemicalSimulator(QMainWindow):
         main_layout = QHBoxLayout(central)
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(8)
-
         splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(splitter)
-
-        # --- Pannello sinistra: controlli ---
         splitter.addWidget(self._build_controls_panel())
-
-        # --- Centro: grafici ---
         splitter.addWidget(self._build_plots_panel())
-
-        # --- Destra: risultati ---
         splitter.addWidget(self._build_results_panel())
-
-        splitter.setSizes([260, 620, 260])
+        splitter.setSizes([280, 620, 260])
 
     def _build_controls_panel(self):
-        """Pannello sinistra con i controlli di tuning."""
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setSpacing(10)
         layout.setContentsMargins(4, 4, 4, 4)
 
-        # --- Titolo ---
         title = QLabel("Simulation Parameters")
         title.setAlignment(Qt.AlignCenter)
-        title.setObjectName("titleLabel")
+        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #2d4a2b; padding: 8px;")
         layout.addWidget(title)
 
-        # --- Gruppo parametri fisici ---
         phys_group = QGroupBox("Physical Parameters")
         phys_layout = QVBoxLayout(phys_group)
-        phys_layout.setSpacing(6)
+        phys_layout.setSpacing(8)
 
-        # R0
-        phys_layout.addWidget(QLabel("Bubble radius R₀ [µm]:"))
+        phys_layout.addWidget(QLabel("Bubble radius R0 [µm]:"))
         self.r0_slider = QSlider(Qt.Horizontal)
         self.r0_slider.setRange(20, 100)
         self.r0_slider.setValue(50)
@@ -150,7 +136,6 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.r0_slider.valueChanged.connect(lambda v: self.r0_spinbox.setValue(float(v)))
         self.r0_spinbox.valueChanged.connect(lambda v: self.r0_slider.setValue(int(v)))
 
-        # P_inf
         phys_layout.addWidget(QLabel("Xylem pressure P∞ [MPa]:"))
         self.pinf_slider = QSlider(Qt.Horizontal)
         self.pinf_slider.setRange(-150, -30)
@@ -168,8 +153,7 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.pinf_slider.valueChanged.connect(lambda v: self.pinf_spinbox.setValue(v / 100.0))
         self.pinf_spinbox.valueChanged.connect(lambda v: self.pinf_slider.setValue(int(v * 100)))
 
-        # Distanza
-        phys_layout.addWidget(QLabel("Distance bubble→mic [cm]:"))
+        phys_layout.addWidget(QLabel("Distance bubble → mic [cm]:"))
         self.dist_slider = QSlider(Qt.Horizontal)
         self.dist_slider.setRange(5, 50)
         self.dist_slider.setValue(10)
@@ -188,42 +172,44 @@ class MainWindowChemicalSimulator(QMainWindow):
 
         layout.addWidget(phys_group)
 
-        # --- Label stress idrico ---
-        self.stress_label = QLabel("Stress: Well hydrated")
-        self.stress_label.setAlignment(Qt.AlignCenter)
-        self.stress_label.setStyleSheet("font-weight: bold; padding: 4px;")
-        layout.addWidget(self.stress_label)
-        self.pinf_spinbox.valueChanged.connect(self._update_stress_label)
-
-        # --- Separatore ---
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
         sep.setFrameShadow(QFrame.Sunken)
         layout.addWidget(sep)
 
-        # --- Pulsante Run Simulation ---
-        self.btn_run = QPushButton("▶  Run Simulation")
-        self.btn_run.setMinimumHeight(40)
-        self.btn_run.setObjectName("mainButton")
-        self.btn_run.clicked.connect(self._run_simulation)
-        layout.addWidget(self.btn_run)
-
-        # --- Pulsante Load .paudio ---
         self.btn_load = QPushButton("📂  Load .paudio File")
-        self.btn_load.setMinimumHeight(35)
+        self.btn_load.setMinimumHeight(42)
         self.btn_load.setObjectName("mainButton")
         self.btn_load.clicked.connect(self._load_paudio)
         layout.addWidget(self.btn_load)
 
-        # --- Pulsante Generate PDF ---
+        self.click_selector_label = QLabel("Select click to analyze:")
+        layout.addWidget(self.click_selector_label)
+
+        self.click_table = QTableWidget(0, 4)
+        self.click_table.setHorizontalHeaderLabels(["Time (s)", "τ (ms)", "Peak (µV)", "R²"])
+        self.click_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.click_table.verticalHeader().setVisible(False)
+        self.click_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.click_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.click_table.setMaximumHeight(200)
+        self.click_table.itemSelectionChanged.connect(self._on_click_selected)
+        layout.addWidget(self.click_table)
+
+        self.btn_run = QPushButton("▶  Run Simulation")
+        self.btn_run.setMinimumHeight(42)
+        self.btn_run.setObjectName("mainButton")
+        self.btn_run.setEnabled(False)
+        self.btn_run.clicked.connect(self._run_simulation)
+        layout.addWidget(self.btn_run)
+
         self.btn_pdf = QPushButton("📄  Generate PDF Report")
-        self.btn_pdf.setMinimumHeight(35)
+        self.btn_pdf.setMinimumHeight(38)
         self.btn_pdf.setObjectName("mainButton")
         self.btn_pdf.setEnabled(False)
         self.btn_pdf.clicked.connect(self._generate_report)
         layout.addWidget(self.btn_pdf)
 
-        # --- Info file caricato ---
         self.file_label = QLabel("No .paudio file loaded")
         self.file_label.setAlignment(Qt.AlignCenter)
         self.file_label.setWordWrap(True)
@@ -234,28 +220,27 @@ class MainWindowChemicalSimulator(QMainWindow):
         return panel
 
     def _build_plots_panel(self):
-        """Pannello centrale con i grafici."""
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
         tab = QTabWidget()
+        tab.setStyleSheet("QTabBar::tab { font-size: 13px; font-weight: 600; padding: 10px 20px; }")
         layout.addWidget(tab)
 
-        # --- Tab 1: Time domain ---
         time_widget = QWidget()
         time_layout = QVBoxLayout(time_widget)
-        self.time_info_label = QLabel("Time Domain — Simulated Click")
+        self.time_info_label = QLabel("Time Domain — Real click vs Simulated")
         self.time_info_label.setAlignment(Qt.AlignCenter)
         time_layout.addWidget(self.time_info_label)
         self.plot_time = BasePlotWidget(
-            x_label="Time", y_label="Pressure",
+            x_label="Time", y_label="Amplitude",
             x_range=(0, 1e-4), y_range=(-1, 1),
             x_min=0, x_max=1e-3, y_min=-10, y_max=10,
-            unit_x="s", unit_y="Pa", parent=self
+            unit_x="s", unit_y="", parent=self
         )
-        self.curve_sim_time = self.plot_time.plot_widget.plot(name="Simulated click")
+        self.curve_sim_time = self.plot_time.plot_widget.plot(name="Simulated", pen={'color': '#689f67', 'width': 2})
         self.curve_real_time = self.plot_time.plot_widget.plot(
             name="Real click", pen={'color': 'r', 'width': 1.5}
         )
@@ -263,27 +248,25 @@ class MainWindowChemicalSimulator(QMainWindow):
         time_layout.addWidget(self.plot_time)
         tab.addTab(time_widget, "Time Domain")
 
-        # --- Tab 2: Frequency domain ---
         freq_widget = QWidget()
         freq_layout = QVBoxLayout(freq_widget)
-        self.freq_info_label = QLabel("Frequency Domain — Spectrum 20–80 kHz")
+        self.freq_info_label = QLabel("Frequency Domain 20–80 kHz")
         self.freq_info_label.setAlignment(Qt.AlignCenter)
         freq_layout.addWidget(self.freq_info_label)
         self.plot_freq = BasePlotWidget(
             x_label="Frequency", y_label="Amplitude",
             x_range=(20000, 80000), y_range=(0, 1),
             x_min=19000, x_max=81000, y_min=0, y_max=10,
-            unit_x="Hz", unit_y="Pa", parent=self
+            unit_x="Hz", unit_y="", parent=self
         )
-        self.curve_sim_freq = self.plot_freq.plot_widget.plot(name="Simulated spectrum")
+        self.curve_sim_freq = self.plot_freq.plot_widget.plot(name="Simulated", pen={'color': '#689f67', 'width': 2})
         self.curve_real_freq = self.plot_freq.plot_widget.plot(
-            name="Real spectrum", pen={'color': 'r', 'width': 1.5}
+            name="Real", pen={'color': 'r', 'width': 1.5}
         )
         self.plot_freq.plot_widget.showGrid(x=True, y=True)
         freq_layout.addWidget(self.plot_freq)
         tab.addTab(freq_widget, "Frequency Domain")
 
-        # --- Tab 3: Bubble dynamics ---
         bubble_widget = QWidget()
         bubble_layout = QVBoxLayout(bubble_widget)
         bubble_layout.addWidget(QLabel("Bubble radius R(t) during collapse"))
@@ -300,24 +283,9 @@ class MainWindowChemicalSimulator(QMainWindow):
         bubble_layout.addWidget(self.plot_bubble)
         tab.addTab(bubble_widget, "Bubble Dynamics")
 
-        # --- Tab 4: τ comparison ---
-        tau_widget = QWidget()
-        tau_layout = QVBoxLayout(tau_widget)
-        tau_layout.addWidget(QLabel("τ distribution: simulated vs measured"))
-        self.plot_tau = BasePlotWidget(
-            x_label="τ", y_label="Count",
-            x_range=(0, 2), y_range=(0, 10),
-            x_min=0, x_max=5, y_min=0, y_max=50,
-            unit_x="ms", unit_y="", parent=self
-        )
-        self.plot_tau.plot_widget.showGrid(x=True, y=True)
-        tau_layout.addWidget(self.plot_tau)
-        tab.addTab(tau_widget, "τ Comparison")
-
         return panel
 
     def _build_results_panel(self):
-        """Pannello destra con i risultati diagnostici."""
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setSpacing(8)
@@ -325,10 +293,9 @@ class MainWindowChemicalSimulator(QMainWindow):
 
         title = QLabel("Diagnostics")
         title.setAlignment(Qt.AlignCenter)
-        title.setObjectName("titleLabel")
+        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #2d4a2b; padding: 8px;")
         layout.addWidget(title)
 
-        # --- Tabella parametri simulati ---
         sim_group = QGroupBox("Simulated Parameters")
         sim_layout = QVBoxLayout(sim_group)
         self.table_sim = QTableWidget(0, 2)
@@ -341,9 +308,8 @@ class MainWindowChemicalSimulator(QMainWindow):
         sim_layout.addWidget(self.table_sim)
         layout.addWidget(sim_group)
 
-        # --- Tabella confronto con reale ---
-        real_group = QGroupBox("Comparison with Real Data")
-        real_layout = QVBoxLayout(real_group)
+        compare_group = QGroupBox("Comparison Real vs Simulated")
+        compare_layout = QVBoxLayout(compare_group)
         self.table_compare = QTableWidget(0, 2)
         self.table_compare.setHorizontalHeaderLabels(["Metric", "Value"])
         self.table_compare.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -351,22 +317,16 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.table_compare.verticalHeader().setVisible(False)
         self.table_compare.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table_compare.setAlternatingRowColors(True)
-        real_layout.addWidget(self.table_compare)
-        layout.addWidget(real_group)
+        compare_layout.addWidget(self.table_compare)
+        layout.addWidget(compare_group)
 
-        # --- Label P∞ stimato ---
-        self.pinf_estimated_label = QLabel("Estimated P∞: —")
-        self.pinf_estimated_label.setAlignment(Qt.AlignCenter)
-        self.pinf_estimated_label.setWordWrap(True)
-        self.pinf_estimated_label.setStyleSheet("font-weight: bold; padding: 6px;")
-        layout.addWidget(self.pinf_estimated_label)
+        self.correlation_label = QLabel("Correlation: —")
+        self.correlation_label.setAlignment(Qt.AlignCenter)
+        self.correlation_label.setStyleSheet("font-weight: bold; font-size: 14px; padding: 6px;")
+        layout.addWidget(self.correlation_label)
 
         layout.addStretch(1)
         return panel
-
-    # =========================================================================
-    # MENUBAR E TOOLBAR
-    # =========================================================================
 
     def _setup_menubar(self):
         menubar = self.menuBar()
@@ -374,49 +334,31 @@ class MainWindowChemicalSimulator(QMainWindow):
         font.setPointSize(12)
         menubar.setFont(font)
 
-        # File
         file_menu = menubar.addMenu("File")
         self.actionHome = QAction("Home", self)
         self.actionHome.triggered.connect(self._go_home)
         file_menu.addAction(self.actionHome)
         file_menu.addSeparator()
-        self.actionLoadPaudio = QAction("Load .paudio File...", self)
-        self.actionLoadPaudio.setShortcut("Ctrl+O")
-        self.actionLoadPaudio.triggered.connect(self._load_paudio)
-        file_menu.addAction(self.actionLoadPaudio)
-        self.actionGeneratePDF = QAction("Generate PDF Report...", self)
-        self.actionGeneratePDF.setShortcut("Ctrl+P")
-        self.actionGeneratePDF.triggered.connect(self._generate_report)
-        file_menu.addAction(self.actionGeneratePDF)
+        action_load = QAction("Load .paudio File...", self)
+        action_load.setShortcut("Ctrl+O")
+        action_load.triggered.connect(self._load_paudio)
+        file_menu.addAction(action_load)
 
-        # Simulation
         sim_menu = menubar.addMenu("Simulation")
-        self.actionRunSim = QAction("Run Simulation", self)
-        self.actionRunSim.setShortcut("Ctrl+R")
-        self.actionRunSim.triggered.connect(self._run_simulation)
-        sim_menu.addAction(self.actionRunSim)
+        action_run = QAction("Run Simulation", self)
+        action_run.setShortcut("Ctrl+R")
+        action_run.triggered.connect(self._run_simulation)
+        sim_menu.addAction(action_run)
 
-        # Settings
         settings_menu = menubar.addMenu("Settings")
         theme_menu = settings_menu.addMenu("Theme")
-        themes = [
-            ("Dark", "dark.css"), ("Dark Green", "dark_green.css"),
-            ("Dark Blue", "dark_blue.css"), ("Dark Amber", "dark_amber.css"),
-            ("Light", "light.css"), ("Light Green", "light_green.css"),
-            ("Light Blue", "light_blue.css"), ("Light Amber", "light_amber.css"),
-        ]
-        for name, file in themes:
-            action = QAction(name, self)
-            action.triggered.connect(lambda checked, f=file: self._update_style(theme_name=f))
-            theme_menu.addAction(action)
+        for name, f in [("Dark","dark.css"),("Dark Green","dark_green.css"),
+                        ("Light","light.css"),("Light Green","light_green.css"),
+                        ("Light Blue","light_blue.css")]:
+            a = QAction(name, self)
+            a.triggered.connect(lambda checked, fn=f: self._update_style(theme_name=fn))
+            theme_menu.addAction(a)
 
-        font_menu = settings_menu.addMenu("Font Scale")
-        for label, scale in [("Very Small", 1.15), ("Small", 1.25), ("Medium", 1.35), ("Large", 1.4)]:
-            action = QAction(label, self)
-            action.triggered.connect(lambda checked, s=scale: self._update_style(font_scale=s))
-            font_menu.addAction(action)
-
-        # About
         about_menu = menubar.addMenu("About")
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.close)
@@ -427,44 +369,419 @@ class MainWindowChemicalSimulator(QMainWindow):
         toolbar = self.addToolBar("Main")
         toolbar.setMovable(False)
         toolbar.setIconSize(QSize(28, 28))
-
         home_action = QAction("🏠 Home", self)
         home_action.triggered.connect(self._go_home)
         toolbar.addAction(home_action)
-
         toolbar.addSeparator()
-
         run_action = QAction("▶ Run", self)
         run_action.triggered.connect(self._run_simulation)
         toolbar.addAction(run_action)
-
         load_action = QAction("📂 Load .paudio", self)
         load_action.triggered.connect(self._load_paudio)
         toolbar.addAction(load_action)
 
-        pdf_action = QAction("📄 PDF Report", self)
-        pdf_action.triggered.connect(self._generate_report)
-        toolbar.addAction(pdf_action)
+    def _load_paudio(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Open .paudio File", "",
+            "PlantLeaf Audio (*.paudio);;All Files (*)"
+        )
+        if not file_path:
+            return
 
-    # =========================================================================
-    # LOGICA
-    # =========================================================================
-
-    def _update_stress_label(self, p_mpa):
-        import sys
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'chemical_simulators'))
         try:
-            from acoustic_parameters import XylemPressure
-            label = XylemPressure.get_stress_label(p_mpa * 1e6)
-            self.stress_label.setText(f"Stress: {label}")
+            import struct, zlib, json as _json
+
+            with open(file_path, 'rb') as f:
+                header_bytes = f.read(128)
+                remaining_data = f.read()
+
+            magic = header_bytes[:10].rstrip(b'\x00')
+            if magic != b'PLANTAUDIO':
+                QMessageBox.warning(self, "Error", "Not a valid .paudio file.")
+                return
+
+            version = struct.unpack('<f', header_bytes[10:14])[0]
+            fs       = struct.unpack('<I', header_bytes[34:38])[0]
+            fft_size = struct.unpack('<I', header_bytes[38:42])[0]
+            freq_min = struct.unpack('<I', header_bytes[42:46])[0]
+            freq_max = struct.unpack('<I', header_bytes[46:50])[0]
+
+            bin_freq  = fs / fft_size
+            bin_start = int(freq_min / bin_freq)
+            bin_end   = int(freq_max / bin_freq)
+            num_bins  = bin_end - bin_start + 1
+            frame_duration_ms = (fft_size / fs) * 1000.0
+
+            click_start_pos = remaining_data.find(b'CLCK')
+            if click_start_pos >= 0:
+                fft_bytes = remaining_data[:click_start_pos]
+                click_section = remaining_data[click_start_pos:]
+            else:
+                fft_bytes = remaining_data
+                click_section = None
+
+            fft_data = []
+            phase_data = []
+            bytes_per_sample = 5 if version >= 3.0 else 4
+            offset = 0
+            while offset + num_bins * bytes_per_sample <= len(fft_bytes):
+                frame_mags = []
+                frame_phases = []
+                for b in range(num_bins):
+                    pos = offset + b * bytes_per_sample
+                    mag = struct.unpack('<f', fft_bytes[pos:pos+4])[0]
+                    frame_mags.append(mag)
+                    if version >= 3.0:
+                        ph = struct.unpack('<b', fft_bytes[pos+4:pos+5])[0]
+                        frame_phases.append(ph)
+                fft_data.append(np.array(frame_mags, dtype=np.float32))
+                if version >= 3.0:
+                    phase_data.append(np.array(frame_phases, dtype=np.int8))
+                offset += num_bins * bytes_per_sample
+
+            freq_axis = np.linspace(freq_min, freq_max, num_bins)
+
+            self.paudio_data = {
+                'fft_data':   fft_data,
+                'phase_data': phase_data,
+                'freq_axis':  freq_axis,
+                'fs':         fs,
+                'fft_size':   fft_size,
+                'freq_min':   freq_min,
+                'freq_max':   freq_max,
+                'bin_start':  bin_start,
+                'num_bins':   num_bins,
+                'version':    version,
+                'frame_duration_ms': frame_duration_ms,
+            }
+
+            clicks_raw = []
+            if click_section and len(click_section) >= 8:
+                marker = click_section[0:4]
+                if marker == b'CLCK':
+                    click_length = struct.unpack('<I', click_section[4:8])[0]
+                    if len(click_section) >= 8 + click_length:
+                        compressed = click_section[8:8+click_length]
+                        try:
+                            clicks_raw = _json.loads(zlib.decompress(compressed).decode('utf-8'))
+                        except:
+                            clicks_raw = []
+
+            if not clicks_raw:
+                self.file_label.setText("🔍 Running click detector...")
+                QApplication.processEvents()
+                clicks_raw = self._run_click_detector(
+                    fft_data, phase_data, freq_axis, fs, fft_size, frame_duration_ms
+                )
+
+            if not clicks_raw:
+                QMessageBox.warning(self, "No Clicks",
+                    "No ultrasonic clicks found in this file.")
+                self.file_label.setText("No clicks found")
+                return
+
+            self.real_clicks = []
+            for click in clicks_raw:
+                ts_str = str(click.get('timestamp', '0'))
+                try:
+                    ts = float(ts_str.replace('s', '').strip())
+                except:
+                    ts = 0.0
+
+                tau_ms = float(click.get('tau_ms', -1.0))
+                if tau_ms <= 0:
+                    duration_str = str(click.get('duration', ''))
+                    if 'FFT' in duration_str:
+                        try:
+                            fft_count = int(duration_str.replace(' FFT', '').strip())
+                            tau_ms = fft_count * 2.56 / 3.0
+                        except:
+                            pass
+
+                frame_idx = int(round(ts * 1000.0 / frame_duration_ms))
+                frame_idx = max(0, min(frame_idx, len(fft_data) - 1))
+
+                self.real_clicks.append({
+                    'timestamp': ts,
+                    'frame_idx': frame_idx,
+                    'tau_ms':    tau_ms,
+                    'frequency': click.get('frequency', ''),
+                    'amplitude': click.get('amplitude', ''),
+                    'r2':        float(click.get('r2_log', click.get('r2', 0.0))),
+                    'peak_amp':  float(click.get('peak_amp', 0.0)),
+                })
+
+            self._populate_click_table()
+            self.file_label.setText(
+                f"{os.path.basename(file_path)}\n{len(self.real_clicks)} clicks found"
+            )
+            if self.real_clicks:
+                self.btn_run.setEnabled(True)
+
+        except Exception as e:
+            import traceback
+            QMessageBox.critical(self, "Load Error", f"Could not load file:\n{str(e)}\n{traceback.format_exc()}")
+
+    def _run_click_detector(self, fft_data, phase_data, freq_axis, fs, fft_size, frame_duration_ms):
+        from windows.replay_window_audio import (
+            compute_hilbert_envelope, find_peak, check_decay, suppress_edge_artifacts
+        )
+
+        total_frames = len(fft_data)
+        if total_frames == 0:
+            return []
+
+        fft_means = np.array([np.mean(np.abs(f)) for f in fft_data])
+        fft_mean  = np.mean(fft_means)
+        fft_std   = np.std(fft_means)
+
+        datasheet_freq_hz = np.array([20, 25, 30, 40, 50, 60, 70, 80]) * 1000
+        datasheet_resp_db = np.array([8.0, 10.5, 6.0, -2.0, -6.0, -7.0, -6.0, -4.0])
+        valid_mask = (freq_axis >= 20000) & (freq_axis <= 80000)
+        mic_db = np.interp(freq_axis[valid_mask], datasheet_freq_hz, datasheet_resp_db)
+        gain_50 = 10 ** (-mic_db * 0.5 / 20.0)
+
+        def normalize_fft(mags):
+            n = mags.copy()
+            n[valid_mask] *= gain_50
+            return n
+
+        def reconstruct_ifft(frame_idx):
+            if not phase_data or frame_idx >= len(phase_data):
+                return None
+            mags = normalize_fft(fft_data[frame_idx].copy())
+            phases_int8 = phase_data[frame_idx]
+            num_bins_full = fft_size // 2
+            bin_freq = fs / fft_size
+            bin_s = int(20000 / bin_freq)
+            bin_e = int(80000 / bin_freq)
+            actual = min(len(mags), bin_e - bin_s + 1, len(phases_int8))
+            full_mag = np.zeros(num_bins_full, dtype=np.float32)
+            full_phase = np.zeros(num_bins_full, dtype=np.int8)
+            full_mag[bin_s:bin_s+actual] = mags[:actual]
+            full_phase[bin_s:bin_s+actual] = phases_int8[:actual]
+            phases_rad = (full_phase / 127.0) * np.pi
+            cs = full_mag * np.exp(1j * phases_rad)
+            taper = max(5, actual // 10)
+            window = np.ones(num_bins_full)
+            for i in range(taper):
+                alpha = i / taper
+                window[bin_s + i] = 0.5 * (1 - np.cos(np.pi * alpha))
+                window[bin_s + actual - i - 1] = 0.5 * (1 - np.cos(np.pi * alpha))
+            cs *= window
+            try:
+                sig = np.fft.irfft(cs, n=fft_size)
+                return suppress_edge_artifacts(sig)
+            except:
+                return None
+
+        threshold_noise = fft_mean + 4 * fft_std
+        empty_indices = np.where(fft_means < threshold_noise)[0]
+        noise_rms = fft_mean
+        if len(empty_indices) > 0:
+            np.random.seed(42)
+            sampled = np.random.choice(empty_indices, size=min(200, len(empty_indices)), replace=False)
+            rms_vals = []
+            for idx in sampled:
+                sig = reconstruct_ifft(idx)
+                if sig is not None:
+                    rms_vals.append(np.sqrt(np.mean(sig**2)))
+            if rms_vals:
+                noise_rms = float(np.mean(rms_vals))
+
+        threshold_v = fft_mean + 5 * fft_std
+        above = [i for i in range(total_frames) if fft_means[i] > threshold_v]
+        MAX_RUN = 4
+        filtered = []
+        if above:
+            run_start = 0
+            for k in range(1, len(above) + 1):
+                at_end = (k == len(above))
+                new_run = at_end or (above[k] - above[k-1] > 1)
+                if new_run:
+                    run = above[run_start:k]
+                    if len(run) <= MAX_RUN:
+                        filtered.extend(run)
+                    run_start = k
+
+        candidates2 = []
+        for fi in filtered:
+            fft_norm = normalize_fft(fft_data[fi].copy())
+            peak_v = float(np.max(fft_norm))
+            if peak_v <= 0.00085:
+                continue
+            power = fft_norm.astype(np.float64) ** 2
+            mean_p = float(np.mean(power))
+            max_p  = float(np.max(power))
+            spr = max_p / mean_p if mean_p > 1e-20 else 0.0
+            if spr > 20:
+                continue
+            candidates2.append({'frame_idx': fi, 'peak_fft_v': peak_v, 'spr': spr})
+
+        candidates3 = []
+        for c in candidates2:
+            fi = c['frame_idx']
+            sig = reconstruct_ifft(fi)
+            if sig is None:
+                continue
+            env = compute_hilbert_envelope(sig)
+            peak_idx, peak_amp = find_peak(env)
+            if peak_amp <= 130e-6:
+                continue
+            next_env = None
+            if peak_idx > 212 and fi + 1 < total_frames:
+                ns = reconstruct_ifft(fi + 1)
+                if ns is not None:
+                    next_env = compute_hilbert_envelope(ns)
+            decay = check_decay(env, peak_idx, next_frame_envelope=next_env, noise_rms=noise_rms)
+            tau_ms = decay['tau_ms']
+            r2 = decay['r_squared_log']
+            E_W1 = decay['E_W1']
+            E_W4 = decay['E_W4']
+            if tau_ms <= 0 or not (0.045 <= tau_ms <= 1.3):
+                continue
+            if r2 <= 0.45:
+                continue
+            if E_W1 <= E_W4 * 2.0:
+                continue
+            GUARD = 20
+            pre_end = max(0, peak_idx - GUARD)
+            pre_w = sig[:pre_end] if pre_end >= 50 else np.array([noise_rms])
+            rms_pre = float(np.sqrt(np.mean(pre_w**2)))
+            pre_snr = rms_pre / noise_rms if noise_rms > 0 else 1.0
+            if pre_snr >= 1.8:
+                continue
+            level = peak_amp * 0.1
+            rise_start = peak_idx
+            for i in range(peak_idx - 1, -1, -1):
+                if env[i] < level:
+                    rise_start = i + 1
+                    break
+            rise_s = max(1, peak_idx - rise_start)
+            fall_end = min(peak_idx + 40, len(env))
+            fall_s = 40
+            for i in range(peak_idx + 1, fall_end):
+                if env[i] < level:
+                    fall_s = i - peak_idx
+                    break
+            asym = rise_s / fall_s if fall_s > 0 else 1.0
+            if asym >= 2.5:
+                continue
+            candidates3.append({**c, 'peak_amp': peak_amp, 'tau_ms': tau_ms, 'r2_log': r2})
+
+        if not candidates3:
+            return []
+
+        sorted_c = sorted(candidates3, key=lambda x: x['frame_idx'])
+        groups, current = [], [sorted_c[0]]
+        for i in range(1, len(sorted_c)):
+            if sorted_c[i]['frame_idx'] - sorted_c[i-1]['frame_idx'] <= 3:
+                current.append(sorted_c[i])
+            else:
+                groups.append(current)
+                current = [sorted_c[i]]
+        groups.append(current)
+
+        result = []
+        for grp in groups:
+            best = max(grp, key=lambda x: x['peak_amp'])
+            ts = best['frame_idx'] * frame_duration_ms / 1000.0
+            result.append({
+                'timestamp': ts,
+                'tau_ms':    best['tau_ms'],
+                'peak_amp':  best['peak_amp'],
+                'r2_log':    best['r2_log'],
+                'frequency': '',
+                'amplitude': str(best['peak_fft_v']),
+            })
+
+        print(f"✅ Click detector: found {len(result)} clicks")
+        return result
+
+    def _populate_click_table(self):
+        self.click_table.setRowCount(len(self.real_clicks))
+        for i, click in enumerate(self.real_clicks):
+            self.click_table.setItem(i, 0, QTableWidgetItem(f"{click['timestamp']:.3f}"))
+            tau_str = f"{click['tau_ms']:.3f}" if click['tau_ms'] > 0 else "N/A"
+            self.click_table.setItem(i, 1, QTableWidgetItem(tau_str))
+            peak_uv = click.get('peak_amp', 0.0) * 1e6
+            self.click_table.setItem(i, 2, QTableWidgetItem(f"{peak_uv:.1f}"))
+            r2_val = click.get('r2', click.get('r2_log', 0.0))
+            self.click_table.setItem(i, 3, QTableWidgetItem(f"{r2_val:.3f}"))
+
+    def _on_click_selected(self):
+        rows = self.click_table.selectedItems()
+        if not rows:
+            return
+        row = self.click_table.currentRow()
+        if row < 0 or row >= len(self.real_clicks):
+            return
+        click = self.real_clicks[row]
+        self._show_real_click(click)
+
+    def _show_real_click(self, click):
+        if not self.paudio_data:
+            return
+        frame_idx = click['frame_idx']
+        fft_data   = self.paudio_data['fft_data']
+        phase_data = self.paudio_data['phase_data']
+        freq_axis  = self.paudio_data['freq_axis']
+
+        if frame_idx >= len(fft_data):
+            return
+
+        self.curve_real_freq.setData(freq_axis, fft_data[frame_idx])
+
+        if phase_data and frame_idx < len(phase_data):
+            signal = self._reconstruct_ifft(frame_idx)
+            if signal is not None:
+                fs = self.paudio_data['fs']
+                fft_size = self.paudio_data['fft_size']
+                t = np.linspace(0, fft_size/fs, fft_size)
+                self.curve_real_time.setData(t, signal)
+
+    def _reconstruct_ifft(self, frame_idx):
+        pd = self.paudio_data
+        fft_mags = pd['fft_data'][frame_idx].copy()
+        if not pd['phase_data'] or frame_idx >= len(pd['phase_data']):
+            return None
+        phases_int8 = pd['phase_data'][frame_idx]
+        fs       = pd['fs']
+        fft_size = pd['fft_size']
+        num_bins_full = fft_size // 2
+        bin_start = pd['bin_start']
+        num_bins  = pd['num_bins']
+        full_mag   = np.zeros(num_bins_full, dtype=np.float32)
+        full_phase = np.zeros(num_bins_full, dtype=np.int8)
+        actual = min(len(fft_mags), num_bins, len(phases_int8))
+        full_mag[bin_start:bin_start+actual]   = fft_mags[:actual]
+        full_phase[bin_start:bin_start+actual] = phases_int8[:actual]
+        phases_rad = (full_phase / 127.0) * np.pi
+        complex_spectrum = full_mag * np.exp(1j * phases_rad)
+        taper = max(5, actual // 10)
+        window = np.ones(num_bins_full)
+        for i in range(taper):
+            alpha = i / taper
+            window[bin_start + i] = 0.5 * (1 - np.cos(np.pi * alpha))
+            window[bin_start + actual - i - 1] = 0.5 * (1 - np.cos(np.pi * alpha))
+        complex_spectrum *= window
+        try:
+            sig = np.fft.irfft(complex_spectrum, n=fft_size)
+            return sig
         except Exception:
-            self.stress_label.setText("")
+            return None
 
     def _run_simulation(self):
-        """Lancia la simulazione nel thread separato."""
         R0 = self.r0_spinbox.value() * 1e-6
         P_inf = self.pinf_spinbox.value() * 1e6
         distance_m = self.dist_spinbox.value() * 0.01
+
+        rows_sel = self.click_table.selectedItems()
+        tau_target = None
+        if rows_sel:
+            row = self.click_table.currentRow()
+            if row >= 0 and row < len(self.real_clicks):
+                tau_target = self.real_clicks[row].get('tau_ms', None)
 
         self.progress_dialog = QProgressDialog("Running simulation...", None, 0, 100, self)
         self.progress_dialog.setWindowModality(Qt.WindowModal)
@@ -472,15 +789,14 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.progress_dialog.setValue(10)
         self.progress_dialog.show()
 
-        self.sim_thread = QThread()
-        self.sim_worker = SimulationWorker(R0, P_inf, distance_m)
+        self.sim_thread = QThread(self)
+        self.sim_worker = SimulationWorker(R0, P_inf, distance_m, tau_target)
         self.sim_worker.moveToThread(self.sim_thread)
         self.sim_thread.started.connect(self.sim_worker.run)
         self.sim_worker.finished.connect(self._on_simulation_finished)
         self.sim_worker.error.connect(self._on_simulation_error)
         self.sim_worker.progress.connect(self.progress_dialog.setValue)
         self.sim_worker.finished.connect(self.sim_thread.quit)
-        self.sim_worker.finished.connect(self.sim_worker.deleteLater)
         self.sim_thread.finished.connect(self.sim_thread.deleteLater)
         self.sim_thread.start()
 
@@ -490,201 +806,102 @@ class MainWindowChemicalSimulator(QMainWindow):
         self._update_plots(result)
         self._update_diagnostics(result)
         self.btn_pdf.setEnabled(True)
-        print("✅ Simulation completed")
+        print("Simulation completed")
 
     def _on_simulation_error(self, error_msg):
         self.progress_dialog.close()
         QMessageBox.critical(self, "Simulation Error", f"An error occurred:\n{error_msg}")
-        print(f"❌ Simulation error: {error_msg}")
 
     def _update_plots(self, result):
-        """Aggiorna tutti i grafici con i risultati della simulazione."""
-        bubble = result['bubble']
+        bubble      = result['bubble']
         propagation = result['propagation']
-        plantleaf = result['plantleaf']
+        plantleaf   = result['plantleaf']
 
-        # Time domain
-        t = bubble['t']
+        t      = bubble['t']
         signal = propagation['signal']
         self.curve_sim_time.setData(t, signal)
-        self.time_info_label.setText(
-            f"Time Domain — R₀={bubble['R0']*1e6:.0f} µm, "
-            f"P∞={bubble['P_inf']/1e6:.2f} MPa"
-        )
 
-        # Frequency domain
         freq = plantleaf['freq']
         spec = plantleaf['spectrum']
         self.curve_sim_freq.setData(freq, spec)
 
-        # Bubble dynamics
         R_um = bubble['R'] * 1e6
         t_us = t * 1e6
         self.curve_bubble.setData(t_us, R_um)
 
-        # Applica tema ai plot
-        for plot, curve in [
-            (self.plot_time, self.curve_sim_time),
-            (self.plot_freq, self.curve_sim_freq),
-            (self.plot_bubble, self.curve_bubble),
-        ]:
-            self.theme_manager.apply_theme_to_plot(plot.plot_widget, curve)
-
     def _update_diagnostics(self, result):
-        """Aggiorna la tabella dei parametri diagnostici."""
-        diag = result['diagnostics']
+        diag   = result['diagnostics']
         bubble = result['bubble']
 
         rows = [
-            ("R₀", f"{bubble['R0']*1e6:.1f} µm"),
-            ("P∞", f"{bubble['P_inf']/1e6:.2f} MPa"),
-            ("Collapsed", "✅ Yes" if bubble['collapsed'] else "❌ No"),
-            ("τ (simulated)", f"{diag['tau']*1000:.3f} ms" if diag['tau'] else "N/A"),
-            ("SPR", f"{diag['SPR']:.2f}" if diag['SPR'] else "N/A"),
-            ("Asymmetry", f"{diag['asymmetry']:.3f}" if diag['asymmetry'] else "N/A"),
-            ("R_spectral", f"{diag['R_spectral']:.3f}" if diag['R_spectral'] else "N/A"),
-            ("Peak amplitude", f"{diag['peak_amplitude']:.4f} Pa" if diag['peak_amplitude'] else "N/A"),
+            ("R₀",         f"{bubble['R0']*1e6:.1f} µm"),
+            ("P∞",         f"{bubble['P_inf']/1e6:.2f} MPa"),
+            ("Collapsed",  "Yes" if bubble['collapsed'] else "No"),
+            ("τ simulated", f"{diag['tau']*1000:.3f} ms" if diag['tau'] else "N/A"),
+            ("SPR",        f"{diag['SPR']:.2f}" if diag['SPR'] else "N/A"),
+            ("Asymmetry",  f"{diag['asymmetry']:.3f}" if diag['asymmetry'] else "N/A"),
+            ("R spectral", f"{diag['R_spectral']:.3f}" if diag['R_spectral'] else "N/A"),
         ]
-
         self.table_sim.setRowCount(len(rows))
-        for i, (param, value) in enumerate(rows):
-            self.table_sim.setItem(i, 0, QTableWidgetItem(param))
-            self.table_sim.setItem(i, 1, QTableWidgetItem(value))
+        for i, (p, v) in enumerate(rows):
+            self.table_sim.setItem(i, 0, QTableWidgetItem(p))
+            self.table_sim.setItem(i, 1, QTableWidgetItem(v))
 
-        # Confronto con dati reali se disponibili
-        if self.real_clicks_tau and diag['tau']:
-            tau_sim_ms = diag['tau'] * 1000
-            tau_meas_ms = np.array(self.real_clicks_tau) * 1000
-            mean_meas = np.mean(tau_meas_ms)
-            diff = abs(tau_sim_ms - mean_meas)
-            rel_err = diff / mean_meas * 100 if mean_meas > 0 else 0
+        rows_sel = self.click_table.selectedItems()
+        if rows_sel and diag['tau']:
+            row = self.click_table.currentRow()
+            click = self.real_clicks[row]
+            tau_real = click.get('tau_ms', -1.0)
+            tau_sim  = diag['tau'] * 1000.0
+
+            real_signal = None
+            if self.paudio_data:
+                real_signal = self._reconstruct_ifft(click['frame_idx'])
+
+            sim_signal = result['propagation']['signal']
+            corr = 0.0
+            if real_signal is not None and len(real_signal) > 0 and len(sim_signal) > 0:
+                n = min(len(real_signal), len(sim_signal))
+                r_norm = real_signal[:n] / (np.max(np.abs(real_signal[:n])) + 1e-30)
+                s_norm = sim_signal[:n]  / (np.max(np.abs(sim_signal[:n]))  + 1e-30)
+                corr = float(np.corrcoef(r_norm, s_norm)[0, 1])
+
+            self.correlation_label.setText(f"Correlation: {corr:.4f}")
 
             compare_rows = [
-                ("τ sim [ms]", f"{tau_sim_ms:.3f}"),
-                ("τ meas mean [ms]", f"{mean_meas:.3f}"),
-                ("Difference [ms]", f"{diff:.3f}"),
-                ("Relative error", f"{rel_err:.1f}%"),
-                ("Match (< 20%)", "✅ Yes" if rel_err < 20 else "❌ No"),
-                ("N real clicks", str(len(self.real_clicks_tau))),
+                ("τ real (ms)",  f"{tau_real:.3f}" if tau_real > 0 else "N/A"),
+                ("τ sim (ms)",   f"{tau_sim:.3f}"),
+                ("Correlation",  f"{corr:.4f}"),
+                ("Match τ",      "Yes" if tau_real > 0 and abs(tau_sim - tau_real) / tau_real < 0.2 else "No"),
             ]
             self.table_compare.setRowCount(len(compare_rows))
-            for i, (metric, value) in enumerate(compare_rows):
-                self.table_compare.setItem(i, 0, QTableWidgetItem(metric))
-                self.table_compare.setItem(i, 1, QTableWidgetItem(value))
-
-            # Aggiorna grafico τ
-            self._update_tau_plot(tau_sim_ms, tau_meas_ms)
-
-    def _update_tau_plot(self, tau_sim_ms, tau_meas_ms):
-        """Aggiorna il grafico di confronto τ."""
-        import pyqtgraph as pg
-
-        self.plot_tau.plot_widget.clear()
-
-        all_tau = np.concatenate([[tau_sim_ms], tau_meas_ms])
-        bins = np.linspace(np.min(all_tau) * 0.8, np.max(all_tau) * 1.2, 20)
-        bin_width = bins[1] - bins[0]
-
-        # Istogramma misurati (rosso)
-        counts_meas, _ = np.histogram(tau_meas_ms, bins=bins)
-        for i, count in enumerate(counts_meas):
-            if count > 0:
-                bar = pg.BarGraphItem(
-                    x=[bins[i] + bin_width / 2], height=[count],
-                    width=bin_width * 0.4, brush='#E53935', pen='#E53935'
-                )
-                self.plot_tau.plot_widget.addItem(bar)
-
-        # Linea verticale τ simulato (blu)
-        self.plot_tau.plot_widget.addLine(
-            x=tau_sim_ms,
-            pen={'color': '#2196F3', 'width': 2, 'style': Qt.DashLine},
-            label=f"τ sim={tau_sim_ms:.3f} ms"
-        )
-
-    def _load_paudio(self):
-        """Carica un file .paudio ed estrae i τ dai click rilevati."""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Open .paudio File", "",
-            "PlantLeaf Audio (*.paudio);;All Files (*)"
-        )
-        if not file_path:
-            return
-
-        try:
-            import struct, json, zlib
-            with open(file_path, 'rb') as f:
-                # Salta header 128 byte
-                f.seek(128)
-                data = f.read()
-
-            # Cerca marker click data
-            click_start = data.find(b'CLCK')
-            if click_start < 0:
-                self.file_label.setText(f"Loaded: {os.path.basename(file_path)}\n(no click data found)")
-                self.real_clicks_tau = []
-                return
-
-            # Leggi click JSON
-            size_bytes = data[click_start + 4: click_start + 8]
-            compressed_size = struct.unpack('<I', size_bytes)[0]
-            compressed_data = data[click_start + 8: click_start + 8 + compressed_size]
-            click_json = zlib.decompress(compressed_data).decode('utf-8')
-            clicks = json.loads(click_json)
-
-            # Estrai durate come proxy di τ (in secondi)
-            # PlantLeaf salva durata in FFT count; ogni FFT = 2.56 ms
-            tau_list = []
-            for click in clicks:
-                duration_str = str(click.get('duration', ''))
-                if 'FFT' in duration_str:
-                    fft_count = int(duration_str.replace(' FFT', '').strip())
-                    tau_ms = fft_count * 2.56 / 3  # stima τ come 1/3 della durata
-                    tau_list.append(tau_ms / 1000.0)
-
-            self.real_clicks_tau = tau_list
-            self.file_label.setText(
-                f"✅ {os.path.basename(file_path)}\n{len(clicks)} clicks, {len(tau_list)} τ values"
-            )
-
-            if self.sim_result:
-                self._update_diagnostics(self.sim_result)
-
-        except Exception as e:
-            QMessageBox.warning(self, "Load Error", f"Could not load file:\n{str(e)}")
-            self.file_label.setText("❌ Load error")
+            for i, (m, v) in enumerate(compare_rows):
+                self.table_compare.setItem(i, 0, QTableWidgetItem(m))
+                self.table_compare.setItem(i, 1, QTableWidgetItem(v))
 
     def _generate_report(self):
-        """Genera il PDF del report scientifico."""
         if not self.sim_result:
             QMessageBox.warning(self, "No Data", "Run a simulation first.")
             return
-
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "Save PDF Report", "report_acoustic.pdf",
-            "PDF Files (*.pdf);;All Files (*)"
+            self, "Save PDF Report", "report_acoustic.pdf", "PDF Files (*.pdf)"
         )
         if not file_path:
             return
-
         try:
-            import sys
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'chemical_simulators'))
             from report_acoustic import generate_report
-
-            tau_meas = self.real_clicks_tau if self.real_clicks_tau else None
-            generate_report(
-                simulation_result=self.sim_result,
-                tau_measured=tau_meas,
-                output_path=file_path
-            )
-            QMessageBox.information(self, "Report Generated", f"PDF saved to:\n{file_path}")
+            generate_report(simulation_result=self.sim_result, output_path=file_path)
+            QMessageBox.information(self, "Done", f"PDF saved to:\n{file_path}")
         except Exception as e:
-            QMessageBox.critical(self, "Report Error", f"Could not generate report:\n{str(e)}")
+            QMessageBox.critical(self, "Error", f"Could not generate report:\n{str(e)}")
 
-    # =========================================================================
-    # TEMA E IMPOSTAZIONI
-    # =========================================================================
+    def _apply_plot_themes(self):
+        bg = '#fafcfa'
+        fg = '#2d4a2b'
+        for plot in [self.plot_time, self.plot_freq, self.plot_bubble]:
+            plot.plot_widget.setBackground(bg)
+            plot.plot_widget.getAxis("bottom").setTextPen(fg)
+            plot.plot_widget.getAxis("left").setTextPen(fg)
 
     def _load_saved_settings(self):
         saved_font_scale = self.font_manager.load_font_scale()
@@ -701,6 +918,10 @@ class MainWindowChemicalSimulator(QMainWindow):
         else:
             self.theme_manager.apply_theme(self, self.theme_manager.current_theme)
         self.setStatusBar(None)
+        self._apply_plot_themes()
+        self.r0_slider.setStyleSheet(SLIDER_CSS)
+        self.pinf_slider.setStyleSheet(SLIDER_CSS)
+        self.dist_slider.setStyleSheet(SLIDER_CSS)
 
     def _go_home(self):
         from windows.main_window_home import MainWindowHome

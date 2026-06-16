@@ -9,7 +9,7 @@ Fonti scientifiche:
     - Brennen (1995): Cavitation and Bubble Dynamics, Oxford University Press
 
 Utilizzo:
-    from chemical_simulators.acoustic_parameters import WaterProperties, BubbleParameters, MicrophoneResponse, PlantLeafConfig
+    from acoustic_parameters import WaterProperties, BubbleParameters, MicrophoneResponse, PlantLeafConfig
 """
 
 import numpy as np

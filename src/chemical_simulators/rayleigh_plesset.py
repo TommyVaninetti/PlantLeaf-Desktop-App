@@ -26,7 +26,7 @@ Fonti:
 import numpy as np
 from scipy.integrate import odeint
 
-from chemical_simulators.acoustic_parameters import (
+from acoustic_parameters import (
     WaterProperties,
     BubbleParameters,
     XylemPressure,
@@ -89,86 +89,47 @@ def rayleigh_plesset_ode(y, t, R0, P_inf, P_gas0):
 # FUNZIONE PRINCIPALE DI SIMULAZIONE
 # =============================================================================
 
-def simulate_bubble_collapse(R0=None, P_inf=None, t_max=None, n_points=5000):
-    """
-    Simula il collasso di una bolla di cavitazione nello xilema.
-
-    Risolve l'equazione di Rayleigh-Plesset dal momento di nucleazione
-    fino al collasso completo o fino a t_max.
-
-    Args:
-        R0       : raggio iniziale della bolla [m].
-                   Default: BubbleParameters.R0_DEFAULT (50 µm)
-        P_inf    : tensione idrica dello xilema [Pa].
-                   Default: XylemPressure.P_INF_DEFAULT (-0.3 MPa)
-        t_max    : durata massima della simulazione [s].
-                   Default: calcolata automaticamente da R0
-        n_points : numero di punti temporali della soluzione
-
-    Returns:
-        dict con le chiavi:
-            't'         : array tempi [s]
-            'R'         : array raggi [m]
-            'V'         : array velocità dR/dt [m/s]
-            'p_source'  : array pressione irradiata alla sorgente [Pa]
-            'R0'        : raggio iniziale usato [m]
-            'P_inf'     : tensione xilematica usata [Pa]
-            'P_gas0'    : pressione iniziale del gas [Pa]
-            'collapsed' : True se la bolla ha raggiunto il collasso
-    """
-    # Valori di default dallo Step 1
+def simulate_bubble_collapse(R0=None, P_inf=None, t_max=None, n_points=5000, tau_target_ms=None):
     if R0 is None:
         R0 = BubbleParameters.R0_DEFAULT
     if P_inf is None:
         P_inf = XylemPressure.P_INF_DEFAULT
 
-    # Condizione di equilibrio iniziale della bolla:
-    # P_gas0 = P_atm + 2σ/R0 - P_inf
-    # La bolla è in equilibrio quando la pressione interna bilancia
-    # la pressione esterna più la tensione superficiale
+    rho = WaterProperties.DENSITY
     sigma = WaterProperties.SURFACE_TENSION
-    P_gas0 = (BubbleParameters.P_ATM
-              + 2.0 * sigma / R0
-              - P_inf)
 
-    # Durata simulazione: scala con R0 e P_inf
-    # Una bolla più grande o con meno tensione impiega più tempo a collassare
+    # Se abbiamo un tau target, stimiamo R0 da esso
+    if tau_target_ms is not None and tau_target_ms > 0:
+        tau_s = tau_target_ms / 1000.0
+        R0_estimated = tau_s / (0.915 * np.sqrt(rho / abs(P_inf)))
+        R0_estimated = np.clip(R0_estimated, 1e-7, 500e-6)
+        R0 = R0_estimated
+        print(f"R0 stimato da tau={tau_target_ms:.3f} ms: {R0*1e6:.2f} µm")
+
+    P_gas0 = BubbleParameters.P_ATM + 2.0 * sigma / R0
+
     if t_max is None:
-        rho = WaterProperties.DENSITY
-        # Tempo di Rayleigh — stima analitica del tempo di collasso
-        # T_R = 0.915 * R0 * sqrt(ρ / |P_inf|)
         T_rayleigh = 0.915 * R0 * np.sqrt(rho / abs(P_inf))
-        # Simuliamo fino a 3 volte il tempo di Rayleigh per catturare
-        # anche le oscillazioni post-collasso
-        t_max = 3.0 * T_rayleigh
+        t_max = max(5.0 * T_rayleigh, 1e-4)
 
-    # Array temporale
     t = np.linspace(0, t_max, n_points)
+    y0 = [R0, 0.0]
 
-    # Condizioni iniziali: bolla ferma al raggio R0
-    y0 = [R0, 0.0]  # [R(0) = R0, V(0) = 0]
-
-    # Risoluzione ODE con scipy
     solution = odeint(
         rayleigh_plesset_ode,
         y0,
         t,
         args=(R0, P_inf, P_gas0),
-        rtol=1e-8,   # tolleranza relativa
-        atol=1e-12,  # tolleranza assoluta
-        mxstep=5000  # max passi interni per intervallo
+        rtol=1e-8,
+        atol=1e-12,
+        mxstep=10000
     )
 
-    R = solution[:, 0]  # raggio nel tempo
-    V = solution[:, 1]  # velocità nel tempo
-
-    # Protezione: forza R >= soglia di collasso
+    R = solution[:, 0]
+    V = solution[:, 1]
     R = np.maximum(R, BubbleParameters.R_COLLAPSE_THRESHOLD)
 
-    # Calcola pressione irradiata alla sorgente
     p_source = compute_radiated_pressure(R, V, t, R0)
-
-    # Controlla se il collasso è avvenuto
     collapsed = np.any(R <= BubbleParameters.R_COLLAPSE_THRESHOLD * 2)
 
     return {

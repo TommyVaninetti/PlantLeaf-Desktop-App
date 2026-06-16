@@ -8,7 +8,7 @@ i parametri diagnostici estratti con la stessa procedura
 dell'algoritmo PlantLeaf v4.0.
 
 Utilizzo:
-    from chemical_simulators.run_acoustic_simulation import run_simulation
+    from run_acoustic_simulation import run_simulation
     result = run_simulation(R0=50e-6, P_inf=-0.5e6)
 """
 

@@ -8,7 +8,7 @@ i parametri diagnostici estratti con la stessa procedura
 dell'algoritmo PlantLeaf v4.0.
 
 Utilizzo:
-    from chemical_simulators.run_acoustic_simulation import run_simulation
+    from run_acoustic_simulation import run_simulation
     result = run_simulation(R0=50e-6, P_inf=-0.5e6)
 """
 
@@ -29,7 +29,7 @@ from acoustic_propagation import apply_propagation
 # FUNZIONE PRINCIPALE
 # =============================================================================
 
-def run_simulation(R0=None, P_inf=None, distance_m=None):
+def run_simulation(R0=None, P_inf=None, distance_m=None, tau_target_ms=None):
     """
     Esegue la simulazione completa del click ultrasonico.
 
@@ -55,7 +55,7 @@ def run_simulation(R0=None, P_inf=None, distance_m=None):
         P_inf = XylemPressure.P_INF_DEFAULT
 
     # --- Step 2: dinamica della bolla ---
-    bubble = simulate_bubble_collapse(R0=R0, P_inf=P_inf)
+    bubble = simulate_bubble_collapse(R0=R0, P_inf=P_inf, tau_target_ms=tau_target_ms)
 
     # --- Step 3: propagazione acustica ---
     propagation = apply_propagation(
@@ -249,22 +249,14 @@ def compute_r_spectral(signal, t):
 # =============================================================================
 
 def resample_to_plantleaf(freq, spectrum):
-    """
-    Ricampiona lo spettro simulato sull'asse frequenze di PlantLeaf
-    (154 bins da 20 a 80 kHz) per il confronto diretto con i dati reali.
-
-    Args:
-        freq     : array frequenze del segnale simulato [Hz]
-        spectrum : array ampiezze del segnale simulato
-
-    Returns:
-        dict con le chiavi:
-            'freq'     : asse frequenze PlantLeaf [Hz] (154 bins)
-            'spectrum' : spettro ricampionato su quell'asse
-    """
     plantleaf_freq = PlantLeafConfig.get_freq_axis()
+    
+    if len(freq) == 0 or len(spectrum) == 0:
+        return {
+            'freq': plantleaf_freq,
+            'spectrum': np.zeros(len(plantleaf_freq))
+        }
 
-    # Interpolazione lineare sullo stesso asse di PlantLeaf
     spectrum_resampled = np.interp(
         plantleaf_freq,
         freq,

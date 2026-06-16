@@ -13,7 +13,7 @@ Fonti:
 """
 
 import numpy as np
-from chemical_simulators.acoustic_parameters import (
+from acoustic_parameters import (
     WaterProperties,
     MicrophoneResponse,
     PlantLeafConfig,
