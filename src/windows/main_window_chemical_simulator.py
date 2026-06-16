@@ -110,16 +110,20 @@ class MainWindowChemicalSimulator(QMainWindow):
         layout.setSpacing(10)
         layout.setContentsMargins(4, 4, 4, 4)
 
-        title = QLabel("Simulation Parameters")
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #2d4a2b; padding: 8px;")
-        layout.addWidget(title)
+        phys_label = QLabel("Physical Parameters")
+        phys_label.setAlignment(Qt.AlignCenter)
+        phys_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #2d4a2b; padding: 8px;")
+        layout.addWidget(phys_label)
 
-        phys_group = QGroupBox("Physical Parameters")
-        phys_layout = QVBoxLayout(phys_group)
+        phys_widget = QWidget()
+        phys_layout = QVBoxLayout(phys_widget)
         phys_layout.setSpacing(8)
+        phys_layout.setContentsMargins(0, 0, 0, 0)
 
-        phys_layout.addWidget(QLabel("Bubble radius R0 [µm]:"))
+        # R0
+        r0_row = QHBoxLayout()
+        r0_lbl = QLabel("R0:")
+        r0_lbl.setFixedWidth(35)
         self.r0_slider = QSlider(Qt.Horizontal)
         self.r0_slider.setRange(20, 100)
         self.r0_slider.setValue(50)
@@ -129,14 +133,18 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.r0_spinbox.setSuffix(" µm")
         self.r0_spinbox.setDecimals(1)
         self.r0_spinbox.setSingleStep(1.0)
-        r0_row = QHBoxLayout()
+        self.r0_spinbox.setFixedWidth(90)
+        r0_row.addWidget(r0_lbl)
         r0_row.addWidget(self.r0_slider)
         r0_row.addWidget(self.r0_spinbox)
         phys_layout.addLayout(r0_row)
         self.r0_slider.valueChanged.connect(lambda v: self.r0_spinbox.setValue(float(v)))
         self.r0_spinbox.valueChanged.connect(lambda v: self.r0_slider.setValue(int(v)))
 
-        phys_layout.addWidget(QLabel("Xylem pressure P∞ [MPa]:"))
+        # P_inf
+        pinf_row = QHBoxLayout()
+        pinf_lbl = QLabel("P∞:")
+        pinf_lbl.setFixedWidth(35)
         self.pinf_slider = QSlider(Qt.Horizontal)
         self.pinf_slider.setRange(-150, -30)
         self.pinf_slider.setValue(-30)
@@ -146,14 +154,18 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.pinf_spinbox.setSuffix(" MPa")
         self.pinf_spinbox.setDecimals(2)
         self.pinf_spinbox.setSingleStep(0.05)
-        pinf_row = QHBoxLayout()
+        self.pinf_spinbox.setFixedWidth(90)
+        pinf_row.addWidget(pinf_lbl)
         pinf_row.addWidget(self.pinf_slider)
         pinf_row.addWidget(self.pinf_spinbox)
         phys_layout.addLayout(pinf_row)
         self.pinf_slider.valueChanged.connect(lambda v: self.pinf_spinbox.setValue(v / 100.0))
         self.pinf_spinbox.valueChanged.connect(lambda v: self.pinf_slider.setValue(int(v * 100)))
 
-        phys_layout.addWidget(QLabel("Distance bubble → mic [cm]:"))
+        # Distance
+        dist_row = QHBoxLayout()
+        dist_lbl = QLabel("Dist:")
+        dist_lbl.setFixedWidth(35)
         self.dist_slider = QSlider(Qt.Horizontal)
         self.dist_slider.setRange(5, 50)
         self.dist_slider.setValue(10)
@@ -163,21 +175,22 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.dist_spinbox.setSuffix(" cm")
         self.dist_spinbox.setDecimals(1)
         self.dist_spinbox.setSingleStep(0.1)
-        dist_row = QHBoxLayout()
+        self.dist_spinbox.setFixedWidth(90)
+        dist_row.addWidget(dist_lbl)
         dist_row.addWidget(self.dist_slider)
         dist_row.addWidget(self.dist_spinbox)
         phys_layout.addLayout(dist_row)
         self.dist_slider.valueChanged.connect(lambda v: self.dist_spinbox.setValue(v / 10.0))
         self.dist_spinbox.valueChanged.connect(lambda v: self.dist_slider.setValue(int(v * 10)))
 
-        layout.addWidget(phys_group)
+        layout.addWidget(phys_widget)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
         sep.setFrameShadow(QFrame.Sunken)
         layout.addWidget(sep)
 
-        self.btn_load = QPushButton("📂  Load .paudio File")
+        self.btn_load = QPushButton("Load .paudio File")
         self.btn_load.setMinimumHeight(42)
         self.btn_load.setObjectName("mainButton")
         self.btn_load.clicked.connect(self._load_paudio)
@@ -187,7 +200,7 @@ class MainWindowChemicalSimulator(QMainWindow):
         layout.addWidget(self.click_selector_label)
 
         self.click_table = QTableWidget(0, 4)
-        self.click_table.setHorizontalHeaderLabels(["Time (s)", "τ (ms)", "Peak (µV)", "R²"])
+        self.click_table.setHorizontalHeaderLabels(["Time (s)", "τ (ms)", "Peak", "R²"])
         self.click_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.click_table.verticalHeader().setVisible(False)
         self.click_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -196,14 +209,14 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.click_table.itemSelectionChanged.connect(self._on_click_selected)
         layout.addWidget(self.click_table)
 
-        self.btn_run = QPushButton("▶  Run Simulation")
+        self.btn_run = QPushButton("Run Simulation")
         self.btn_run.setMinimumHeight(42)
         self.btn_run.setObjectName("mainButton")
         self.btn_run.setEnabled(False)
         self.btn_run.clicked.connect(self._run_simulation)
         layout.addWidget(self.btn_run)
 
-        self.btn_pdf = QPushButton("📄  Generate PDF Report")
+        self.btn_pdf = QPushButton("Generate PDF Report")
         self.btn_pdf.setMinimumHeight(38)
         self.btn_pdf.setObjectName("mainButton")
         self.btn_pdf.setEnabled(False)
@@ -238,7 +251,7 @@ class MainWindowChemicalSimulator(QMainWindow):
             x_label="Time", y_label="Amplitude",
             x_range=(0, 150), y_range=(-1.2, 1.2),
             x_min=0, x_max=200, y_min=-2, y_max=2,
-            unit_x="s", unit_y="", parent=self
+            unit_x="us", unit_y="", parent=self
         )
         self.curve_sim_time = self.plot_time.plot_widget.plot(name="Simulated", pen={'color': '#689f67', 'width': 2})
         self.curve_real_time = self.plot_time.plot_widget.plot(
@@ -272,9 +285,9 @@ class MainWindowChemicalSimulator(QMainWindow):
         bubble_layout.addWidget(QLabel("Bubble radius R(t) during collapse"))
         self.plot_bubble = BasePlotWidget(
             x_label="Time", y_label="Radius",
-            x_range=(0, 1e-4), y_range=(0, 100),
-            x_min=0, x_max=1e-3, y_min=0, y_max=200,
-            unit_x="s", unit_y="µm", parent=self
+            x_range=(0, 150), y_range=(0, 100),
+            x_min=0, x_max=200, y_min=0, y_max=200,
+            unit_x="us", unit_y="µm", parent=self
         )
         self.curve_bubble = self.plot_bubble.plot_widget.plot(
             name="R(t)", pen={'color': '#2196F3', 'width': 2}
@@ -293,11 +306,16 @@ class MainWindowChemicalSimulator(QMainWindow):
 
         title = QLabel("Diagnostics")
         title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #2d4a2b; padding: 8px;")
+        title.setStyleSheet("font-size: 26px; font-weight: bold; color: #2d4a2b; padding: 8px;")
         layout.addWidget(title)
 
-        sim_group = QGroupBox("Simulated Parameters")
-        sim_layout = QVBoxLayout(sim_group)
+        layout.addSpacing(48)
+
+        sim_title = QLabel("Simulated\nParameters")
+        sim_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #2d4a2b; padding: 4px;")
+        sim_title.setAlignment(Qt.AlignLeft)
+        layout.addWidget(sim_title)
+
         self.table_sim = QTableWidget(0, 2)
         self.table_sim.setHorizontalHeaderLabels(["Parameter", "Value"])
         self.table_sim.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -305,11 +323,14 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.table_sim.verticalHeader().setVisible(False)
         self.table_sim.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table_sim.setAlternatingRowColors(True)
-        sim_layout.addWidget(self.table_sim)
-        layout.addWidget(sim_group)
+        self.table_sim.setStyleSheet("QTableWidget { border: none; }")
+        layout.addWidget(self.table_sim)
 
-        compare_group = QGroupBox("Comparison Real vs Simulated")
-        compare_layout = QVBoxLayout(compare_group)
+        compare_title = QLabel("Comparison Real\nvs Simulated")
+        compare_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #2d4a2b; padding: 4px;")
+        compare_title.setAlignment(Qt.AlignLeft)
+        layout.addWidget(compare_title)
+
         self.table_compare = QTableWidget(0, 2)
         self.table_compare.setHorizontalHeaderLabels(["Metric", "Value"])
         self.table_compare.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -317,8 +338,8 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.table_compare.verticalHeader().setVisible(False)
         self.table_compare.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table_compare.setAlternatingRowColors(True)
-        compare_layout.addWidget(self.table_compare)
-        layout.addWidget(compare_group)
+        self.table_compare.setStyleSheet("QTableWidget { border: none; }")
+        layout.addWidget(self.table_compare)
 
         self.correlation_label = QLabel("Correlation: —")
         self.correlation_label.setAlignment(Qt.AlignCenter)
@@ -369,14 +390,14 @@ class MainWindowChemicalSimulator(QMainWindow):
         toolbar = self.addToolBar("Main")
         toolbar.setMovable(False)
         toolbar.setIconSize(QSize(28, 28))
-        home_action = QAction("🏠 Home", self)
+        home_action = QAction("Home", self)
         home_action.triggered.connect(self._go_home)
         toolbar.addAction(home_action)
         toolbar.addSeparator()
-        run_action = QAction("▶ Run", self)
+        run_action = QAction("Run", self)
         run_action.triggered.connect(self._run_simulation)
         toolbar.addAction(run_action)
-        load_action = QAction("📂 Load .paudio", self)
+        load_action = QAction("Load .paudio", self)
         load_action.triggered.connect(self._load_paudio)
         toolbar.addAction(load_action)
 
@@ -468,7 +489,7 @@ class MainWindowChemicalSimulator(QMainWindow):
                             clicks_raw = []
 
             if not clicks_raw:
-                self.file_label.setText("🔍 Running click detector...")
+                self.file_label.setText("Running click detector...")
                 QApplication.processEvents()
                 clicks_raw = self._run_click_detector(
                     fft_data, phase_data, freq_axis, fs, fft_size, frame_duration_ms
@@ -705,7 +726,7 @@ class MainWindowChemicalSimulator(QMainWindow):
             tau_str = f"{click['tau_ms']:.3f}" if click['tau_ms'] > 0 else "N/A"
             self.click_table.setItem(i, 1, QTableWidgetItem(tau_str))
             peak_uv = click.get('peak_amp', 0.0) * 1e6
-            self.click_table.setItem(i, 2, QTableWidgetItem(f"{peak_uv:.1f}"))
+            self.click_table.setItem(i, 2, QTableWidgetItem(f"{peak_uv:.0f}"))
             r2_val = click.get('r2', click.get('r2_log', 0.0))
             self.click_table.setItem(i, 3, QTableWidgetItem(f"{r2_val:.3f}"))
 
@@ -828,7 +849,6 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.curve_sim_freq.setData(freq, spec)
 
         R_um = bubble['R'] * 1e6
-        t_us = t * 1e6
         self.curve_bubble.setData(t * 1e6, R_um)
 
     def _update_diagnostics(self, result):
@@ -842,7 +862,6 @@ class MainWindowChemicalSimulator(QMainWindow):
             ("τ simulated", f"{diag['tau']*1000:.3f} ms" if diag['tau'] else "N/A"),
             ("SPR",        f"{diag['SPR']:.2f}" if diag['SPR'] else "N/A"),
             ("Asymmetry",  f"{diag['asymmetry']:.3f}" if diag['asymmetry'] else "N/A"),
-            ("R spectral", f"{diag['R_spectral']:.3f}" if diag['R_spectral'] else "N/A"),
         ]
         self.table_sim.setRowCount(len(rows))
         for i, (p, v) in enumerate(rows):
