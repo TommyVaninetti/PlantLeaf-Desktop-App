@@ -265,10 +265,10 @@ class AudioLoadWorker(QObject):
             full_freq_axis = np.arange(fft_size_h // 2) * (fs_h / fft_size_h)
 
             n = total_frames
-            fft_means_arr   = np.empty(n, dtype=np.float32)
-            E_hat_floors    = np.empty(n, dtype=np.float32)
-            noise_floors    = np.empty(n, dtype=np.float32)
-            std_noises      = np.empty(n, dtype=np.float32)
+            fft_means_arr   = np.empty(n, dtype=np.float64)
+            E_hat_floors    = np.empty(n, dtype=np.float64)
+            noise_floors    = np.empty(n, dtype=np.float64)
+            std_noises      = np.empty(n, dtype=np.float64)
             fft_timestamps  = np.empty(n, dtype=np.float64)
 
             estimator = AdaptiveNoiseEstimatorV5()

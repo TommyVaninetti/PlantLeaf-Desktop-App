@@ -179,30 +179,17 @@ class ReplayBaseWindow(FileHandlerMixin, QMainWindow):
             self.actionFFTParameters.setToolTip("Analyze FFT parameters fed to the algorithm")
             analysis_menu.addAction(self.actionFFTParameters)
 
-            # CLICK DETECTOR
-            analysis_menu.addSeparator()
-            self.actionClickDetector = QAction("Automatic Click Detector", self)
-            self.actionClickDetector.setShortcut("Ctrl+D")
-            self.actionClickDetector.setToolTip(
-                "Run automatic ultrasonic click detection algorithm\n"
-                "4-stage pipeline: Energy → Spectral → Decay → Deduplication"
-            )
-            analysis_menu.addAction(self.actionClickDetector)
-
-            # BATCH SCREENSHOT EXPORT
-            self.actionBatchExport = QAction("Batch Export Screenshots", self)
-            self.actionBatchExport.setShortcut("Ctrl+Shift+E")
-            self.actionBatchExport.setToolTip(
-                "Export PNG screenshots for all detected clicks\n"
-                "Run Click Detector first. Saves to confirmed/ and rejected/ folders."
-            )
-            analysis_menu.addAction(self.actionBatchExport)
-
             # TOGGLE NORMALIZED DATA OR RAW (FOR ALL FFT, IFFT AND MEANFFT PLOTS)
             self.actionToggleNormalized = QAction("Toggle Normalized/Raw", self)
             self.actionToggleNormalized.setToolTip("Toggle between normalized and raw data views")
             
             analysis_menu.addAction(self.actionToggleNormalized)
+
+            # BATCH EXPORT
+            self.actionDataCollection = QAction("Export Data Collection", self)
+            self.actionDataCollection.setToolTip("Export all detected clicks as CSV and screenshots")
+            self.actionDataCollection.triggered.connect(self._on_open_data_collection_dialog)
+            file_menu.addAction(self.actionDataCollection)
 
         self.actionMath = QAction("Select Region for Analysis", self)
         self.actionMath.setToolTip("Select a region in the plot to perform mathematical analysis")

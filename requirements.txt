@@ -4,3 +4,4 @@ pyserial
 numpy
 scipy
 wakepy
+scikit-learn>=1.4.0

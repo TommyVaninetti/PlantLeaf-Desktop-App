@@ -46,6 +46,7 @@ class MainWindowHome(BaseWindow):
         self.actionWebSite = QAction("Website", self)
         self.actionLicense = QAction("License", self)
         self.actionOpenFile = QAction("Open File", self)
+        self.actionDataCollection = QAction("Export Data Collection", self)
         self.actionDark = QAction("Dark", self)
         self.actionDark_Green = QAction("Dark Green", self)
         self.actionDark_Blue = QAction("Dark Blue", self)
@@ -91,6 +92,9 @@ class MainWindowHome(BaseWindow):
         menu_bar.addMenu(menu_file)
         menu_file.addAction(self.actionOpenFile)
         self.actionOpenFile.setShortcut("Ctrl+O")
+        menu_file.addSeparator()
+        menu_file.addAction(self.actionDataCollection)
+        self.actionDataCollection.setShortcut("Ctrl+E")
 
         # Menu Settings (solo temi e font)
         menu_settings = QMenu("Settings", self)
@@ -142,6 +146,7 @@ class MainWindowHome(BaseWindow):
             (self.actionWebSite, self.website_action),
             (self.actionLicense, self.license_action),
             (self.actionOpenFile, self.open_file_action),
+            (self.actionDataCollection, self._on_open_data_collection_dialog),
             (self.actionDark, lambda: self.update_style(theme_name="dark.css")),
             (self.actionDark_Green, lambda: self.update_style(theme_name="dark_green.css")),
             (self.actionDark_Blue, lambda: self.update_style(theme_name="dark_blue.css")),
@@ -297,7 +302,7 @@ class MainWindowHome(BaseWindow):
             print(f"❌ Error opening audio window: {e}")
             self.show_error_dialog("Error", f"Could not open audio analysis:\n{str(e)}")
 
-    
+     
     def closeEvent(self, event):
         """Override del closeEvent per la finestra home"""
         # Chiudi direttamente senza passare per BaseWindow
@@ -313,5 +318,14 @@ class MainWindowHome(BaseWindow):
         msg.setIcon(QMessageBox.Critical)
         msg.addButton("OK", QMessageBox.AcceptRole)
         msg.exec()
+    
+    def _on_open_data_collection_dialog(self):
+        """Open data collection dialog for Phase 2."""
+        try:
+            from components.data_collection_dialog_v5 import DataCollectionDialogV5
+            dialog = DataCollectionDialogV5(parent=self)
+            dialog.exec()
+        except Exception as e:
+            self.show_error_dialog("Error", f"Failed to open data collection dialog: {e}")
 
 

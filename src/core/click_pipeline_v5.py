@@ -738,7 +738,9 @@ def compute_fft_energy(fft_magnitudes: np.ndarray) -> float:
         return 0.0
     # Use only as many bins as are present (guard against truncated frames)
     k = min(len(fft_magnitudes), _K_BINS)
-    return float(np.mean(fft_magnitudes[:k] ** 2))
+    # Cast to float64 before squaring: float32 overflows for large (but physically
+    # plausible) values that arrive from corrupted or high-amplitude frames.
+    return float(np.mean(fft_magnitudes[:k].astype(np.float64) ** 2))
 
 
 ### STAGES ###
