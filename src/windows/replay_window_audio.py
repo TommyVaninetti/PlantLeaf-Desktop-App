@@ -389,10 +389,32 @@ class IFFTWindow(QDialog):
         # Menubar
         from PySide6.QtWidgets import QMenuBar
         menubar = QMenuBar(self)
-        file_menu = menubar.addMenu("Analysis")
-        action_close = QAction("Close", self)
-        action_close.triggered.connect(self.close)
-        file_menu.addAction(action_close)
+        analysis_menu = menubar.addMenu("Analysis")
+
+        actionNormalize = QAction("Toggle Normalization", self)
+        actionNormalize.triggered.connect(self.toggle_normalization)
+        analysis_menu.addAction(actionNormalize)
+
+        actionEnvelope = QAction("Show Hilbert Envelope", self)
+        actionEnvelope.triggered.connect(self.toggle_envelope)
+        analysis_menu.addAction(actionEnvelope)
+
+        actionAnalyseDecay = QAction("Analyse Decay", self)
+        actionAnalyseDecay.triggered.connect(self.analyze_decay)
+        analysis_menu.addAction(actionAnalyseDecay)
+
+        actionShowFitCurve = QAction("Show Fit Curve", self)
+        actionShowFitCurve.triggered.connect(self.toggle_fit_curve)
+        analysis_menu.addAction(actionShowFitCurve)
+
+        actionShowOnlyEnvelope = QAction("Show Only Envelope", self)
+        actionShowOnlyEnvelope.triggered.connect(self.toggle_ifft_signal)
+        analysis_menu.addAction(actionShowOnlyEnvelope)
+
+        actionClose = QAction("Close", self)
+        actionClose.triggered.connect(self.close)
+        analysis_menu.addAction(actionClose)
+
 
         layout.setMenuBar(menubar)
         self.setLayout(layout)
@@ -995,6 +1017,8 @@ class ReplayWindowAudio(ReplayBaseWindow):
         # ✅ CONNETTI AZIONI AUDIO-SPECIFIC
         if hasattr(self, 'actionToggleNormalized'):
             self.actionToggleNormalized.triggered.connect(self.toggle_normalized_data)
+        if hasattr(self, 'actionDataCollection'):
+            self.actionDataCollection.triggered.connect(self._on_open_data_collection_dialog)
 
         # Applica tema
         self._load_saved_settings()
@@ -1465,7 +1489,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
         
         self.plot_widget_fft = BasePlotWidget(
             x_label="Frequency", y_label="Amplitude",
-            x_range=(20000, 80000), y_range=(0, 0.02),
+            x_range=(20000, 80000), y_range=(0, 0.003),
             x_min=19000, x_max=81000, y_min=0, y_max=1.7,
             unit_x="Hz", unit_y="V", parent=self
         )
@@ -2122,3 +2146,12 @@ class ReplayWindowAudio(ReplayBaseWindow):
 
         # Update FFT window
         self.update_display()
+    
+    def _on_open_data_collection_dialog(self):
+        """Open data collection dialog for Phase 2."""
+        try:
+            from components.data_collection_dialog_v5 import DataCollectionDialogV5
+            dialog = DataCollectionDialogV5(parent=self)
+            dialog.exec()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to open data collection dialog: {e}")
