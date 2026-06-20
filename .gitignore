@@ -8,6 +8,7 @@ firmware/
 implementations_docs/
 test_scripts/
 other/
+scripts/
 
 # Python bytecode
 __pycache__/

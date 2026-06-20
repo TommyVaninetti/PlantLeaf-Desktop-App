@@ -1,7 +1,13 @@
+#Fundamental
 PySide6==6.9.0
 pyqtgraph
 pyserial
 numpy
 scipy
+
+#Acquisition
 wakepy
+
+#LM
 scikit-learn>=1.4.0
+pandas
