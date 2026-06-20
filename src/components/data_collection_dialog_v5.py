@@ -167,74 +167,91 @@ def _get_frame_envelope_pair(
     normalize: bool = True,
 ) -> Tuple:
     """
-    Get envelope and signal for current frame plus prev/next frames.
-    
-    Handles boundary conditions gracefully (frame 0, frame N-1).
-    
-    Args:
-        dm: AudioDataManager instance with loaded .paudio file
-        frame_idx: Current frame index to process
-        normalize: If True, use normalized FFT (default). If False, use raw FFT.
-    
+    Reconstruct current frame + its neighbours, return envelopes and signals.
+
+    Centralises ALL iFFT/Hilbert work for a candidate so the caller never needs
+    to call reconstruct_frame_v5 a second time for the same frame.
+
     Returns:
-        Tuple of:
-        - prev_envelope: envelope from frame idx-1 (None if idx=0)
-        - curr_envelope: envelope from frame idx
-        - next_envelope: envelope from frame idx+1 (None if idx=last)
-        - curr_signal: raw iFFT signal from frame idx
-        - prev_signal: raw iFFT signal from frame idx-1 (None if idx=0)
+        prev_envelope : ndarray or None
+        curr_envelope : ndarray
+        next_envelope : ndarray or None
+        curr_signal   : ndarray
+        prev_signal   : ndarray or None
+        curr_fft_norm : ndarray  ← mic-corrected FFT magnitudes (full half-spectrum)
+        curr_freq_axis: ndarray  ← frequency axis [Hz] for curr_fft_norm
     """
-    # Lazy import to avoid circular imports
     from core.click_pipeline_v5 import (
         reconstruct_frame_v5,
         compute_hilbert_envelope,
         FS, FFT_SIZE,
     )
-    
-    envelopes = {}
-    signals = {}
-    
-    # Determine which frames to load
+
+    envelopes  = {}
+    signals    = {}
+    curr_fft_norm  = None
+    curr_freq_axis = None
+
     frames_to_load = [frame_idx]
     if frame_idx > 0:
         frames_to_load.append(frame_idx - 1)
     if frame_idx < len(dm.fft_mags) - 1:
         frames_to_load.append(frame_idx + 1)
-    
-    # Load and reconstruct frames
+
     for idx in frames_to_load:
-        frame_data = reconstruct_frame_v5(
-            dm.fft_mags[idx],
-            dm.phase_int8[idx],
-            FS,
-            FFT_SIZE,
-            normalize=normalize,
+        fd = reconstruct_frame_v5(
+            dm.fft_mags[idx], dm.phase_int8[idx],
+            FS, FFT_SIZE, normalize=normalize,
         )
-        signals[idx] = frame_data['signal']
-        envelopes[idx] = compute_hilbert_envelope(frame_data['signal'])
-    
+        if fd is None:
+            continue
+        signals[idx]   = fd['signal']
+        envelopes[idx] = compute_hilbert_envelope(fd['signal'])
+        if idx == frame_idx:          # keep FFT data for the candidate frame
+            curr_fft_norm  = fd['fft_norm']
+            curr_freq_axis = fd['freq_axis']
+
     prev_envelope = envelopes.get(frame_idx - 1) if frame_idx > 0 else None
     curr_envelope = envelopes[frame_idx]
     next_envelope = envelopes.get(frame_idx + 1) if frame_idx < len(dm.fft_mags) - 1 else None
-    curr_signal = signals[frame_idx]
-    prev_signal = signals.get(frame_idx - 1) if frame_idx > 0 else None
-    
-    return prev_envelope, curr_envelope, next_envelope, curr_signal, prev_signal
+    curr_signal   = signals[frame_idx]
+    prev_signal   = signals.get(frame_idx - 1) if frame_idx > 0 else None
+
+    return (prev_envelope, curr_envelope, next_envelope,
+            curr_signal, prev_signal,
+            curr_fft_norm, curr_freq_axis)
 
 
 def _process_file_for_collection(
     dm,
     k: float = K_DEFAULT,
     normalize: bool = True,
+    stop_check=None,
+    progress_cb=None,
 ) -> Tuple[List[CandidateData], List[Dict]]:
     """
     Process single .paudio file: find Stage 1 survivors and compute all features.
-    
+
+    Args (additional):
+        stop_check  : Optional callable() → bool. Called before each survivor.
+                      Return True to abort early (partial results returned).
+        progress_cb : Optional callable(i, total) emitted every 10 survivors so
+                      the dialog can show that analysis is progressing.
+
+    Fast path: if dm already carries the pre-computed arrays produced by
+    AudioLoadWorker (fft_means, E_hat_floor_arr, noise_floor_arr, std_noise_arr),
+    Stage 1 is a pure-numpy threshold + run-length filter — no per-frame iFFT
+    or Hilbert transform needed (that was already done during file loading).
+    This avoids re-processing every frame a second time, which was the main
+    performance bottleneck.
+
+    Slow-path fallback (run_stage1_v5) is used when those arrays are absent.
+
     Args:
         dm: AudioDataManager with loaded file
         k: Stage 1 multiplier (default 1.5)
         normalize: Use normalized FFT if True
-    
+
     Returns:
         Tuple of:
         - candidates: List of CandidateData objects (one per Stage 1 survivor)
@@ -243,77 +260,137 @@ def _process_file_for_collection(
     # Lazy import to avoid circular imports
     from core.click_pipeline_v5 import (
         run_stage1_v5,
-        reconstruct_frame_v5,
         compute_hilbert_envelope,
         find_peak,
         compute_features_v5,
-        run_fit_pipeline_v5,
-        FS, FFT_SIZE,
+        FS, FFT_SIZE, MAX_RUN,
     )
-    
+
     candidates = []
-    csv_rows = []
-    
-    # Run Stage 1: find survivors
-    candidates_raw = run_stage1_v5(dm, k=k)
-    
+    csv_rows   = []
+
+    # ── Stage 1: find above-threshold candidates ──────────────────────────────
+    # Fast path: AudioLoadWorker already computed per-frame energy and adaptive
+    # noise estimates.  Reuse them — no iFFT/Hilbert needed here.
+    _has_precomputed = (
+        hasattr(dm, 'fft_means')        and dm.fft_means       is not None and
+        hasattr(dm, 'E_hat_floor_arr')  and dm.E_hat_floor_arr is not None and
+        hasattr(dm, 'noise_floor_arr')  and dm.noise_floor_arr is not None and
+        hasattr(dm, 'std_noise_arr')    and dm.std_noise_arr   is not None and
+        len(dm.fft_means) == dm.total_frames
+    )
+
+    if _has_precomputed:
+        fft_means     = np.asarray(dm.fft_means,       dtype=np.float64)
+        E_hat_arr     = np.asarray(dm.E_hat_floor_arr, dtype=np.float64)
+        noise_fl_arr  = np.asarray(dm.noise_floor_arr, dtype=np.float64)
+        std_noise_arr = np.asarray(dm.std_noise_arr,   dtype=np.float64)
+
+        # Threshold: E_i > k × Ê_floor  (vectorised, no Python loop over frames)
+        valid   = E_hat_arr > 0
+        flagged = valid & (fft_means > k * E_hat_arr)
+        indices = np.where(flagged)[0]
+
+        if len(indices) == 0:
+            return candidates, csv_rows
+
+        # Run-length filter: discard runs > MAX_RUN consecutive frames (noise)
+        above_threshold = [
+            {
+                'frame_idx'  : int(i),
+                'E_i'        : float(fft_means[i]),
+                'E_hat_floor': float(E_hat_arr[i]),
+                'noise_floor': float(noise_fl_arr[i]),
+                'std_noise'  : float(std_noise_arr[i]),
+            }
+            for i in indices
+        ]
+
+        runs, current = [], [above_threshold[0]]
+        for j in range(1, len(above_threshold)):
+            if above_threshold[j]['frame_idx'] == above_threshold[j-1]['frame_idx'] + 1:
+                current.append(above_threshold[j])
+            else:
+                runs.append(current)
+                current = [above_threshold[j]]
+        runs.append(current)
+
+        candidates_raw = []
+        for run in runs:
+            if len(run) <= MAX_RUN:
+                for entry in run:
+                    candidates_raw.append({**entry, 'group_size': len(run)})
+    else:
+        # Slow path: recompute noise estimator from scratch (file was loaded
+        # without pre-computed arrays, e.g. older .paudio format).
+        candidates_raw = run_stage1_v5(dm, k=k)
+
     if not candidates_raw:
         return candidates, csv_rows
-    
+
+    n_survivors = len(candidates_raw)
+
     # Process each survivor
     for i, survivor in enumerate(candidates_raw):
+        # Honour cancel request — return partial results already built
+        if stop_check is not None and stop_check():
+            break
+
+        # Emit periodic progress so the dialog label doesn't appear frozen
+        if progress_cb is not None and i % 10 == 0:
+            progress_cb(i, n_survivors)
+
         frame_idx = survivor['frame_idx']
-        
+
         try:
-            # Get prev/next frame envelopes + signals for feature computation
-            prev_env, curr_env, next_env, curr_sig, prev_sig = _get_frame_envelope_pair(
+            # Single iFFT reconstruction pass — _get_frame_envelope_pair now
+            # returns curr_fft_norm and curr_freq_axis so we never reconstruct
+            # the same frame twice.
+            (prev_env, curr_env, next_env,
+             curr_sig, prev_sig,
+             curr_fft_norm, curr_freq_axis) = _get_frame_envelope_pair(
                 dm, frame_idx, normalize=normalize
             )
-            
-            # Reconstruct current frame to get FFT data for features
-            frame_data = reconstruct_frame_v5(
-                dm.fft_mags[frame_idx],
-                dm.phase_int8[frame_idx],
-                FS,
-                FFT_SIZE,
-                normalize=normalize,
-            )
-            
-            # Compute peak index — unpack tuple returned by find_peak()
+
+            # Compute peak index
             peak_idx, peak_amp = find_peak(curr_env)
-            
-            # Compute all 17 features
+
+            # Compute all 17 features (calls run_fit_pipeline_v5 internally)
             features = compute_features_v5(
-                signal=frame_data['signal'],
+                signal=curr_sig,
                 envelope=curr_env,
-                fft_norm=frame_data['fft_norm'],
-                freq_axis=frame_data['freq_axis'],
+                fft_norm=curr_fft_norm,
+                freq_axis=curr_freq_axis,
                 noise_floor=survivor['noise_floor'],
                 std_noise=survivor['std_noise'],
-                peak_idx=peak_idx,           
+                peak_idx=peak_idx,
                 fs=FS,
                 next_frame_envelope=next_env,
                 prev_frame_envelope=prev_env,
                 prev_frame_signal=prev_sig,
             )
-            
-            # Calculate timestamp
-            timestamp_s = frame_idx / (FS / FFT_SIZE)  # Convert frame to seconds
 
-            # Pre-compute fit curve here (worker thread) so the renderer never
-            # needs to call scipy.  Uses the same tau_ms from features.
+            # Calculate timestamp
+            timestamp_s = frame_idx / (FS / FFT_SIZE)
+
+            # Pre-compute fit curve for the renderer.
+            # Use find_decay_window_v5 directly (already imported inside
+            # compute_features_v5) to get the window bounds without calling
+            # the full run_fit_pipeline_v5 a second time.
             fit_t_ms_arr = None
             fit_y_arr    = None
             tau_ms_val   = features.get('tau_ms', -1.0)
             R2_val       = features.get('R2', 0.0)
             if tau_ms_val > 0 and R2_val > 0.1:
                 try:
-                    fit_result  = run_fit_pipeline_v5(
-                        curr_env, peak_idx, survivor['noise_floor'],
-                        survivor['std_noise'], FS, next_env,
+                    from core.click_pipeline_v5 import find_decay_window_v5
+                    win    = find_decay_window_v5(
+                        curr_env, peak_idx,
+                        survivor['noise_floor'], survivor['std_noise'],
+                        next_env,
                     )
-                    d_start = fit_result.get('decay_start', 0)
-                    d_end   = min(fit_result.get('decay_end', len(curr_env)), len(curr_env))
+                    d_start = win['decay_start']
+                    d_end   = min(win['decay_end'], len(curr_env))
                     if d_end > d_start + 2:
                         n_arr        = np.arange(d_end - d_start, dtype=np.float64)
                         tau_s        = max(tau_ms_val, 0.01) / 1000.0
@@ -325,10 +402,10 @@ def _process_file_for_collection(
                     pass
 
             ### FILTERS ### (also skips screenshot rendering)
-            
+
             # Skip candidates with invalid R^2 or tau
             if features.get('R2', 0.00) == 0.00 or features.get('tau_ms', -1.0) <= 0:
-                continue 
+                continue
 
             ### ------- ###
 
@@ -357,10 +434,10 @@ def _process_file_for_collection(
                 SPR=features.get('SPR', 0.0),
                 R_spectral=features.get('R_spectral', 0.0),
                 FPE_hz=features.get('FPE_hz', 0.0),
-                signal=frame_data['signal'],
+                signal=curr_sig,
                 envelope=curr_env,
-                fft_norm=frame_data['fft_norm'],
-                freq_axis=frame_data['freq_axis'],
+                fft_norm=curr_fft_norm,
+                freq_axis=curr_freq_axis,
                 fit_t_ms=fit_t_ms_arr,
                 fit_y=fit_y_arr,
                 label='',
@@ -821,7 +898,8 @@ class DataCollectionWorkerV5(QThread):
     
     # Signals
     progress_updated = Signal(int, int, int, int)  # (file_idx, total_files, candidates_found, total_candidates)
-    candidate_ready  = Signal(object)              # ← NEW: (CandidateData, str) — rendered on main thread
+    load_progress    = Signal(int, int, int)        # (file_idx, total_files, pct_0_100) — fired during file loading
+    candidate_ready  = Signal(object)              # (CandidateData, str) — rendered on main thread
     file_complete    = Signal(str, int, str)       # (filename, candidate_count, csv_path)
     error_occurred   = Signal(str)
     finished         = Signal(int, str)            # (total_candidates, output_dir)
@@ -848,6 +926,8 @@ class DataCollectionWorkerV5(QThread):
         self.output_dir = Path(output_dir) if output_dir else Path.home() / 'plantleaf_data_collection'
         self.normalize_mode = normalize_mode
         self._stop_requested = False
+        # Holds the active AudioLoadWorker so request_stop() can cancel it mid-load.
+        self._current_audio_worker = None
     
     def run(self):
         """Main worker loop — pure numpy/IO work only. No Qt widgets created here."""
@@ -871,13 +951,24 @@ class DataCollectionWorkerV5(QThread):
 
                 try:
                     self.error_occurred.emit(f"Loading {paudio_file.name}...")
-                    dm = self._load_audio_file(paudio_file)
+                    dm = self._load_audio_file(paudio_file, file_idx, len(self.file_list))
                     if dm is None:
                         self.error_occurred.emit(f"Failed to load {paudio_file.name}, skipping")
                         continue
 
+                    # Loading done — tell the user we're now in the analysis phase.
+                    # Without this, the label stays frozen at the last "Loading: X%"
+                    # value for the entire (potentially long) feature-extraction phase.
+                    self.error_occurred.emit(
+                        f"Analysing {paudio_file.name} ({dm.total_frames} frames)…"
+                    )
+
                     candidates, csv_rows = _process_file_for_collection(
-                        dm, k=self.k, normalize=self.normalize_mode
+                        dm, k=self.k, normalize=self.normalize_mode,
+                        stop_check=lambda: self._stop_requested,
+                        progress_cb=lambda done, total: self.error_occurred.emit(
+                            f"  → {paudio_file.name}: {done}/{total} survivors processed…"
+                        ),
                     )
                     
                     ## CSV ##
@@ -920,7 +1011,7 @@ class DataCollectionWorkerV5(QThread):
             self.error_occurred.emit(f"Critical error in worker: {str(e)}")
             traceback.print_exc()
     
-    def _load_audio_file(self, paudio_path: Path):
+    def _load_audio_file(self, paudio_path: Path, file_idx: int = 0, total_files: int = 1):
         """
         Load a .paudio file into AudioDataManager.
 
@@ -928,8 +1019,14 @@ class DataCollectionWorkerV5(QThread):
         we are already inside DataCollectionWorkerV5.run()).
         Mirrors file_handler_mixin._on_finished for consistent field population.
 
+        Forwards AudioLoadWorker's internal progress (0-100 %) through the
+        load_progress signal so the dialog can animate its progress bar during
+        the loading phase — otherwise the UI appears frozen for large files.
+
         Args:
-            paudio_path: Path to .paudio file
+            paudio_path : Path to .paudio file
+            file_idx    : Zero-based index of this file in the batch (for progress scaling)
+            total_files : Total number of files in the batch (for progress scaling)
 
         Returns:
             AudioDataManager if successful, None otherwise
@@ -945,9 +1042,26 @@ class DataCollectionWorkerV5(QThread):
             worker.finished.connect(lambda d: result.update({'data': d}))
             worker.error.connect(lambda msg: result.update({'error': msg}))
 
+            # Forward AudioLoadWorker's internal progress to the dialog.
+            # worker.progress emits 0-100 within this file; load_progress
+            # carries (file_idx, total_files, pct) so the dialog can scale it
+            # correctly across the full batch.
+            worker.progress.connect(
+                lambda pct: self.load_progress.emit(file_idx, total_files, pct)
+            )
+
+            # Register so request_stop() can cancel this worker immediately.
+            self._current_audio_worker = worker
+
             # Run synchronously — blocks until file is fully loaded.
             # Signals are emitted synchronously (same-thread DirectConnection).
             worker.run()
+
+            # Deregister — the worker has finished (or was cancelled).
+            self._current_audio_worker = None
+
+            if self._stop_requested:
+                return None   # cancelled during load — skip this file
 
             if result['error']:
                 print(f"Load error for {paudio_path.name}: {result['error']}")
@@ -1003,8 +1117,16 @@ class DataCollectionWorkerV5(QThread):
         
 
     def request_stop(self):
-        """Request the worker to stop gracefully."""
+        """
+        Request the worker to stop gracefully.
+
+        Also cancels any AudioLoadWorker that is currently running synchronously
+        inside _load_audio_file, so the cancel takes effect immediately instead
+        of waiting for the full file-load loop to complete.
+        """
         self._stop_requested = True
+        if self._current_audio_worker is not None:
+            self._current_audio_worker.cancel_load()  # sets AudioLoadWorker._cancelled
 
 
 class DataCollectionDialogV5(QDialog):
@@ -1325,6 +1447,9 @@ class DataCollectionDialogV5(QDialog):
         self.worker.progress_updated.connect(
             self._on_progress_updated, Qt.QueuedConnection
         )
+        self.worker.load_progress.connect(
+            self._on_load_progress, Qt.QueuedConnection
+        )
         self.worker.file_complete.connect(
             self._on_file_complete, Qt.QueuedConnection
         )
@@ -1349,24 +1474,73 @@ class DataCollectionDialogV5(QDialog):
         _render_candidate_screenshot(candidate, Path(screenshot_path))
 
     def _on_cancel(self):
-        """Cancel worker thread."""
+        """
+        Cancel worker thread without blocking the main thread.
+
+        NEVER call self.worker.wait() here — it would block the main thread
+        while DataCollectionWorkerV5 is stuck inside AudioLoadWorker.run(),
+        which cannot respect _stop_requested until the current file finishes
+        loading.  Instead we:
+          1. Signal both workers to stop (request_stop also cancels the inner
+             AudioLoadWorker via _current_audio_worker.cancel_load())
+          2. Disconnect all signals so no stale callbacks reach the UI
+          3. Reset the UI immediately
+        The background QThread finishes on its own; Python GC cleans it up.
+        """
         if self.worker:
             self._log("Cancelling...")
             self.worker.request_stop()
-            self.worker.wait()
+            # Disconnect all signals so in-flight queued events are harmless.
+            try:
+                self.worker.candidate_ready.disconnect()
+                self.worker.progress_updated.disconnect()
+                self.worker.load_progress.disconnect()
+                self.worker.file_complete.disconnect()
+                self.worker.error_occurred.disconnect()
+                self.worker.finished.disconnect()
+            except RuntimeError:
+                pass
+            self.worker = None   # allow GC; thread finishes in background
             self._log("Cancelled.")
-        
         self._reset_ui()
     
     def _on_progress_updated(self, file_idx: int, total_files: int, candidates_found: int, total_candidates: int):
-        """Update progress bar and label."""
-        pct = int((file_idx / total_files) * 100) if total_files > 0 else 0
+        """Update progress bar and label during candidate processing phase."""
+        # Each file occupies an equal share of 0-100 %. Within that share,
+        # the first half was used for loading (via _on_load_progress) and the
+        # second half for candidate processing.  Here we move to the midpoint
+        # so the bar never jumps backwards.
+        if total_files > 0:
+            file_share = 100.0 / total_files
+            pct = int(file_idx * file_share + file_share * 0.5)
+        else:
+            pct = 0
         self.progress_bar.setValue(pct)
         self.label_progress.setText(
-            f"File {file_idx + 1}/{total_files}  |  Candidates: {total_candidates}  |  "
-            f"Current file: {candidates_found}"
+            f"Processing file {file_idx + 1}/{total_files}  |  Candidates so far: {total_candidates}"
         )
-    
+
+    def _on_load_progress(self, file_idx: int, total_files: int, pct_in_file: int):
+        """
+        Update progress bar during file loading phase.
+
+        AudioLoadWorker reports 0-100 % internally as it reads and processes
+        the .paudio file. We scale that into each file's share of the total
+        progress bar (first half of that share, 0-50 %), so the bar moves
+        smoothly during what would otherwise be a frozen UI.
+        """
+        if total_files > 0:
+            file_share = 100.0 / total_files
+            # Map pct_in_file (0-100) to the first half of this file's share
+            pct = int(file_idx * file_share + (pct_in_file / 100.0) * file_share * 0.5)
+        else:
+            pct = pct_in_file // 2
+       # print(f"Load progress for file {file_idx + 1}/{total_files}: {pct_in_file}% → overall {pct}%")
+        self.progress_bar.setValue(pct)
+        self.label_progress.setText(
+            f"Loading file {file_idx + 1}/{total_files}: {pct_in_file}%"
+        )
+
     def _on_screenshot_saved(self, filepath: str):
         """Log screenshot saved (optional, keep concise)."""
         pass  # Too verbose to log every screenshot
