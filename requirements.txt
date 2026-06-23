@@ -11,3 +11,4 @@ wakepy
 #LM
 scikit-learn>=1.4.0
 pandas
+joblib
