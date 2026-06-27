@@ -24,17 +24,30 @@ estimator and a Support Vector Machine (SVM) classifier.
 
 Architecture (four stages):
   Stage 1  – Adaptive energy threshold + run-length filter
-  Stage 3  – Feature extraction (17 features, no hard thresholds)
-  Stage 4  – SVM classification
-  Stage 5  – Deduplication
+             [compute_features_v5 is called between Stage 1 and Stage 2 by the caller]
+  Stage 2  – Valid-fit and OOD gate: R² ≥ STAGE2_R2_MIN, SPR < STAGE2_SPR_MAX
+  Stage 3  – SVM classification (RBF kernel, 16 features, calibrated threshold)
+  Stage 4  – Deduplication (merge nearby detections from the same physical click)
 
-Stage 2 (FFT hard-threshold filters from v4) has been removed. SPR and peak FFT
-amplitude are now features fed to the SVM rather than hard gates, so the pipeline
-learns their discriminative power from data rather than from hand-tuned thresholds.
+The old v4 Stage 2 (FFT hard-threshold filters on SPR and peak FFT amplitude) has
+been removed. SPR and peak amplitude are now features fed to the SVM, so the
+pipeline learns their discriminative weight from labelled data instead of fixed
+hand-tuned thresholds.
+
+Stage 2 applies two gates, both mirroring the pre-filters used on the training data
+in train_svm.py so the SVM only receives inputs within its trained distribution:
+  • R² ≥ 0.10: if the decay does not fit an exponential, τ and all decay-window
+    features are unreliable — discard before the SVM.
+  • SPR < 100: if the spectrum is extremely tonal (single dominant component),
+    the sample is out-of-distribution for the model — discard before the SVM.
 
 Implementation notes:
-  • All numpy operations — no scipy.linalg / BLAS / LAPACK calls — ensuring
-    thread-safety on macOS (avoids segfaults from Apple Accelerate inside QThreads).
+  • All numpy operations in the signal processing stages — no scipy.linalg /
+    BLAS / LAPACK calls — ensuring thread-safety on macOS (avoids segfaults from
+    Apple Accelerate inside QThreads).
+  • sklearn's SVC.predict_proba() at INFERENCE time uses the libsvm C extension
+    (no BLAS) plus Platt-sigmoid arithmetic (pure scalar), so Stage 3 is also
+    safe to call from a QThread.
   • Every tuneable constant is defined once in the '── ALGORITHM CONSTANTS ──'
     section below and referenced by name throughout. Nothing is buried inline.
 
@@ -43,6 +56,7 @@ Reference: CLICK_DETECTION_ALGORITHM_v5.md (June 2026)
 
 import numpy as np
 from typing import Optional
+from pathlib import Path
 
 
 # ── ALGORITHM CONSTANTS ──────────────────────────────────────────────────────
@@ -191,6 +205,36 @@ MIN_CENTROID_SAMPLES  = 6   # Minimum segment length [samples] for a meaningful
 _BIN_MID = int(40_000 / _BIN_FREQ)   # 40 kHz bin index in the full half-spectrum.
                                        # Splits the analysis band at 40 kHz for
                                        # R_spectral = E_low[20-40] / E_high[40-80].
+
+# STAGE 2 — Valid-fit gate (§11)
+STAGE2_R2_MIN  = 0.10   # Minimum acceptable R² from the log-linear decay fit.
+                         # Below this value the fit explains less than 10 % of the
+                         # variance → τ, fit_coverage, and every feature that reads
+                         # decay_start/decay_end are unreliable. Candidate is dropped.
+                         # Mirrors NOISE_FILTER_R2_MIN in train_svm.py.
+
+STAGE2_SPR_MAX = 100.0  # Maximum acceptable Spectral Peak Ratio.
+                         # SPR = max(power) / mean(power) over the 20–80 kHz band.
+                         # SPR ≥ 100 means the spectrum is dominated by a single
+                         # tonal component — extremely narrowband, never seen in
+                         # real clicks (max SPR in the training click set ≈ 34).
+                         # During training, noise samples with SPR ≥ 100 were
+                         # removed by NOISE_FILTER_SPR_MAX in train_svm.py, so
+                         # neither class was ever shown this region of feature space.
+                         # A candidate with SPR ≥ 100 is therefore out-of-distribution
+                         # for the SVM; its prediction would be undefined.
+                         # Mirrors NOISE_FILTER_SPR_MAX in train_svm.py.
+
+# STAGE 4 — Deduplication (§13)
+DEDUP_WINDOW_FRAMES = 3  # Maximum frame-index gap between two detections that
+                          # are considered to belong to the same physical click.
+                          # At ~390 FPS: 3 frames ≈ 7.7 ms.
+                          # A genuine cavitation click lasts ≤ 0.5 ms (1–2 frames).
+                          # Gaps up to 3 frames cover borderline events that trigger
+                          # Stage 1 in two consecutive frames AND the unlikely case
+                          # of a 1-frame gap caused by the run-length filter keeping
+                          # both the first and last frame of a 3-frame run.
+                          # → verify experimentally if double-detections are observed.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -1787,3 +1831,300 @@ def compute_features_v5(
     features.update(_feat_fft_features(fft_norm, freq_axis))
 
     return features
+
+
+# =============================================================================
+# SVM MODEL LOADER
+# =============================================================================
+
+def load_svm_model(model_path: Path) -> dict:
+    """
+    Load a PlantLeaf v5 SVM model from a .pkl file produced by train_svm.py.
+
+    Called ONCE at application startup (or when the user loads a new model file)
+    and the returned dict is kept in memory and passed to run_stage3_v5 for every
+    recording. Do NOT call this per-frame.
+
+    Expected dict keys in the .pkl (all written by train_svm.py):
+        'pipeline'    : fitted sklearn Pipeline (SimpleImputer → StandardScaler → SVC)
+        'threshold'   : float — optimal decision threshold from ROC optimisation
+        'features'    : list[str] — ordered feature names the model was trained on
+        'kernel'      : str  — 'linear' or 'rbf' (informational)
+        'all_results' : dict — per-kernel AUC and threshold (informational)
+
+    Parameters
+    ----------
+    model_path : Path
+        Absolute path to the .pkl file.
+
+    Returns
+    -------
+    dict
+        The raw model dict (same keys as above). Pass directly to run_stage3_v5.
+
+    Raises
+    ------
+    FileNotFoundError
+        If model_path does not exist.
+    ValueError
+        If the .pkl is missing required keys (wrong file or corrupt save).
+    """
+    import joblib  # imported lazily so the module is usable without sklearn when
+                   # only signal processing functions are needed (e.g. unit tests)
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"SVM model not found: {model_path}")
+
+    model = joblib.load(model_path)
+
+    # Validate that all required keys are present before the first recording runs.
+    # A clear error here is much easier to debug than an AttributeError deep in
+    # Stage 3 during a live acquisition.
+    required = ('pipeline', 'threshold', 'features')
+    missing  = [k for k in required if k not in model]
+    if missing:
+        raise ValueError(
+            f"SVM model at {model_path} is missing keys: {missing}. "
+            f"Re-train with the current train_svm.py."
+        )
+
+    return model
+
+
+# =============================================================================
+# STAGE 2 — Valid-fit gate  (§11)
+# =============================================================================
+
+def run_stage2_v5(candidates: list) -> tuple:
+    """
+    Stage 2 of the v5 click detection pipeline: valid-fit and OOD gate  (§11).
+
+    Two hard thresholds guard the feature vector before it is passed to the SVM.
+    Both were chosen to match the pre-filters applied to the training data in
+    train_svm.py, so the SVM only receives inputs that fall within the region of
+    feature space it was trained on.
+
+    Gate 1 — valid exponential decay:
+        R² ≥ STAGE2_R2_MIN  (default 0.10)
+
+        An R² below 0.10 means the Gaussian-smoothed decay shows essentially no
+        exponential character. In this case:
+          • τ_ms is set to −1 (invalid sentinel) by _fit_decay_segment.
+          • decay_start and decay_end are placed heuristically (fallback), not
+            from the slope criterion.
+          • Every feature that reads the decay window (asymmetry_integral,
+            fall_time_ms, post_SNR, ZCR_post, centroid_shift_hz) is an artefact
+            of the fallback placement rather than of the actual signal shape.
+        Feeding such a vector to the SVM produces an unpredictable score.
+
+    Gate 2 — in-distribution SPR:
+        SPR < STAGE2_SPR_MAX  (default 100)
+
+        SPR ≥ 100 means the spectrum is dominated by a single tonal component —
+        extremely narrowband. This region was never shown to the SVM during
+        training (noise pre-filter NOISE_FILTER_SPR_MAX = 100 in train_svm.py
+        removed all such samples from BOTH training classes), so the model's
+        prediction there is out-of-distribution and undefined. The maximum SPR
+        observed in the training click set was ≈ 34, making this a generous
+        safety margin rather than a tight discriminant.
+
+    All other features (peak_SNR, FPE_hz, ZCR, kurtosis, …) are left entirely
+    to the SVM. They vary continuously and the SVM boundary in those dimensions
+    was learned from labelled data.
+
+    Parameters
+    ----------
+    candidates : list of dict
+        Stage 1 survivors with features already attached (i.e. each dict
+        contains 'R2' and 'SPR' keys produced by compute_features_v5).
+
+    Returns
+    -------
+    (survivors, n_rejected) : (list of dict, int)
+        survivors   — candidates that passed both gates.
+        n_rejected  — total candidates dropped (useful for UI statistics).
+    """
+    survivors  = []
+    n_rejected = 0
+
+    for cand in candidates:
+        r2  = cand.get('R2',  0.0)
+        spr = cand.get('SPR', 0.0)
+
+        # Gate 1: R² < 0.10 → decay fit is invalid; downstream features
+        # that depend on decay_start / decay_end are unreliable.
+        # _fit_decay_segment also returns R2=0.0 for degenerate windows
+        # (too short or near-zero denominator) — those fail here too.
+        if r2 < STAGE2_R2_MIN:
+            n_rejected += 1
+            continue #next candidate
+
+        # Gate 2: SPR ≥ 100 → extremely tonal signal, out-of-distribution
+        # for the SVM (never seen in training for either class).
+        if spr >= STAGE2_SPR_MAX:
+            n_rejected += 1
+            continue
+
+        survivors.append(cand)
+
+    return survivors, n_rejected
+
+
+# =============================================================================
+# STAGE 3 — SVM classification  (§12)
+# =============================================================================
+
+def run_stage3_v5(candidates: list, svm_model: dict) -> tuple:
+    """
+    Stage 3 of the v5 click detection pipeline: SVM classification  (§12).
+
+    Feeds the feature vector of every Stage 2 survivor into the pre-trained
+    sklearn Pipeline (SimpleImputer → StandardScaler → SVC with Platt scaling)
+    and applies the optimised decision threshold to obtain the binary prediction.
+
+    The feature order and the decision threshold are both read from the model
+    dict (loaded once by load_svm_model). The pipeline module never hardcodes
+    which features are used — the model is the single source of truth.
+
+    Thread-safety note:
+        sklearn SVC.predict_proba at inference time uses the libsvm C extension
+        for the kernel evaluations (no BLAS/LAPACK) and simple scalar arithmetic
+        for the Platt sigmoid. StandardScaler.transform is pure numpy. This
+        function is therefore safe to call from a QThread on macOS.
+
+    Parameters
+    ----------
+    candidates : list of dict
+        Stage 2 survivors. Each dict must contain every feature name listed in
+        svm_model['features']. Any feature value that is NaN (e.g. from a
+        degenerate frame) is handled by the SimpleImputer in the pipeline, which
+        fills it with the training-set mean — safe but worth monitoring.
+
+    svm_model : dict
+        Dict returned by load_svm_model. Must contain:
+            'pipeline'  : fitted sklearn Pipeline
+            'threshold' : float — decision threshold (e.g. 0.220)
+            'features'  : list[str] — ordered feature names
+
+    Returns
+    -------
+    (detections, n_rejected) : (list of dict, int)
+        detections  — candidates classified as clicks (svm_probability ≥ threshold).
+                      Two new keys are added to each surviving dict:
+                          'svm_probability' : float  (0.0–1.0)
+                          'svm_prediction'  : int    (always 1 here)
+        n_rejected  — candidates the SVM classified as noise (for the UI stats panel).
+    """
+    if not candidates:
+        return [], 0
+
+    pipeline   = svm_model['pipeline']
+    threshold  = float(svm_model['threshold'])
+    feat_names = svm_model['features']   # authoritative order from training
+
+    # ── Build feature matrix (n_candidates × n_features) ────────────────────
+    # Values are extracted in the exact column order the SVM was trained on.
+    # float64 is used throughout: the SVC C extension requires it, and it avoids
+    # the silent overflow that affected float32 on large peak_SNR values.
+    X = np.array(
+        [[cand.get(f, np.nan) for f in feat_names] for cand in candidates],
+        dtype=np.float64,
+    )
+
+    # ── Predict probabilities ────────────────────────────────────────────────
+    # Column 1 of predict_proba = P(class=1) = P(click).
+    # The pipeline internally applies SimpleImputer then StandardScaler before
+    # the SVC — no manual scaling is needed here.
+    proba = pipeline.predict_proba(X)[:, 1]
+
+    # ── Apply threshold and collect survivors ────────────────────────────────
+    detections = []
+    n_rejected = 0
+
+    for cand, p in zip(candidates, proba):
+        if p >= threshold:
+            # Deep-copy the dict to avoid mutating Stage 2 output in place,
+            # then annotate with the SVM result for downstream use and logging.
+            det = dict(cand)
+            det['svm_probability'] = float(p)
+            det['svm_prediction']  = 1
+            detections.append(det)
+        else:
+            n_rejected += 1
+
+    return detections, n_rejected
+
+
+# =============================================================================
+# STAGE 4 — Deduplication  (§13)
+# =============================================================================
+
+def run_stage4_v5(detections: list) -> list:
+    """
+    Stage 4 of the v5 click detection pipeline: deduplication  (§13).
+
+    A single physical cavitation click can produce Stage 1 candidates in more
+    than one consecutive frame when:
+      (a) the click straddles a frame boundary — Stage 1 detects it in both
+          the frame where it rises and the frame where it decays;
+      (b) the click's total energy is high enough that the first frame of a
+          2- or 3-frame run passes Stage 1 and also survives Stage 2/3.
+
+    The run-length filter in Stage 1 (MAX_RUN = 3) guarantees at most 3
+    consecutive candidates per physical event. Deduplication resolves the
+    remaining duplicates by grouping nearby detections and keeping the one
+    with the highest SVM probability (highest model confidence).
+
+    Algorithm:
+        1. Sort detections by frame_idx.
+        2. Assign each detection to a group: a new group starts whenever the
+           gap to the previous detection exceeds DEDUP_WINDOW_FRAMES.
+           (Single-linkage chaining: frames 10-11-14 with window=3 form one
+            group because each consecutive pair is within the window.)
+        3. From each group, keep only the detection with the highest
+           svm_probability. Ties are broken by keeping the earlier frame.
+
+    Parameters
+    ----------
+    detections : list of dict
+        Stage 3 survivors. Each dict must contain:
+            'frame_idx'       : int   — frame index in the recording
+            'svm_probability' : float — SVM confidence score (used to break ties)
+
+    Returns
+    -------
+    list of dict
+        Deduplicated detections, sorted by frame_idx.
+        The returned dicts are the same objects as in the input (no copying),
+        so all original keys (features, noise estimates, etc.) are preserved.
+    """
+    if len(detections) <= 1:
+        return list(detections)
+
+    # ── Step 1: sort by frame index ──────────────────────────────────────────
+    sorted_dets = sorted(detections, key=lambda d: d['frame_idx'])
+
+    # ── Step 2: group by proximity ───────────────────────────────────────────
+    # Build a list of groups, where each group is a list of detections.
+    # A new group starts when the frame gap to the previous detection exceeds
+    # DEDUP_WINDOW_FRAMES.
+    groups  = []
+    current = [sorted_dets[0]]
+
+    for det in sorted_dets[1:]:
+        gap = det['frame_idx'] - current[-1]['frame_idx']
+        if gap <= DEDUP_WINDOW_FRAMES:
+            current.append(det)   # same physical click → extend current group
+        else:
+            groups.append(current)   # unambiguously a new event
+            current = [det]
+    groups.append(current)           # close the final group
+
+    # ── Step 3: keep the highest-confidence detection from each group ─────────
+    best = []
+    for group in groups:
+        # argmax on svm_probability; Python's max() is stable so equal values
+        # naturally preserve the earlier frame (sorted order from Step 1).
+        best.append(max(group, key=lambda d: d['svm_probability']))
+
+    return best
