@@ -22,24 +22,32 @@ The project bridges plant biology, acoustic signal processing, and embedded syst
 ## Key Features
 
 ### Ultrasonic Click Detection
-- Real-time FFT visualisation of the 20–80 kHz ultrasonic band
-- Automatic 4-stage click detection algorithm (v4.0) with sub-millisecond temporal resolution
-- Time-domain signal reconstruction via inverse FFT (iFFT) with Gibbs suppression
-- Hilbert envelope analysis for click morphology characterisation (decay constant τ, R²)
-- Threshold-based and fully automatic detection modes
+- Real-time FFT visualisation of the 20–80 kHz ultrasonic band at 390 FPS
+- 4-stage click detection pipeline v5: adaptive noise floor, hard spectral gates, SVM classifier, deduplication
+- Time-domain signal reconstruction via inverse FFT (iFFT) with Gibbs suppression and Hilbert envelope
+- 17 acoustic features per candidate: SNR ratios, decay constant τ, R², ZCR, kurtosis, spectral shape
+- Interactive Stage 1 threshold filter with adaptive noise floor display during replay
+- Batch data collection export: CSV of 17 features + screenshots for manual labelling and model training
+
+### Machine Learning Pipeline
+- SVM classifier (RBF kernel, scikit-learn Pipeline) trained on 285 labeled candidates across 4 species
+- Session-level cross-validation (`StratifiedGroupKFold`) to prevent recording-level data leakage
+- AUC-ROC = 0.835; Set B recall = 0.962 at threshold 0.220 (optimised for recall ≥ 0.90)
+- Offline tools: `train_svm.py`, `evaluate_candidates.py`, `analyze_dataset.py` with per-file confusion matrices and click-rate plots
 
 ### Voltage Signal Analysis
-- Real-time acquisition and visualisation of plant electrical signals up to 1k samples/s
+- Real-time acquisition and visualisation of plant electrical signals up to 1 kHz
 - Automatic mathematical fitting of action potential waveforms (sinusoidal depolarisation + exponential repolarisation)
-- Energy calculation and correlation coefficient reporting for each detected event
+- R² goodness-of-fit and signal energy reported per event
 - Export of raw voltage recordings and fitted parameters
 
 ### Application
 - Cross-platform GUI (Windows, macOS, Linux) built with PySide6
 - Unified interface for both voltage and audio acquisition and analysis
-- Interactive spectrograms, time-averaged FFT graphs, and waveform inspection
-- Full session export with per-click feature vectors (τ, R², SPR, amplitude, spectral ratio)
-Complete documentation is available here: [📄 Documentation Repo](https://github.com/TommyVaninetti/PlantLeaf---documentation)
+- Interactive spectrograms, time-averaged FFT energy plots, iFFT waveform inspection
+- Full session export with per-click feature vectors
+
+Complete documentation is available here: [Documentation Repo](https://github.com/TommyVaninetti/PlantLeaf---documentation)
 
 ---
 
@@ -69,20 +77,20 @@ python src/main.py
 
 ## Detection Algorithm
 
-The ultrasonic click detector is a 4-stage pipeline that processes continuous FFT streams from the STM32 firmware and identifies cavitation click candidates with high sensitivity and low false-positive rate:
+The current algorithm (v5) is a 4-stage pipeline that processes continuous FFT streams from the STM32 firmware and identifies cavitation click candidates with high recall:
 
 | Stage | Operation |
 |-------|-----------|
-| **Stage 1** | Energy threshold (`μ + 5σ`) + run-length filter (sustained noise rejection) |
-| **Stage 2** | Normalised peak FFT amplitude + Spectral Peak Ratio (broadband shape check) |
-| **Stage 3** | Six-criterion temporal validation: amplitude, pre-click silence, energy decay, asymmetry, decay constant τ, exponential fit quality R² |
+| **Stage 1** | Adaptive energy threshold: `E_i > k × Ê_floor` — per-frame noise floor estimated by `AdaptiveNoiseEstimatorV5` |
+| **Stage 2** | Hard gates: R² ≥ 0.10 (exponential decay quality) and SPR < 100 (broadband shape) |
+| **Stage 3** | SVM classifier (`SimpleImputer → StandardScaler → SVC`, RBF kernel, C=50, γ=0.01) on 16 acoustic features; threshold = 0.220 |
 | **Stage 4** | Deduplication across consecutive frames |
 
-**Full technical specification:** [CLICK_DETECTION_ALGORITHM_4.md](https://github.com/TommyVaninetti/PlantLeaf---documentation/blob/main/App/Automatic_click_detection_algorithm/CLICK_DETECTION_ALGORITHM_4.md)
+**v5 full specification (current):** [CLICK_DETECTION_ALGORITHM_v5.md](https://github.com/TommyVaninetti/PlantLeaf---documentation/blob/main/App/Automatic_click_detection_algorithm/CLICK_DETECTION_ALGORITHM_v5.md)
 
-**FFT and phase data specification:** [FFT_PHASE_TECHNICAL_SPECIFICATION.md](https://github.com/TommyVaninetti/PlantLeaf---documentation/blob/main/App/FFT_and_acquisition_specifications/FFT_PHASE_TECHNICAL_SPECIFICATION.md)
+**v4 specification (historical):** [CLICK_DETECTION_ALGORITHM_v4.md](https://github.com/TommyVaninetti/PlantLeaf---documentation/blob/main/App/Automatic_click_detection_algorithm/CLICK_DETECTION_ALGORITHM_v4.md)
 
-**A new version of the algorithm (v5) is currently under development.** See [CLICK_DETECTION_ALGORITHM_v5.md](https://github.com/TommyVaninetti/PlantLeaf---documentation/blob/main/App/Automatic_click_detection_algorithm/CLICK_DETECTION_ALGORITHM_5.md) for the documentation and check out the new branches that include code under development.
+**FFT and phase data specification:** [FFT_PHASE_TECHNICAL_SPECIFICATION.md](https://github.com/TommyVaninetti/PlantLeaf---documentation/blob/main/App/FFT_PHASE_TECHNICAL_SPECIFICATION.md)
 
 ## Experimental Results
 
@@ -94,9 +102,9 @@ We have led experiments on Aloe Vera, Ferrocactus and Dionea. We are looking to 
 ## Future Developments
 
 We are actively developing our software and hardware, in particular:
-- Ultrasonic Clicks detector algorithm v5: adaptive threshold, SVM algorithm are to be introduced for analysis in non-noisy environments as well
-- ASEB and wireless instrumentation: currently testing the ASEB and developing a wireless module with automatic click detection
-- Physical Simulators: made to simulate both ultrasonic clicks and action potentials on computer
+- ASEB and wireless instrumentation: currently testing the ASEB board and developing a wireless module with on-device click detection
+- Expanding the SVM training dataset across more plant species and stress conditions
+- Physical simulators: tools to simulate both ultrasonic clicks and action potentials for algorithm validation
 
 ## Project Structure
 
@@ -107,12 +115,9 @@ PlantLeaf-Desktop-App/
 │   ├── main.py                          # Application entry point
 │   │
 │   ├── components/                      # Reusable UI widgets
-│   │   ├── batch_click_csv_export.py
-│   │   ├── batch_export_screenshots.py
+│   │   ├── data_collection_dialog_v5.py # Batch Stage-1 export: CSV + screenshots
 │   │   ├── choose_serial_port.py
-│   │   ├── click_detector_dialog.py
 │   │   ├── data_table.py
-│   │   ├── multi_file_batch_export.py
 │   │   ├── not_saved_popup.py
 │   │   ├── sampling_settings.py
 │   │   ├── start_stop_button.py
@@ -122,9 +127,10 @@ PlantLeaf-Desktop-App/
 │   ├── config/
 │   │   └── app_config.py                # Application-wide constants
 │   │
-│   ├── core/                            # Base classes and managers
+│   ├── core/                            # Base classes and pipeline
+│   │   ├── click_pipeline_v5.py         # Full v5 detection pipeline + 17 features
+│   │   ├── replay_base_window.py        # Shared replay UI (MathOperations dialog)
 │   │   ├── base_window.py
-│   │   ├── replay_base_window.py        # Math/analysis dialog (MathOperations)
 │   │   ├── file_handler_mixin.py
 │   │   ├── audio_trim_export.py
 │   │   ├── voltage_trim_export.py
@@ -133,15 +139,20 @@ PlantLeaf-Desktop-App/
 │   │   ├── layout_manager.py
 │   │   ├── settings_manager.py
 │   │   ├── special_component.py
-│   │   └── wake_lock_manager.py         
+│   │   └── wake_lock_manager.py
+│   │
+│   ├── ml/                              # Offline machine learning scripts
+│   │   ├── train_svm.py                 # SVM training with session-level CV
+│   │   ├── evaluate_candidates.py       # Batch inference on candidate CSVs
+│   │   └── analyze_dataset.py           # Per-file stats, confusion matrix, plots
 │   │
 │   ├── plotting/
-│   │   └── plot_manager.py              # pyqtgraph wrappers
+│   │   └── plot_manager.py              # PyQtGraph wrappers
 │   │
 │   ├── saving/
 │   │   ├── audio_save_worker.py         # Async .paudio file writer
 │   │   ├── audio_load_progress.py
-│   │   └── voltage_save_worker.py       # Async .pvolt file writer
+│   │   └── voltage_save_worker.py       # Async .pvoltage file writer
 │   │
 │   ├── serial_communication/
 │   │   ├── audio_reader.py              # STM32 USB CDC audio stream parser
@@ -153,7 +164,7 @@ PlantLeaf-Desktop-App/
 │       ├── main_window_voltage.py       # Real-time voltage acquisition window
 │       ├── replay_window_audio.py       # Offline audio replay & analysis
 │       ├── replay_window_voltage.py     # Offline voltage replay & analysis
-│       └── ui/                          # PySide6 UI files created with QtCreator
+│       └── ui/                          # PySide6 UI files (Qt Designer)
 │           ├── ui_MainWindowAudio.py
 │           ├── ui_MainWindowVoltage.py
 │           └── ui_MathDialog.py
@@ -164,9 +175,9 @@ PlantLeaf-Desktop-App/
 │
 ├── themes/                              # QSS stylesheets
 │   ├── dark.css / light.css
-│   └── dark_amber/blue/green  ·  light_amber/blue/green
+│   └── dark_amber / dark_blue / dark_green  ·  light_amber / light_blue / light_green
 │
-├── csv_to_pvolt.py                      # Utility: convert CSV to .pvolt format
+├── csv_to_pvolt.py                      # Utility: convert CSV to .pvoltage format
 ├── licenses.txt                         # Third-party licence notices
 ├── requirements.txt
 ├── CONTRIBUTING.md
@@ -186,14 +197,20 @@ PlantLeaf-Desktop-App/
 
 ## Dependencies
 
-| Library | Version | License |
-|---------|---------|---------|
-| PySide6 | 6.9.0 | LGPLv3 |
-| pyqtgraph | latest | MIT |
-| pyserial | latest | BSD |
-| numpy | latest | BSD |
-| scipy | latest | BSD |
-| wakepy | latest | MIT |
+| Library | Version | License | Used in |
+|---------|---------|---------|---------|
+| PySide6 | 6.9.0 | LGPLv3 | App |
+| PyQtGraph | latest | MIT | App |
+| NumPy | latest | BSD | App + ML scripts |
+| SciPy | latest | BSD | App + ML scripts |
+| PySerial | latest | BSD | App |
+| wakepy | latest | MIT | App |
+| scikit-learn | 1.6.1 | BSD | App (Stage 3 inference) + ML scripts |
+| joblib | 1.5.3 | BSD | App (model loading) + ML scripts |
+| pandas | 2.3.3 | BSD | ML scripts only |
+| matplotlib | 3.9.4 | BSD | ML scripts only |
+
+See [LIBRARIES.md](https://github.com/TommyVaninetti/PlantLeaf---documentation/blob/main/App/LIBRARIES.md) for the full rationale behind each choice.
 
 ---
 
