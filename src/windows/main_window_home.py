@@ -220,9 +220,10 @@ class MainWindowHome(BaseWindow):
         btn_voltage = self.create_main_button("⚡ New Voltage Analysis", "Start a new voltage analysis")
         btn_audio = self.create_main_button("🔊 New Audio Analysis", "Start a new audio analysis")
         btn_open = self.create_main_button("📁 Open Existing File", "Open a previously saved analysis file")
+        btn_chemical = self.create_main_button("🧪 Audio Chemical Simulator", "Run the acoustic cavitation simulator")
         
         # Add buttons to layout
-        for btn in (btn_voltage, btn_audio, btn_open):
+        for btn in (btn_voltage, btn_audio, btn_open, btn_chemical):
             buttons_layout.addWidget(btn)
         
         # Center the buttons
@@ -241,6 +242,7 @@ class MainWindowHome(BaseWindow):
         btn_open.clicked.connect(self.open_file_action)
         btn_voltage.clicked.connect(self.new_voltage_analysis)
         btn_audio.clicked.connect(self.new_audio_analysis)
+        btn_chemical.clicked.connect(self.new_chemical_simulator)
 
         # Bottom spacer
         main_layout.addSpacerItem(QSpacerItem(20, 15, QSizePolicy.Minimum, QSizePolicy.Expanding))
@@ -302,7 +304,22 @@ class MainWindowHome(BaseWindow):
             print(f"❌ Error opening audio window: {e}")
             self.show_error_dialog("Error", f"Could not open audio analysis:\n{str(e)}")
 
-     
+    def new_chemical_simulator(self):
+        """Open the acoustic chemical simulator"""
+        print("🧪 Starting chemical simulator...")
+        try:
+            from windows.main_window_chemical_simulator import MainWindowChemicalSimulator
+            self.hide()
+            chemical_window = MainWindowChemicalSimulator()
+            self.layout_manager.center_window_on_screen(chemical_window)
+            chemical_window.show()
+            print("✅ Chemical simulator window opened")
+        except Exception as e:
+            self.show()
+            print(f"❌ Error opening chemical simulator: {e}")
+            self.show_error_dialog("Error", f"Could not open chemical simulator:\n{str(e)}")
+
+    
     def closeEvent(self, event):
         """Override del closeEvent per la finestra home"""
         # Chiudi direttamente senza passare per BaseWindow
