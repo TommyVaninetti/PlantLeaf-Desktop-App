@@ -1,3 +1,20 @@
+# Copyright (C) 2026 Tommaso Vaninetti
+#
+# This file is part of PlantLeaf.
+#
+# PlantLeaf is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# PlantLeaf is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with PlantLeaf. If not, see <https://www.gnu.org/licenses/>.
+
 """
 Gestione dei temi CSS per l'applicazione PlantLeaf
 """
@@ -76,8 +93,23 @@ class ThemeManager:
         try:
             with open(theme_path, 'r', encoding='utf-8') as f:
                 css = f.read()
-            # Cerca un colore "accent" (es: background-color di QPushButton:checked)
+            # Cerca un colore "accent" (background-color di QPushButton:checked)
             accent = re.search(r'QPushButton:checked\s*{[^}]*background-color:\s*([^;]+);', css)
+            if accent:
+                return accent.group(1).strip()
+        except Exception as e:
+            print(f"Errore lettura accent color: {e}")
+        return "#007bff"  # fallback
+    
+    def get_darker_accent_color(self, theme_name=None):
+        if theme_name is None:
+            theme_name = self.current_theme
+        theme_path = os.path.join(self.themes_dir, theme_name)
+        try:
+            with open(theme_path, 'r', encoding='utf-8') as f:
+                css = f.read()
+            # Cerca un colore "accent" (border-color di QPushButton:checked)
+            accent = re.search(r'QPushButton:checked\s*{[^}]*border-color:\s*([^;]+);', css)
             if accent:
                 return accent.group(1).strip()
         except Exception as e:

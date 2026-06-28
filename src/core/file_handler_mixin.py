@@ -1,3 +1,20 @@
+# Copyright (C) 2026 Tommaso Vaninetti
+#
+# This file is part of PlantLeaf.
+#
+# PlantLeaf is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# PlantLeaf is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with PlantLeaf. If not, see <https://www.gnu.org/licenses/>.
+
 import os
 import numpy as np
 from PySide6.QtWidgets import QProgressDialog, QMessageBox
@@ -210,9 +227,12 @@ class FileHandlerMixin:
         dm.streaming_start_time = data['streaming_start_time']
         dm.streaming_end_time = data['streaming_end_time']
         
-        # ✅ PRECALCOLA LE MEDIE FFT
-        print("🔄 Precalcolo medie FFT...")
-        dm.precompute_fft_means()
+        # Pre-computed arrays
+        dm.fft_means       = data['fft_means']        # np.float32[n_frames]
+        dm.fft_timestamps  = data['fft_timestamps']   # np.float64[n_frames]
+        dm.E_hat_floor_arr = data['E_hat_floor_arr']  # np.float32[n_frames]
+        dm.noise_floor_arr = data['noise_floor_arr']  # np.float32[n_frames]
+        dm.std_noise_arr   = data['std_noise_arr']    # np.float32[n_frames]
         
         # Setup UI
         replay_window._setup_metadata()

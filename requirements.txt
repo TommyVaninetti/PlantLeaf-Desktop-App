@@ -1,6 +1,17 @@
+#Fundamental
 PySide6==6.9.0
 pyqtgraph
 pyserial
 numpy
 scipy
+
+#Acquisition
 wakepy
+
+#LM
+scikit-learn>=1.4.0
+pandas
+joblib
+
+#matplotlib ONLY if running src/ml/analyze_dataset.py script
+#matplotlib

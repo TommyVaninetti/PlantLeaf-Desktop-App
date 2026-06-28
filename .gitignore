@@ -1,5 +1,6 @@
 #cartelle
 .venv/
+.claude/
 old/
 build/
 dist/
@@ -8,6 +9,7 @@ firmware/
 implementations_docs/
 test_scripts/
 other/
+scripts/
 
 # Python bytecode
 __pycache__/
