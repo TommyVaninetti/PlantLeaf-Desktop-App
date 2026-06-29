@@ -366,7 +366,7 @@ class ReplayBaseWindow(FileHandlerMixin, QMainWindow):
         msg.setIcon(QMessageBox.Information)
         msg.setWindowTitle("Version")
         msg.setText(
-            "The current version is 1.0.0 (Beta)."
+            "The current version is 1.1.0."
         )
         msg.setStyleSheet("""
             QMessageBox {
