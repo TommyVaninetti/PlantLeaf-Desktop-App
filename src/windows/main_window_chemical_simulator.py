@@ -1,7 +1,14 @@
 import sys
 import os
-sys.path.insert(0, "/Users/fridatirari/PlantLeaf development /PlantLeaf-Desktop-App/src/chemical_simulators")
-sys.path.insert(0, "/Users/fridatirari/PlantLeaf development /PlantLeaf-Desktop-App/src")
+
+# Add src/chemical_simulators/ to the path so modules there can import each
+# other with bare names (e.g. "from acoustic_parameters import ...").
+# src/ itself is already on the path (inserted by main.py at startup).
+_SIM_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'chemical_simulators')
+)
+if _SIM_DIR not in sys.path:
+    sys.path.insert(0, _SIM_DIR)
 
 import numpy as np
 from PySide6.QtWidgets import (
@@ -20,6 +27,16 @@ from core.layout_manager import LayoutManager
 from core.theme_manager import ThemeManager
 from config.app_config import AppConfig
 from plotting.plot_manager import BasePlotWidget
+
+
+class _PaudioDM:
+    """Minimal adapter so run_stage1_v5 can consume raw paudio arrays."""
+    def __init__(self, fft_data, phase_data, fs, fft_size):
+        self.fft_data     = fft_data
+        self.phase_data   = phase_data
+        self.header_info  = {'fs': fs, 'fft_size': fft_size}
+        self.total_frames = len(fft_data)
+
 
 SLIDER_CSS = (
     "QSlider::groove:horizontal { background: #a5d6a7; height: 6px; border-radius: 3px; }"
@@ -44,9 +61,7 @@ class SimulationWorker(QObject):
 
     def run(self):
         try:
-            import sys
-            sys.path.insert(0, "/Users/fridatirari/PlantLeaf development /PlantLeaf-Desktop-App/src/chemical_simulators")
-            from run_acoustic_simulation import run_simulation
+            from chemical_simulators.run_acoustic_simulation import run_simulation
             self.progress.emit(30)
             result = run_simulation(
                 R0=self.R0,
@@ -56,6 +71,113 @@ class SimulationWorker(QObject):
             )
             self.progress.emit(100)
             self.finished.emit(result)
+        except Exception as e:
+            import traceback
+            self.error.emit(f"{str(e)}\n{traceback.format_exc()}")
+
+
+class ClickDetectorWorker(QObject):
+    finished = Signal(list)   # emits the raw click list on success
+    error    = Signal(str)
+
+    def __init__(self, fft_data, phase_data, fs, fft_size, frame_duration_ms):
+        super().__init__()
+        self.fft_data          = fft_data
+        self.phase_data        = phase_data
+        self.fs                = fs
+        self.fft_size          = fft_size
+        self.frame_duration_ms = frame_duration_ms
+
+    def run(self):
+        try:
+            from pathlib import Path
+            from core.click_pipeline_v5 import (
+                run_stage1_v5, run_stage2_v5, run_stage3_v5, run_stage4_v5,
+                reconstruct_frame_v5, compute_hilbert_envelope, find_peak,
+                compute_features_v5, load_svm_model,
+            )
+            from config.app_config import AppConfig
+
+            fft_data          = self.fft_data
+            phase_data        = self.phase_data
+            fs                = self.fs
+            fft_size          = self.fft_size
+            frame_duration_ms = self.frame_duration_ms
+
+            model_path = Path(AppConfig.BASE_DIR) / 'src' / 'ml' / 'plantleaf_svm_v5.pkl'
+            svm_model = load_svm_model(model_path)
+
+            dm = _PaudioDM(fft_data, phase_data, fs, fft_size)
+            stage1_candidates = run_stage1_v5(dm, k=1.5)
+            if not stage1_candidates:
+                self.finished.emit([])
+                return
+
+            candidates_with_features = []
+            for cand in stage1_candidates:
+                fi = cand['frame_idx']
+                try:
+                    fd = reconstruct_frame_v5(fft_data[fi], phase_data[fi], fs, fft_size, normalize=True)
+                    if fd is None:
+                        continue
+                    curr_sig = fd['signal']
+                    curr_env = compute_hilbert_envelope(curr_sig)
+                    peak_idx, peak_amp = find_peak(curr_env)
+
+                    prev_env, prev_sig = None, None
+                    if fi > 0 and fi - 1 < len(phase_data):
+                        pf = reconstruct_frame_v5(fft_data[fi-1], phase_data[fi-1], fs, fft_size, normalize=True)
+                        if pf is not None:
+                            prev_sig = pf['signal']
+                            prev_env = compute_hilbert_envelope(prev_sig)
+
+                    next_env = None
+                    if fi + 1 < len(fft_data) and fi + 1 < len(phase_data):
+                        nf = reconstruct_frame_v5(fft_data[fi+1], phase_data[fi+1], fs, fft_size, normalize=True)
+                        if nf is not None:
+                            next_env = compute_hilbert_envelope(nf['signal'])
+
+                    features = compute_features_v5(
+                        signal=curr_sig, envelope=curr_env,
+                        fft_norm=fd['fft_norm'], freq_axis=fd['freq_axis'],
+                        noise_floor=cand['noise_floor'], std_noise=cand['std_noise'],
+                        peak_idx=peak_idx, fs=fs,
+                        next_frame_envelope=next_env,
+                        prev_frame_envelope=prev_env, prev_frame_signal=prev_sig,
+                    )
+                    candidates_with_features.append({**cand, **features, 'peak_amp': peak_amp})
+                except Exception as e:
+                    print(f"Warning: frame {fi} skipped: {e}")
+                    continue
+
+            stage2_survivors, _ = run_stage2_v5(candidates_with_features)
+            if not stage2_survivors:
+                self.finished.emit([])
+                return
+
+            detections, _ = run_stage3_v5(stage2_survivors, svm_model)
+            if not detections:
+                self.finished.emit([])
+                return
+
+            final = run_stage4_v5(detections)
+
+            result = []
+            for det in final:
+                ts = det['frame_idx'] * frame_duration_ms / 1000.0
+                result.append({
+                    'timestamp': ts,
+                    'tau_ms':   det.get('tau_ms', -1.0),
+                    'peak_amp': det.get('peak_amp', 0.0),
+                    'R2':       det.get('R2', 0.0),
+                    'frequency': '',
+                    'amplitude': str(det.get('SPR', '')),
+                    'svm_probability': det.get('svm_probability', 0.0),
+                })
+
+            print(f"✅ Click detector v5: {len(result)} clicks")
+            self.finished.emit(result)
+
         except Exception as e:
             import traceback
             self.error.emit(f"{str(e)}\n{traceback.format_exc()}")
@@ -79,6 +201,9 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.sim_thread = None
         self.sim_worker = None
         self.paudio_data = None
+        self._detect_thread = None
+        self._detect_worker = None
+        self._detect_progress = None
 
         self._setup_ui()
         self._setup_menubar()
@@ -248,15 +373,13 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.time_info_label.setAlignment(Qt.AlignCenter)
         time_layout.addWidget(self.time_info_label)
         self.plot_time = BasePlotWidget(
-            x_label="Time", y_label="Amplitude",
-            x_range=(0, 150), y_range=(-1.2, 1.2),
-            x_min=0, x_max=200, y_min=-2, y_max=2,
-            unit_x="us", unit_y="", parent=self
+            x_label="Time", y_label="Norm. Amplitude",
+            x_range=(0, 0.00768), y_range=(-1.2, 1.2),
+            x_min=0, x_max=0.00768, y_min=-2, y_max=2,
+            unit_x="s", unit_y="", parent=self
         )
-        self.curve_sim_time = self.plot_time.plot_widget.plot(name="Simulated", pen={'color': '#689f67', 'width': 2})
-        self.curve_real_time = self.plot_time.plot_widget.plot(
-            name="Real click", pen={'color': 'r', 'width': 1.5}
-        )
+        self.curve_sim_time  = self.plot_time.plot_widget.plot(name="Simulated",  pen={'color': '#689f67', 'width': 3.5})
+        self.curve_real_time = self.plot_time.plot_widget.plot(name="Real click", pen={'color': 'r',       'width': 2})
         self.plot_time.plot_widget.showGrid(x=True, y=True)
         time_layout.addWidget(self.plot_time)
         tab.addTab(time_widget, "Time Domain")
@@ -267,9 +390,9 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.freq_info_label.setAlignment(Qt.AlignCenter)
         freq_layout.addWidget(self.freq_info_label)
         self.plot_freq = BasePlotWidget(
-            x_label="Frequency", y_label="Amplitude",
-            x_range=(20000, 80000), y_range=(0, 1),
-            x_min=19000, x_max=81000, y_min=0, y_max=10,
+            x_label="Frequency", y_label="Norm. Amplitude",
+            x_range=(20000, 80000), y_range=(0, 1.1),
+            x_min=19000, x_max=81000, y_min=0, y_max=1.5,
             unit_x="Hz", unit_y="", parent=self
         )
         self.curve_sim_freq = self.plot_freq.plot_widget.plot(name="Simulated", pen={'color': '#689f67', 'width': 2})
@@ -285,9 +408,9 @@ class MainWindowChemicalSimulator(QMainWindow):
         bubble_layout.addWidget(QLabel("Bubble radius R(t) during collapse"))
         self.plot_bubble = BasePlotWidget(
             x_label="Time", y_label="Radius",
-            x_range=(0, 150), y_range=(0, 100),
-            x_min=0, x_max=200, y_min=0, y_max=200,
-            unit_x="us", unit_y="µm", parent=self
+            x_range=(0, 0.00256), y_range=(0, 100),
+            x_min=0, x_max=0.003, y_min=0, y_max=200,
+            unit_x="s", unit_y="µm", parent=self
         )
         self.curve_bubble = self.plot_bubble.plot_widget.plot(
             name="R(t)", pen={'color': '#2196F3', 'width': 2}
@@ -441,26 +564,26 @@ class MainWindowChemicalSimulator(QMainWindow):
                 fft_bytes = remaining_data
                 click_section = None
 
-            fft_data = []
-            phase_data = []
             bytes_per_sample = 5 if version >= 3.0 else 4
-            offset = 0
-            while offset + num_bins * bytes_per_sample <= len(fft_bytes):
-                frame_mags = []
-                frame_phases = []
-                for b in range(num_bins):
-                    pos = offset + b * bytes_per_sample
-                    mag = struct.unpack('<f', fft_bytes[pos:pos+4])[0]
-                    frame_mags.append(mag)
-                    if version >= 3.0:
-                        ph = struct.unpack('<b', fft_bytes[pos+4:pos+5])[0]
-                        frame_phases.append(ph)
-                fft_data.append(np.array(frame_mags, dtype=np.float32))
-                if version >= 3.0:
-                    phase_data.append(np.array(frame_phases, dtype=np.int8))
-                offset += num_bins * bytes_per_sample
+            bytes_per_frame  = num_bins * bytes_per_sample
+            n_frames = len(fft_bytes) // bytes_per_frame
+            raw = np.frombuffer(
+                fft_bytes[:n_frames * bytes_per_frame], dtype=np.uint8
+            ).reshape(n_frames, num_bins, bytes_per_sample)
+            # Magnitudes: first 4 bytes of each bin → float32
+            mag_raw  = np.ascontiguousarray(raw[:, :, :4])
+            fft_2d   = mag_raw.view(np.float32).reshape(n_frames, num_bins)
+            fft_data = list(fft_2d)   # list of 1-D float32 arrays
+            if version >= 3.0:
+                # Phase: 5th byte of each bin → int8
+                phase_2d   = np.ascontiguousarray(raw[:, :, 4]).view(np.int8).reshape(n_frames, num_bins)
+                phase_data = list(phase_2d)
+            else:
+                phase_data = []
 
-            freq_axis = np.linspace(freq_min, freq_max, num_bins)
+            # True STFT bin-center frequencies: f[k] = k * (fs/fft_size), k = bin_start..bin_end.
+            # (linspace(freq_min, freq_max, num_bins) would mislabel the top bin by ~1 bin.)
+            freq_axis = np.arange(bin_start, bin_start + num_bins) * bin_freq
 
             self.paudio_data = {
                 'fft_data':   fft_data,
@@ -488,236 +611,127 @@ class MainWindowChemicalSimulator(QMainWindow):
                         except:
                             clicks_raw = []
 
-            if not clicks_raw:
-                self.file_label.setText("Running click detector...")
-                QApplication.processEvents()
-                clicks_raw = self._run_click_detector(
-                    fft_data, phase_data, freq_axis, fs, fft_size, frame_duration_ms
-                )
+            # Use embedded clicks only if they carry v5 fields (tau_ms + peak_amp).
+            # Older CLCK sections (format: timestamp/frequency/amplitude/duration_us)
+            # predate these fields — re-run the v5 detector instead.
+            has_v5_fields = bool(clicks_raw) and clicks_raw[0].get('tau_ms') is not None
+            if not has_v5_fields:
+                # Launch detection in a background thread so the UI stays responsive.
+                self._detect_file_path = file_path
+                self._launch_click_detector(fft_data, phase_data, fs, fft_size, frame_duration_ms)
+                return   # UI update happens via _on_detection_finished
 
-            if not clicks_raw:
-                QMessageBox.warning(self, "No Clicks",
-                    "No ultrasonic clicks found in this file.")
-                self.file_label.setText("No clicks found")
-                return
-
-            self.real_clicks = []
-            for click in clicks_raw:
-                ts_str = str(click.get('timestamp', '0'))
-                try:
-                    ts = float(ts_str.replace('s', '').strip())
-                except:
-                    ts = 0.0
-
-                tau_ms = float(click.get('tau_ms', -1.0))
-                if tau_ms <= 0:
-                    duration_str = str(click.get('duration', ''))
-                    if 'FFT' in duration_str:
-                        try:
-                            fft_count = int(duration_str.replace(' FFT', '').strip())
-                            tau_ms = fft_count * 2.56 / 3.0
-                        except:
-                            pass
-
-                frame_idx = int(round(ts * 1000.0 / frame_duration_ms))
-                frame_idx = max(0, min(frame_idx, len(fft_data) - 1))
-
-                self.real_clicks.append({
-                    'timestamp': ts,
-                    'frame_idx': frame_idx,
-                    'tau_ms':    tau_ms,
-                    'frequency': click.get('frequency', ''),
-                    'amplitude': click.get('amplitude', ''),
-                    'r2':        float(click.get('r2_log', click.get('r2', 0.0))),
-                    'peak_amp':  float(click.get('peak_amp', 0.0)),
-                })
-
-            self._populate_click_table()
-            self.file_label.setText(
-                f"{os.path.basename(file_path)}\n{len(self.real_clicks)} clicks found"
-            )
-            if self.real_clicks:
-                self.btn_run.setEnabled(True)
+            self._process_click_results(clicks_raw, frame_duration_ms, file_path)
 
         except Exception as e:
             import traceback
             QMessageBox.critical(self, "Load Error", f"Could not load file:\n{str(e)}\n{traceback.format_exc()}")
 
-    def _run_click_detector(self, fft_data, phase_data, freq_axis, fs, fft_size, frame_duration_ms):
-        from windows.replay_window_audio import (
-            compute_hilbert_envelope, find_peak, check_decay, suppress_edge_artifacts
+    def _launch_click_detector(self, fft_data, phase_data, fs, fft_size, frame_duration_ms):
+        self.file_label.setText("Running click detector v5…")
+        self.btn_run.setEnabled(False)
+
+        dlg = QProgressDialog(
+            "Detecting clicks with v5 pipeline…\n(this may take a moment for long recordings)",
+            None, 0, 0, self,
         )
+        dlg.setWindowTitle("Click Detection")
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+        dlg.show()
+        QApplication.processEvents()
+        self._detect_progress = dlg
 
-        total_frames = len(fft_data)
-        if total_frames == 0:
-            return []
+        # Store frame_duration_ms so the finished callback can read it without
+        # needing a lambda — lambdas have no thread affinity in Qt and cause
+        # DirectConnection (= callback on worker thread = UI calls on wrong thread).
+        self._pending_frame_duration_ms = frame_duration_ms
 
-        fft_means = np.array([np.mean(np.abs(f)) for f in fft_data])
-        fft_mean  = np.mean(fft_means)
-        fft_std   = np.std(fft_means)
+        worker = ClickDetectorWorker(fft_data, phase_data, fs, fft_size, frame_duration_ms)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        # Both connections below are QObject→QObject across threads: Qt automatically
+        # uses QueuedConnection, ensuring the slots run on the main thread.
+        worker.finished.connect(self._on_detection_finished)
+        worker.error.connect(self._on_detection_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._detect_thread = thread
+        self._detect_worker = worker
+        thread.start()
 
-        datasheet_freq_hz = np.array([20, 25, 30, 40, 50, 60, 70, 80]) * 1000
-        datasheet_resp_db = np.array([8.0, 10.5, 6.0, -2.0, -6.0, -7.0, -6.0, -4.0])
-        valid_mask = (freq_axis >= 20000) & (freq_axis <= 80000)
-        mic_db = np.interp(freq_axis[valid_mask], datasheet_freq_hz, datasheet_resp_db)
-        gain_50 = 10 ** (-mic_db * 0.5 / 20.0)
+    def _on_detection_finished(self, clicks_raw):
+        if self._detect_progress:
+            self._detect_progress.close()
+            self._detect_progress = None
+        frame_duration_ms = getattr(self, '_pending_frame_duration_ms', 2.56)
+        file_path         = getattr(self, '_detect_file_path', '')
+        self._process_click_results(clicks_raw, frame_duration_ms, file_path)
 
-        def normalize_fft(mags):
-            n = mags.copy()
-            n[valid_mask] *= gain_50
-            return n
+    def _on_detection_error(self, msg):
+        if self._detect_progress:
+            self._detect_progress.close()
+            self._detect_progress = None
+        if 'SVM model not found' in msg or 'FileNotFoundError' in msg:
+            QMessageBox.warning(self, "SVM Model Missing",
+                "Could not find plantleaf_svm_v5.pkl.\n"
+                "Train the model first (src/ml/train_svm.py) and save it to src/ml/.")
+        else:
+            QMessageBox.critical(self, "Click Detector Error",
+                f"An error occurred during click detection:\n\n{msg}")
+        self.file_label.setText("Detection failed")
 
-        def reconstruct_ifft(frame_idx):
-            if not phase_data or frame_idx >= len(phase_data):
-                return None
-            mags = normalize_fft(fft_data[frame_idx].copy())
-            phases_int8 = phase_data[frame_idx]
-            num_bins_full = fft_size // 2
-            bin_freq = fs / fft_size
-            bin_s = int(20000 / bin_freq)
-            bin_e = int(80000 / bin_freq)
-            actual = min(len(mags), bin_e - bin_s + 1, len(phases_int8))
-            full_mag = np.zeros(num_bins_full, dtype=np.float32)
-            full_phase = np.zeros(num_bins_full, dtype=np.int8)
-            full_mag[bin_s:bin_s+actual] = mags[:actual]
-            full_phase[bin_s:bin_s+actual] = phases_int8[:actual]
-            phases_rad = (full_phase / 127.0) * np.pi
-            cs = full_mag * np.exp(1j * phases_rad)
-            taper = max(5, actual // 10)
-            window = np.ones(num_bins_full)
-            for i in range(taper):
-                alpha = i / taper
-                window[bin_s + i] = 0.5 * (1 - np.cos(np.pi * alpha))
-                window[bin_s + actual - i - 1] = 0.5 * (1 - np.cos(np.pi * alpha))
-            cs *= window
+    def _process_click_results(self, clicks_raw, frame_duration_ms, file_path):
+        fft_data = self.paudio_data['fft_data'] if self.paudio_data else []
+
+        if not clicks_raw:
+            QMessageBox.warning(self, "No Clicks",
+                "No ultrasonic clicks found in this file.")
+            self.file_label.setText("No clicks found")
+            return
+
+        self.real_clicks = []
+        for click in clicks_raw:
+            ts_str = str(click.get('timestamp', '0'))
             try:
-                sig = np.fft.irfft(cs, n=fft_size)
-                return suppress_edge_artifacts(sig)
-            except:
-                return None
+                ts = float(ts_str.replace('s', '').strip())
+            except Exception:
+                ts = 0.0
 
-        threshold_noise = fft_mean + 4 * fft_std
-        empty_indices = np.where(fft_means < threshold_noise)[0]
-        noise_rms = fft_mean
-        if len(empty_indices) > 0:
-            np.random.seed(42)
-            sampled = np.random.choice(empty_indices, size=min(200, len(empty_indices)), replace=False)
-            rms_vals = []
-            for idx in sampled:
-                sig = reconstruct_ifft(idx)
-                if sig is not None:
-                    rms_vals.append(np.sqrt(np.mean(sig**2)))
-            if rms_vals:
-                noise_rms = float(np.mean(rms_vals))
+            tau_ms = float(click.get('tau_ms', -1.0))
+            if tau_ms <= 0:
+                duration_str = str(click.get('duration', ''))
+                if 'FFT' in duration_str:
+                    try:
+                        fft_count = int(duration_str.replace(' FFT', '').strip())
+                        tau_ms = fft_count * 2.56 / 3.0
+                    except Exception:
+                        pass
 
-        threshold_v = fft_mean + 5 * fft_std
-        above = [i for i in range(total_frames) if fft_means[i] > threshold_v]
-        MAX_RUN = 4
-        filtered = []
-        if above:
-            run_start = 0
-            for k in range(1, len(above) + 1):
-                at_end = (k == len(above))
-                new_run = at_end or (above[k] - above[k-1] > 1)
-                if new_run:
-                    run = above[run_start:k]
-                    if len(run) <= MAX_RUN:
-                        filtered.extend(run)
-                    run_start = k
+            frame_idx = int(round(ts * 1000.0 / frame_duration_ms))
+            frame_idx = max(0, min(frame_idx, max(0, len(fft_data) - 1)))
 
-        candidates2 = []
-        for fi in filtered:
-            fft_norm = normalize_fft(fft_data[fi].copy())
-            peak_v = float(np.max(fft_norm))
-            if peak_v <= 0.00085:
-                continue
-            power = fft_norm.astype(np.float64) ** 2
-            mean_p = float(np.mean(power))
-            max_p  = float(np.max(power))
-            spr = max_p / mean_p if mean_p > 1e-20 else 0.0
-            if spr > 20:
-                continue
-            candidates2.append({'frame_idx': fi, 'peak_fft_v': peak_v, 'spr': spr})
-
-        candidates3 = []
-        for c in candidates2:
-            fi = c['frame_idx']
-            sig = reconstruct_ifft(fi)
-            if sig is None:
-                continue
-            env = compute_hilbert_envelope(sig)
-            peak_idx, peak_amp = find_peak(env)
-            if peak_amp <= 130e-6:
-                continue
-            next_env = None
-            if peak_idx > 212 and fi + 1 < total_frames:
-                ns = reconstruct_ifft(fi + 1)
-                if ns is not None:
-                    next_env = compute_hilbert_envelope(ns)
-            decay = check_decay(env, peak_idx, next_frame_envelope=next_env, noise_rms=noise_rms)
-            tau_ms = decay['tau_ms']
-            r2 = decay['r_squared_log']
-            E_W1 = decay['E_W1']
-            E_W4 = decay['E_W4']
-            if tau_ms <= 0 or not (0.045 <= tau_ms <= 1.3):
-                continue
-            if r2 <= 0.45:
-                continue
-            if E_W1 <= E_W4 * 2.0:
-                continue
-            GUARD = 20
-            pre_end = max(0, peak_idx - GUARD)
-            pre_w = sig[:pre_end] if pre_end >= 50 else np.array([noise_rms])
-            rms_pre = float(np.sqrt(np.mean(pre_w**2)))
-            pre_snr = rms_pre / noise_rms if noise_rms > 0 else 1.0
-            if pre_snr >= 1.8:
-                continue
-            level = peak_amp * 0.1
-            rise_start = peak_idx
-            for i in range(peak_idx - 1, -1, -1):
-                if env[i] < level:
-                    rise_start = i + 1
-                    break
-            rise_s = max(1, peak_idx - rise_start)
-            fall_end = min(peak_idx + 40, len(env))
-            fall_s = 40
-            for i in range(peak_idx + 1, fall_end):
-                if env[i] < level:
-                    fall_s = i - peak_idx
-                    break
-            asym = rise_s / fall_s if fall_s > 0 else 1.0
-            if asym >= 2.5:
-                continue
-            candidates3.append({**c, 'peak_amp': peak_amp, 'tau_ms': tau_ms, 'r2_log': r2})
-
-        if not candidates3:
-            return []
-
-        sorted_c = sorted(candidates3, key=lambda x: x['frame_idx'])
-        groups, current = [], [sorted_c[0]]
-        for i in range(1, len(sorted_c)):
-            if sorted_c[i]['frame_idx'] - sorted_c[i-1]['frame_idx'] <= 3:
-                current.append(sorted_c[i])
-            else:
-                groups.append(current)
-                current = [sorted_c[i]]
-        groups.append(current)
-
-        result = []
-        for grp in groups:
-            best = max(grp, key=lambda x: x['peak_amp'])
-            ts = best['frame_idx'] * frame_duration_ms / 1000.0
-            result.append({
+            self.real_clicks.append({
                 'timestamp': ts,
-                'tau_ms':    best['tau_ms'],
-                'peak_amp':  best['peak_amp'],
-                'r2_log':    best['r2_log'],
-                'frequency': '',
-                'amplitude': str(best['peak_fft_v']),
+                'frame_idx': frame_idx,
+                'tau_ms':    tau_ms,
+                'frequency': click.get('frequency', ''),
+                'amplitude': click.get('amplitude', ''),
+                'r2':        float(click.get('R2', click.get('r2', click.get('r2_log', 0.0)))),
+                'peak_amp':  float(click.get('peak_amp', 0.0)),
             })
 
-        print(f"✅ Click detector: found {len(result)} clicks")
-        return result
+        self._populate_click_table()
+        self.file_label.setText(
+            f"{os.path.basename(file_path)}\n{len(self.real_clicks)} clicks found"
+        )
+        if self.real_clicks:
+            self.btn_run.setEnabled(True)
 
     def _populate_click_table(self):
         self.click_table.setRowCount(len(self.real_clicks))
@@ -743,55 +757,61 @@ class MainWindowChemicalSimulator(QMainWindow):
     def _show_real_click(self, click):
         if not self.paudio_data:
             return
+        pd        = self.paudio_data
         frame_idx = click['frame_idx']
-        fft_data   = self.paudio_data['fft_data']
-        phase_data = self.paudio_data['phase_data']
-        freq_axis  = self.paudio_data['freq_axis']
+        fft_data  = pd['fft_data']
+        phase_data = pd['phase_data']
 
         if frame_idx >= len(fft_data):
             return
 
-        self.curve_real_freq.setData(freq_axis, fft_data[frame_idx])
+        from core.click_pipeline_v5 import reconstruct_frame_v5
 
-        if phase_data and frame_idx < len(phase_data):
-            signal = self._reconstruct_ifft(frame_idx)
-            if signal is not None:
-                fs = self.paudio_data['fs']
-                fft_size = self.paudio_data['fft_size']
-                t = np.linspace(0, fft_size/fs, fft_size)
-                sig_norm = signal / (np.max(np.abs(signal)) + 1e-30)
-                self.curve_real_time.setData(t * 1e6, sig_norm)
-
-    def _reconstruct_ifft(self, frame_idx):
-        pd = self.paudio_data
-        fft_mags = pd['fft_data'][frame_idx].copy()
-        if not pd['phase_data'] or frame_idx >= len(pd['phase_data']):
-            return None
-        phases_int8 = pd['phase_data'][frame_idx]
         fs       = pd['fs']
         fft_size = pd['fft_size']
-        num_bins_full = fft_size // 2
-        bin_start = pd['bin_start']
-        num_bins  = pd['num_bins']
-        full_mag   = np.zeros(num_bins_full, dtype=np.float32)
-        full_phase = np.zeros(num_bins_full, dtype=np.int8)
-        actual = min(len(fft_mags), num_bins, len(phases_int8))
-        full_mag[bin_start:bin_start+actual]   = fft_mags[:actual]
-        full_phase[bin_start:bin_start+actual] = phases_int8[:actual]
-        phases_rad = (full_phase / 127.0) * np.pi
-        complex_spectrum = full_mag * np.exp(1j * phases_rad)
-        taper = max(5, actual // 10)
-        window = np.ones(num_bins_full)
-        for i in range(taper):
-            alpha = i / taper
-            window[bin_start + i] = 0.5 * (1 - np.cos(np.pi * alpha))
-            window[bin_start + actual - i - 1] = 0.5 * (1 - np.cos(np.pi * alpha))
-        complex_spectrum *= window
-        try:
-            sig = np.fft.irfft(complex_spectrum, n=fft_size)
-            return sig
-        except Exception:
-            return None
+        phases = (
+            phase_data[frame_idx]
+            if phase_data and frame_idx < len(phase_data)
+            else np.array([], dtype=np.int8)
+        )
+        fd = reconstruct_frame_v5(fft_data[frame_idx], phases, fs, fft_size, normalize=True)
+        if fd is None:
+            return
+
+        # FFT plot: mic-corrected, Tukey-tapered magnitudes (analysis band only), normalized to [0,1]
+        bin_start     = pd['bin_start']
+        num_bins      = pd['num_bins']
+        freq_axis     = pd['freq_axis']
+        fft_norm_band = fd['fft_norm'][bin_start : bin_start + num_bins]
+        peak = np.max(fft_norm_band)
+        if peak > 0:
+            fft_norm_band = fft_norm_band / peak
+        self.curve_real_freq.setData(freq_axis, fft_norm_band)
+
+        # Time-domain: [frame−1 | frame | frame+1] concatenated into one continuous signal
+        frame_dur  = fft_size / fs                           # seconds per frame
+
+        def _recon(fi):
+            if fi < 0 or fi >= len(fft_data):
+                return np.zeros(fft_size, dtype=np.float32)  # silent padding at file edges
+            ph = (phase_data[fi]
+                  if phase_data and fi < len(phase_data)
+                  else np.array([], dtype=np.int8))
+            fd_r = reconstruct_frame_v5(fft_data[fi], ph, fs, fft_size, normalize=True)
+            return fd_r['signal'] if fd_r is not None else np.zeros(fft_size, dtype=np.float32)
+
+        sig_prev   = _recon(frame_idx - 1)
+        sig_center = fd['signal']
+        sig_next   = _recon(frame_idx + 1)
+
+        sig_full    = np.concatenate([sig_prev, sig_center, sig_next])
+        center_peak = np.max(np.abs(sig_center)) + 1e-30
+        t_full      = np.linspace(0, 3 * frame_dur, 3 * fft_size)
+
+        # Peak position inside the full 3-frame axis (for sim alignment)
+        self._real_click_peak_t = frame_dur + np.argmax(np.abs(sig_center)) / fs
+
+        self.curve_real_time.setData(t_full, sig_full / center_peak)
 
     def _run_simulation(self):
         R0 = self.r0_spinbox.value() * 1e-6
@@ -839,17 +859,21 @@ class MainWindowChemicalSimulator(QMainWindow):
         propagation = result['propagation']
         plantleaf   = result['plantleaf']
 
-        t      = bubble['t']
-        signal = propagation['signal']
+        t_sim    = bubble['t']                                      # seconds
+        signal   = propagation['signal']
         sim_norm = signal / (np.max(np.abs(signal)) + 1e-30)
-        self.curve_sim_time.setData(t * 1e6, sim_norm)
+        t_peak_sim  = t_sim[np.argmax(np.abs(signal))]
+        t_peak_real = getattr(self, '_real_click_peak_t', 0.0)
+        self.curve_sim_time.setData(t_sim - t_peak_sim + t_peak_real, sim_norm)
 
-        freq = plantleaf['freq']
-        spec = plantleaf['spectrum']
-        self.curve_sim_freq.setData(freq, spec)
+        freq      = plantleaf['freq']
+        spec      = plantleaf['spectrum']
+        spec_peak = np.max(spec)
+        spec_norm = spec / spec_peak if spec_peak > 0 else spec
+        self.curve_sim_freq.setData(freq, spec_norm)
 
         R_um = bubble['R'] * 1e6
-        self.curve_bubble.setData(t * 1e6, R_um)
+        self.curve_bubble.setData(t_sim, R_um)
 
     def _update_diagnostics(self, result):
         diag   = result['diagnostics']
@@ -877,7 +901,16 @@ class MainWindowChemicalSimulator(QMainWindow):
 
             real_signal = None
             if self.paudio_data:
-                real_signal = self._reconstruct_ifft(click['frame_idx'])
+                from core.click_pipeline_v5 import reconstruct_frame_v5
+                pd  = self.paudio_data
+                fi  = click['frame_idx']
+                ph  = (pd['phase_data'][fi]
+                       if pd['phase_data'] and fi < len(pd['phase_data'])
+                       else np.array([], dtype=np.int8))
+                fd2 = reconstruct_frame_v5(pd['fft_data'][fi], ph,
+                                           pd['fs'], pd['fft_size'], normalize=True)
+                if fd2 is not None:
+                    real_signal = fd2['signal']
 
             sim_signal = result['propagation']['signal']
             corr = 0.0
@@ -910,7 +943,7 @@ class MainWindowChemicalSimulator(QMainWindow):
         if not file_path:
             return
         try:
-            from report_acoustic import generate_report
+            from chemical_simulators.report_acoustic import generate_report
             generate_report(simulation_result=self.sim_result, output_path=file_path)
             QMessageBox.information(self, "Done", f"PDF saved to:\n{file_path}")
         except Exception as e:

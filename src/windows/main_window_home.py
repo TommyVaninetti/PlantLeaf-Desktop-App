@@ -219,11 +219,11 @@ class MainWindowHome(BaseWindow):
         # Create buttons
         btn_voltage = self.create_main_button("⚡ New Voltage Analysis", "Start a new voltage analysis")
         btn_audio = self.create_main_button("🔊 New Audio Analysis", "Start a new audio analysis")
+        btn_chemical = self.create_main_button("🧪 Bioacoustics Simulator", "Run the bioacoustics simulator")
         btn_open = self.create_main_button("📁 Open Existing File", "Open a previously saved analysis file")
-        btn_chemical = self.create_main_button("🧪 Audio Chemical Simulator", "Run the acoustic cavitation simulator")
-        
+
         # Add buttons to layout
-        for btn in (btn_voltage, btn_audio, btn_open, btn_chemical):
+        for btn in (btn_voltage, btn_audio, btn_chemical, btn_open):
             buttons_layout.addWidget(btn)
         
         # Center the buttons
@@ -248,7 +248,7 @@ class MainWindowHome(BaseWindow):
         main_layout.addSpacerItem(QSpacerItem(20, 15, QSizePolicy.Minimum, QSizePolicy.Expanding))
         
         # Footer
-        footer_label = QLabel("PlantLeaf v1.0.0 - Tommaso Vaninetti")
+        footer_label = QLabel("PlantLeaf v1.1.0 - Tommaso Vaninetti")
         footer_label.setAlignment(Qt.AlignCenter)
         footer_label.setObjectName("footerLabel")
         main_layout.addWidget(footer_label)

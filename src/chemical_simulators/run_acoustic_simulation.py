@@ -23,8 +23,8 @@ def run_simulation(R0=None, P_inf=None, distance_m=None, tau_target_ms=None):
 
     # Parametri del modello fenomenologico
     tau_s = (tau_target_ms / 1000.0) if tau_target_ms and tau_target_ms > 0 else 0.000249
-    fs = 200000
-    n_points = 512
+    fs = PlantLeafConfig.FS
+    n_points = PlantLeafConfig.FFT_SIZE
     t = np.linspace(0, n_points / fs, n_points)
 
     # Frequenza centrale stimata da P_inf

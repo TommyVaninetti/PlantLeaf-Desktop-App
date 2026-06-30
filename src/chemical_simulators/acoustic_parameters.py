@@ -13,6 +13,14 @@ Utilizzo:
 """
 
 import numpy as np
+from core.click_pipeline_v5 import (
+    FS          as _PL_FS,
+    FFT_SIZE    as _PL_FFT_SIZE,
+    BIN_START_HZ as _PL_BIN_START,
+    BIN_END_HZ  as _PL_BIN_END,
+    _MIC_FREQ_HZ,
+    _MIC_RESP_DB,
+)
 
 
 # =============================================================================
@@ -152,29 +160,18 @@ class MicrophoneResponse:
     """
     Risposta in frequenza del microfono MEMS SPU0410LR5H (Knowles).
 
-    Dati estratti dal datasheet ufficiale Knowles SPU0410LR5H-QB.
-    La risposta è espressa in dB relativo al livello piatto (0 dB = risposta piatta).
-
-    Il microfono ha un picco di risonanza a ~25 kHz (+10.5 dB) e una
-    caduta progressiva oltre i 40 kHz, con un secondo picco più basso
-    attorno a 60 kHz.
+    I valori di frequenza e risposta sono importati da core.click_pipeline_v5
+    (_MIC_FREQ_HZ, _MIC_RESP_DB) per garantire che la simulazione usi
+    esattamente la stessa curva di risposta usata dal pipeline di rilevamento.
 
     Fonte: Knowles SPU0410LR5H datasheet, Fig. 3
     """
 
-    # Frequenze di campionamento [Hz] — valori dal datasheet
-    FREQ_POINTS_HZ = np.array([
-        20000, 22000, 24000, 25000, 26000, 28000,
-        30000, 32000, 35000, 40000, 45000, 50000,
-        55000, 60000, 65000, 70000, 75000, 80000
-    ], dtype=float)
+    # Frequenze di campionamento [Hz] — identiche a click_pipeline_v5._MIC_FREQ_HZ
+    FREQ_POINTS_HZ = _MIC_FREQ_HZ
 
-    # Risposta corrispondente [dB] — relativa al livello piatto
-    RESPONSE_DB = np.array([
-        0.0,   1.5,   5.0,  10.5,  8.0,   4.0,
-        1.0,  -1.0,  -2.5,  -5.0,  -4.0,  -2.0,
-       -3.5,   0.5,  -4.0,  -7.0, -10.0, -14.0
-    ], dtype=float)
+    # Risposta corrispondente [dB] — identica a click_pipeline_v5._MIC_RESP_DB
+    RESPONSE_DB = _MIC_RESP_DB
 
     # Frequenza di risonanza principale [Hz]
     F_RESONANCE = 25000.0  # 25 kHz
@@ -193,13 +190,11 @@ class MicrophoneResponse:
         Returns:
             np.ndarray: Risposta lineare (non in dB) — fattore moltiplicativo
         """
-        # Interpolazione lineare dei valori dB
         response_db = np.interp(
             freq_hz,
             MicrophoneResponse.FREQ_POINTS_HZ,
             MicrophoneResponse.RESPONSE_DB
         )
-        # Conversione dB → lineare
         return 10.0 ** (response_db / 20.0)
 
 
@@ -211,25 +206,25 @@ class PlantLeafConfig:
     """
     Configurazione del sistema di acquisizione PlantLeaf.
 
-    Questi parametri devono essere coerenti con il firmware del microcontrollore
-    e con i parametri usati in MainWindowAudio.
+    I valori numerici sono importati da core.click_pipeline_v5 (single source of
+    truth) per garantire coerenza con il firmware e con il pipeline di rilevamento.
     """
 
     # Frequenza di campionamento [Hz]
-    FS = 200000  # 200 kHz
+    FS = _PL_FS            # 200 kHz
 
     # Dimensione FFT [campioni]
-    FFT_SIZE = 512
+    FFT_SIZE = _PL_FFT_SIZE  # 512
 
     # Range di frequenza analizzato [Hz]
-    FREQ_MIN = 20000   # 20 kHz
-    FREQ_MAX = 80000   # 80 kHz
+    FREQ_MIN = _PL_BIN_START  # 20 kHz
+    FREQ_MAX = _PL_BIN_END    # 80 kHz
 
     # Durata di un singolo frame FFT [s]
-    FFT_DURATION = FFT_SIZE / FS  # = 2.56 ms
+    FFT_DURATION = _PL_FFT_SIZE / _PL_FS  # = 2.56 ms
 
     # Passo in frequenza per bin FFT [Hz/bin]
-    BIN_FREQ = FS / FFT_SIZE  # = 390.625 Hz/bin
+    BIN_FREQ = _PL_FS / _PL_FFT_SIZE  # = 390.625 Hz/bin
 
     @staticmethod
     def get_freq_axis():
@@ -243,8 +238,9 @@ class PlantLeafConfig:
         bin_freq = PlantLeafConfig.FS / PlantLeafConfig.FFT_SIZE
         bin_start = int(PlantLeafConfig.FREQ_MIN / bin_freq)
         bin_end = int(PlantLeafConfig.FREQ_MAX / bin_freq)
-        num_bins = bin_end - bin_start + 1
-        return np.linspace(PlantLeafConfig.FREQ_MIN, PlantLeafConfig.FREQ_MAX, num_bins)
+        # True STFT bin-center frequencies f[k] = k * (FS/FFT_SIZE), k = bin_start..bin_end.
+        # (linspace(FREQ_MIN, FREQ_MAX, num_bins) would mislabel the top bin by ~1 bin.)
+        return np.arange(bin_start, bin_end + 1) * bin_freq
 
 
 # =============================================================================
