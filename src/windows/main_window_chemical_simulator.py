@@ -751,8 +751,25 @@ class MainWindowChemicalSimulator(QMainWindow):
         row = self.click_table.currentRow()
         if row < 0 or row >= len(self.real_clicks):
             return
+        # Selecting a different click invalidates any existing simulation
+        self._discard_simulation()
         click = self.real_clicks[row]
         self._show_real_click(click)
+
+    def _discard_simulation(self):
+        """Clear the simulated (green) overlay and its result tables.
+
+        Called whenever the selected click changes: the previous simulation no
+        longer corresponds to the newly selected click, so it must be discarded.
+        """
+        self.sim_result = None
+        self.curve_sim_time.setData([], [])
+        self.curve_sim_freq.setData([], [])
+        self.curve_bubble.setData([], [])
+        self.table_sim.setRowCount(0)
+        self.table_compare.setRowCount(0)
+        self.correlation_label.setText("Correlation: —")
+        self.btn_pdf.setEnabled(False)
 
     def _show_real_click(self, click):
         if not self.paudio_data:

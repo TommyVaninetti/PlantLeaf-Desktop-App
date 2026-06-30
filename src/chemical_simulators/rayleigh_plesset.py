@@ -153,11 +153,12 @@ def compute_radiated_pressure(R, V, t, R0):
     Calcola la pressione irradiata dalla bolla in collasso.
 
     La pressione irradiata è proporzionale alla seconda derivata
-    del volume della bolla nel tempo. In forma semplificata:
+    del volume della bolla nel tempo (sorgente monopolare). In forma semplificata:
 
-        p_source(t) ≈ ρ/r · (R·R'' + 2·R'²) · R²
+        p_source(t) ≈ ρ/r · (R²·R'' + 2·R·R'²)
 
     dove r è la distanza dalla bolla (qui normalizzata a R0).
+    Unità risultanti: Pascal [Pa].
 
     Args:
         R  : array del raggio nel tempo [m]
@@ -177,8 +178,8 @@ def compute_radiated_pressure(R, V, t, R0):
     # Estendi all'ultimo punto per mantenere la lunghezza
     dV_dt = np.append(dV_dt, dV_dt[-1])
 
-    # Pressione irradiata alla distanza R0 dalla bolla
-    # p = ρ · R² · (R·R'' + 2·V²) / R0
-    p_source = rho * R ** 2 * (R * dV_dt + 2.0 * V ** 2) / R0
+    # Pressione irradiata alla distanza R0 dalla bolla (sorgente monopolare):
+    # p = ρ/r · (R²·R'' + 2·R·V²) = ρ/R0 · R · (R·R'' + 2·V²)   [Pa]
+    p_source = rho * R * (R * dV_dt + 2.0 * V ** 2) / R0
 
     return p_source
