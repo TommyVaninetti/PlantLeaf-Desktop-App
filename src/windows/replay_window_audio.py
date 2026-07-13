@@ -60,6 +60,23 @@ from core.click_pipeline_v5 import (
 )
 
 
+def fmt_volts(value, decimals=3):
+    """
+    Format a voltage with an automatically chosen SI unit (V / mV / µV).
+
+    Since the iFFT amplitude-scale fix (see docs/fft_and_ifft/IFFT_AMPLITUDE_SCALE_FIX.md)
+    the reconstructed signal is in true volts, so clicks land in the mV range while
+    noise floors can still be sub-mV. Picking the unit from the magnitude keeps both
+    readable instead of hard-coding one scale.
+    """
+    v = abs(float(value))
+    if v >= 0.5:
+        return f"{float(value):.{decimals}f} V"
+    if v >= 5e-4:
+        return f"{float(value) * 1e3:.{decimals}f} mV"
+    return f"{float(value) * 1e6:.{decimals}f} µV"
+
+
 class AudioDataManager:
     """Gestisce dati audio con architettura multi-livello per performance ottimali"""
     
@@ -182,16 +199,26 @@ class AudioDataManager:
             else:
                 frame_data = None
 
+            # 4. Update estimator and store per-frame noise estimates
             if frame_data is not None:
                 envelope   = compute_hilbert_envelope(frame_data['signal'])
                 env_mean_i = float(np.mean(envelope))
                 env_std_i  = float(np.std(envelope))
+                noise = estimator.update(E_i, env_mean_i, env_std_i)
             else:
-                env_mean_i = float(np.sqrt(max(E_i, 0.0)))  # amplitude fallback
-                env_std_i  = 0.0
+                # No reconstruction → no envelope → no honest env_mean/env_std.
+                # The previous code synthesised sqrt(E_i) here, which is a band-RMS
+                # of the FFT magnitudes and NOT an envelope mean: it differs from the
+                # real thing by ~sqrt(K/2) ≈ 9x. Writing it into B2_mean would bias
+                # noise_floor upward for every subsequent frame (the buffer is a
+                # rolling median) and silently crush peak_SNR for the rest of the
+                # recording. Skip the update and carry the current estimates forward.
+                noise = {
+                    'E_hat_floor': estimator.E_hat_floor,
+                    'noise_floor': estimator.noise_floor,
+                    'std_noise':   estimator.std_noise,
+                }
 
-            # 4. Update estimator and store per-frame noise estimates
-            noise = estimator.update(E_i, env_mean_i, env_std_i)
             E_hat_floors[i] = noise['E_hat_floor']
             noise_floors[i] = noise['noise_floor']
             std_noises[i]   = noise['std_noise']
@@ -299,10 +326,19 @@ class IFFTWindow(QDialog):
             x_min_val = time_data[0]
             x_max_val = time_data[-1]
 
+        # Vista Y derivata dai dati: dopo la correzione di scala dell'iFFT il segnale
+        # è in volt veri (click nell'ordine dei mV), quindi un range fisso in µV lo
+        # lascerebbe completamente fuori schermo.
+        y_peak = float(np.max(np.abs(signal_data))) if (
+            signal_data is not None and len(signal_data) > 0) else 1e-3
+        if not np.isfinite(y_peak) or y_peak <= 0:
+            y_peak = 1e-3
+        y_peak *= 1.25   # margine
+
         # Crea il widget del grafico con il range corretto e auto-range per l'asse Y
         self.plot_widget = BasePlotWidget(
             x_label="Time", y_label="Amplitude",
-            x_range=(x_min_val, x_max_val), y_range=(-0.00005, 0.00015),
+            x_range=(x_min_val, x_max_val), y_range=(-y_peak, y_peak),
             x_min=x_min_val, x_max=x_max_val, y_min=-1.7, y_max=1.7,
             unit_x="s", unit_y="V", parent=self
         )
@@ -489,12 +525,23 @@ class IFFTWindow(QDialog):
 
         self.signal_data_normalized = frame_data['signal']
         print(f"✅ Normalized iFFT via reconstruct_frame_v5  "
-              f"(peak {np.max(np.abs(self.signal_data_normalized))*1e6:.2f} µV)")
+              f"(peak {fmt_volts(np.max(np.abs(self.signal_data_normalized)), 2)})")
+
+    def _rescale_y_to(self, signal):
+        """Fit the Y view to the signal currently on screen (raw and normalized
+        differ by the mic correction, up to ~10 dB)."""
+        if signal is None or len(signal) == 0:
+            return
+        peak = float(np.max(np.abs(signal)))
+        if not np.isfinite(peak) or peak <= 0:
+            return
+        self.plot_widget.plot_widget.setYRange(-peak * 1.25, peak * 1.25, padding=0)
 
     def _update_display(self):
         """Show ONLY the selected signal (normalized or raw) — not both overlaid."""
         if self.is_normalized and self.signal_data_normalized is not None:
             self.ifft_curve.setData(self.time_data, self.signal_data_normalized)
+            self._rescale_y_to(self.signal_data_normalized)
             #As a color, use a darker accent color = border-color of QPushButton:checked
             self.ifft_curve.setPen({'color': self.parent.theme_manager.get_darker_accent_color(), 'width': 2})
             self.normalize_button.setText("Show Raw iFFT")
@@ -502,6 +549,7 @@ class IFFTWindow(QDialog):
             self.info_label.setStyleSheet("color: red; font-weight: bold; font-size: 10pt;")
         else:
             self.ifft_curve.setData(self.time_data, self.signal_data_raw)
+            self._rescale_y_to(self.signal_data_raw)
             if self.parent and hasattr(self.parent, 'theme_manager'):
                 self.parent.theme_manager.apply_theme_to_plot(
                     plot_widget_name=self.plot_widget.plot_widget,
@@ -605,7 +653,7 @@ class IFFTWindow(QDialog):
 
         print(f"\n🔍 Decay Analysis v5 ({'NORMALIZED' if self.is_normalized else 'RAW'}):")
         print(f"   Peak at t = {peak_time:.6f} s (sample {peak_idx})")
-        print(f"   Peak amplitude: {peak_amp*1e6:.2f} µV")
+        print(f"   Peak amplitude: {fmt_volts(peak_amp, 3)}")
 
         # ── Retrieve per-frame noise estimates ────────────────────────────────
         dm = self.parent.data_manager if (self.parent and hasattr(self.parent, 'data_manager')) else None
@@ -756,16 +804,16 @@ class IFFTWindow(QDialog):
             self._noise_floor_line = self.plot_widget.plot_widget.addLine(
                 y=noise_floor,
                 pen={'color': '#80DEEA', 'width': 1.2, 'style': QtCore.Qt.DashLine},
-                label=f' noise_floor  {noise_floor*1e6:.2f} µV',
+                label=f' noise_floor  {fmt_volts(noise_floor, 3)}',
                 labelOpts={'position': 0.05, 'color': '#80DEEA'},
             )
             level = noise_floor + std_noise
             self._noise_std_line = self.plot_widget.plot_widget.addLine(
                 y=level,
                 pen={'color': '#CE93D8', 'width': 1.2, 'style': QtCore.Qt.DotLine},
-                label=f' noise+σ  {level*1e6:.2f} µV',
+                label=f' noise+σ  {fmt_volts(level, 3)}',
                 labelOpts={'position': 0.05, 'color': '#CE93D8'},
-            )   
+            )
             return
 
         # Recompute decay window from the envelope to get decay_start/decay_end
@@ -809,7 +857,7 @@ class IFFTWindow(QDialog):
         self._noise_floor_line = self.plot_widget.plot_widget.addLine(
             y=noise_floor,
             pen={'color': '#80DEEA', 'width': 1.2, 'style': QtCore.Qt.DashLine},
-            label=f'noise_floor  {noise_floor*1e6:.2f} µV',
+            label=f'noise_floor  {fmt_volts(noise_floor, 3)}',
             labelOpts={'position': 0.05, 'color': '#80DEEA'},
         )
 
@@ -818,12 +866,12 @@ class IFFTWindow(QDialog):
         self._noise_std_line = self.plot_widget.plot_widget.addLine(
             y=level,
             pen={'color': '#CE93D8', 'width': 1.2, 'style': QtCore.Qt.DotLine},
-            label=f'noise+σ  {level*1e6:.2f} µV',
+            label=f'noise+σ  {fmt_volts(level, 3)}',
             labelOpts={'position': 0.05, 'color': '#CE93D8'},
         )
 
         print(f"✅ Fit overlay v5: τ={tau_ms:.3f} ms  R²={R2:.3f}  "
-              f"noise={noise_floor*1e6:.3f} µV  level={level*1e6:.3f} µV")
+              f"noise={fmt_volts(noise_floor, 3)}  level={fmt_volts(level, 3)}")
 
 
     def _show_decay_results_dialog(self, frame_index, peak_time, peak_idx,
@@ -854,8 +902,8 @@ class IFFTWindow(QDialog):
         text = QTextEdit()
         text.setReadOnly(True)
 
-        nf_uv  = noise_floor * 1e6
-        std_uv = std_noise   * 1e6
+        nf_str  = fmt_volts(noise_floor, 3)
+        std_str = fmt_volts(std_noise,   3)
         f = features   # shorthand
 
         def fmt(v, unit='', decimals=4):
@@ -870,11 +918,11 @@ class IFFTWindow(QDialog):
   <tr><td style='width:220px;padding:3px;'>Peak time in frame:</td>
       <td><b>{peak_time:.6f} s</b>  (sample {peak_idx}/512)</td></tr>
   <tr><td style='padding:3px;'>Peak amplitude:</td>
-      <td><b>{peak_amp*1e6:.2f} µV</b></td></tr>
+      <td><b>{fmt_volts(peak_amp, 3)}</b></td></tr>
   <tr><td style='padding:3px;'>Noise floor (adaptive):</td>
-      <td>{nf_uv:.3f} µV</td></tr>
+      <td>{nf_str}</td></tr>
   <tr><td style='padding:3px;'>Noise std (adaptive):</td>
-      <td>{std_uv:.3f} µV</td></tr>
+      <td>{std_str}</td></tr>
 </table>
 
 <p style='margin-top:12px;'><b style='font-size:12pt; text-decoration:underline;'>

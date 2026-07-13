@@ -55,8 +55,8 @@ CSV_COLUMNS = [
     'file',
     'frame_idx',
     'timestamp_s',
-    'noise_floor_uV',
-    'std_noise_uV',
+    'noise_floor_mV',
+    'std_noise_mV',
     'E_hat_floor',
     'peak_SNR',
     'pre_SNR',
@@ -135,8 +135,13 @@ class CandidateData:
             'file': self.file,
             'frame_idx': self.frame_idx,
             'timestamp_s': round(self.timestamp_s, 6),
-            'noise_floor_uV': round(self.noise_floor * 1e6, 2),
-            'std_noise_uV': round(self.std_noise * 1e6, 2),
+            # mV since the iFFT amplitude-scale fix — the reconstructed signal is
+            # now in true volts, so these land in the mV range. CSVs exported before
+            # that fix carry uV columns 256x smaller; the 17 feature columns are
+            # dimensionless ratios and are unaffected, so old and new training sets
+            # remain comparable. See docs/fft_and_ifft/IFFT_AMPLITUDE_SCALE_FIX.md
+            'noise_floor_mV': round(self.noise_floor * 1e3, 4),
+            'std_noise_mV': round(self.std_noise * 1e3, 4),
             'E_hat_floor': round(self.E_hat_floor, 6),
             'peak_SNR': round(self.peak_SNR, 3),
             'pre_SNR': round(self.pre_SNR, 3),
@@ -606,8 +611,8 @@ def _draw_feature_footer(
     # (label, [value strings]) — one line per group
     tau_str = f"{c.tau_ms:.4f} ms" if c.tau_ms > 0 else "N/A"
     groups = [
-        ("Noise",    [f"floor = {c.noise_floor * 1e6:.2f} µV",
-                      f"std = {c.std_noise * 1e6:.2f} µV",
+        ("Noise",    [f"floor = {c.noise_floor * 1e3:.4f} mV",
+                      f"std = {c.std_noise * 1e3:.4f} mV",
                       f"Ê_floor = {c.E_hat_floor:.3e}"]),
         ("SNR",      [f"peak = {c.peak_SNR:.2f}",
                       f"pre = {c.pre_SNR:.2f}",
@@ -670,7 +675,7 @@ def _render_candidate_screenshot(
       │                            │  fit (green dashed, if R²>0.1)        │
       │                            │  noise floor (cyan) + ±std (purple)   │
       ├──────────────── feature footer (6 lines) ───────────────────────────┤
-      │  Noise:    floor = … µV  │  std = … µV  │  Ê_floor = …            │
+      │  Noise:    floor = … mV  │  std = … mV  │  Ê_floor = …            │
       │  SNR:      peak = …  │  pre = …  │  post = …                       │
       │  Shape:    rise = … ms  │  fall = … ms  │  asymmetry = …           │
       │  ZCR:      pre = …  │  click = …  │  post = …                      │

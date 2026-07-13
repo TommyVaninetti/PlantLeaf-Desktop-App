@@ -435,17 +435,35 @@ def reconstruct_frame_v5(
           to form a complex spectrum.
         • Apply a Tukey (cosine-bell) taper to the analysis-band edges of the
           complex spectrum to reduce spectral leakage.
+        • Multiply by N/2 to undo the firmware's own 2/N normalization — see
+          the AMPLITUDE SCALE note below.
 
       Step 2 — iFFT:
-        • np.fft.irfft → fft_size real samples.
+        • np.fft.irfft → fft_size real samples, in VOLTS.
 
       Step 3 — Gibbs suppression:
         • suppress_edge_artifacts() with symmetric AND condition.
 
+    AMPLITUDE SCALE
+    ---------------
+    The firmware transmits magnitudes that are ALREADY amplitudes in volts: it
+    converts ADC counts to volts before the FFT (main_with_phase.c:118) and then
+    scales every bin by 2/N afterwards (main_with_phase.c:224). np.fft.irfft, by
+    contrast, expects RAW (unnormalized) rfft coefficients and supplies its own
+    1/N. Feeding the transmitted magnitudes straight to irfft therefore applied
+    2/N twice and produced a signal N/2 = 256x too small — clicks appeared as
+    ~10 uV, which is 70x below one ADC quantization step (3.3/4095 = 806 uV) and
+    hence physically impossible. Step 1e restores the raw-FFT scale, so `signal`
+    is now in true volts and clicks read in mV.
+
+    See docs/fft_and_ifft/IFFT_AMPLITUDE_SCALE_FIX.md for the full derivation and
+    the proof that all 17 v5 features (being dimensionless ratios) are unchanged.
+
     Parameters
     ----------
     fft_mags : np.ndarray
-        Raw FFT magnitudes for the analysis band only (up to _K_BINS = 154 values).
+        FFT magnitudes for the analysis band only (up to _K_BINS = 154 values).
+        Already amplitude-normalized by the firmware → units of volts.
     phase_int8 : np.ndarray
         Phase values for the same bins, encoded as int8 [-127, +127] → [-π, +π].
     fs : int
@@ -502,6 +520,14 @@ def reconstruct_frame_v5(
         taper_val = 0.5 * (1.0 - np.cos(np.pi * alpha))
         complex_spectrum[bin_start + i]              *= taper_val  # left edge
         complex_spectrum[bin_start + n_bins - 1 - i] *= taper_val  # right edge
+
+    # ── Step 1e: restore the raw-FFT scale ───────────────────────────────────
+    # The firmware already divides every magnitude by N/2 (main_with_phase.c:224,
+    # FFT_NORMALIZATION_FACTOR_NORMAL = 2/FFT_BUFFER_SIZE), so fft_mags are
+    # AMPLITUDES in volts, not raw FFT coefficients. np.fft.irfft expects raw
+    # coefficients and applies its own 1/N — without this factor the 2/N lands
+    # twice and the reconstruction comes out N/2 = 256x too small.
+    complex_spectrum = complex_spectrum * (fft_size / 2.0)
 
     # ── Step 2: iFFT ─────────────────────────────────────────────────────────
     try:

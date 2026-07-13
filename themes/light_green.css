@@ -289,26 +289,3 @@ QPlainTextEdit, QTextEdit {
 QPlainTextEdit:focus, QTextEdit:focus {
     border-color: #81c784;
 }
-
-/* ==== QSlider ==== */
-QSlider::groove:horizontal {
-    background: #a5d6a7;
-    height: 6px;
-    border-radius: 3px;
-}
-QSlider::handle:horizontal {
-    background: #5a7559;
-    border: 2px solid #5a7559;
-    width: 16px;
-    height: 16px;
-    margin: -5px 0;
-    border-radius: 8px;
-}
-QSlider::sub-page:horizontal {
-    background: #689f67;
-    border-radius: 3px;
-}
-QSlider::add-page:horizontal {
-    background: #c8e6c9;
-    border-radius: 3px;
-}
