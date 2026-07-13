@@ -57,7 +57,16 @@ from core.click_pipeline_v5 import (
     _BIN_START as V5_BIN_START,
     _BIN_END   as V5_BIN_END,
     K_STAGE1_DEFAULT,
+    LEVEL_STD_FACTOR,
+    BIN_START_HZ as V5_BAND_LO_HZ,
+    BIN_END_HZ   as V5_BAND_HI_HZ,
 )
+
+
+#: Below this, an onset→decay_end span is a noise excursion rather than a click,
+#: and its spectrum would carry a resolution of tens of kHz — i.e. nothing usable.
+#: The Region FFT dialog falls back to the whole frame instead.
+MIN_CLICK_REGION_SAMPLES = 16
 
 
 def fmt_volts(value, decimals=3):
@@ -401,6 +410,17 @@ class IFFTWindow(QDialog):
         self.toggle_ifft_button.clicked.connect(self.toggle_ifft_signal)
         button_layout.addWidget(self.toggle_ifft_button)
 
+        # PULSANTE FFT DELLA REGIONE (spettro della regione fittata / a scelta)
+        self.region_fft_button = QPushButton("FFT of Region")
+        self.region_fft_button.setToolTip(
+            "Spectrum of the fitted click region (Ctrl+F).\n"
+            "Opens on the decay window if one exists, and lets you drag the\n"
+            "selection to analyse any other part of the signal."
+        )
+        self.region_fft_button.setShortcut("Ctrl+F")
+        self.region_fft_button.clicked.connect(self.open_region_fft)
+        button_layout.addWidget(self.region_fft_button)
+
         self.info_label = QLabel("📊 Raw iFFT signal (no correction)")
         self.info_label.setStyleSheet("color: #888; font-size: 10pt;")
         button_layout.addWidget(self.info_label)
@@ -446,6 +466,15 @@ class IFFTWindow(QDialog):
         actionShowOnlyEnvelope = QAction("Show Only Envelope", self)
         actionShowOnlyEnvelope.triggered.connect(self.toggle_ifft_signal)
         analysis_menu.addAction(actionShowOnlyEnvelope)
+
+        analysis_menu.addSeparator()
+
+        actionRegionFFT = QAction("FFT of Region…", self)
+        actionRegionFFT.setShortcut("Ctrl+F")
+        actionRegionFFT.triggered.connect(self.open_region_fft)
+        analysis_menu.addAction(actionRegionFFT)
+
+        analysis_menu.addSeparator()
 
         actionClose = QAction("Close", self)
         actionClose.triggered.connect(self.close)
@@ -1028,6 +1057,278 @@ class IFFTWindow(QDialog):
                     QPushButton:hover { background-color: #e0e0e0; }
                 """)
         dialog.exec()
+
+    # ── FFT of Region ────────────────────────────────────────────────────────
+
+    def _build_frame_context(self):
+        """
+        Stitch frames fi-1, fi, fi+1 into one continuous trace.
+
+        A click's decay routinely runs past the end of its own 512-sample frame:
+        find_decay_window_v5() already concatenates the NEXT frame's envelope and
+        can return decay_end > 511. There is no time-domain equivalent in the
+        pipeline, so we build one here. The previous frame is included so the
+        pre-click noise window is reachable too.
+
+        Each frame is reconstructed independently (own Tukey taper, own Gibbs
+        suppression), so the joins carry a mild seam — we return their positions
+        so the dialog can draw them honestly rather than hiding them.
+
+        Returns
+        -------
+        dict or None:
+            'time'     : absolute time axis [s]
+            'signal'   : stitched samples [V]
+            'envelope' : Hilbert envelope of the stitched signal
+            'origin'   : index, within `signal`, of sample 0 of the CURRENT frame
+            'seams'    : absolute times of the frame joins [s]
+            'fs', 'fft_size'
+        """
+        dm = getattr(self.parent, 'data_manager', None)
+        if dm is None or self.frame_index is None:
+            return None
+
+        fi = int(self.frame_index)
+        fs = dm.header_info.get('fs', V5_FS)
+        fft_size = dm.header_info.get('fft_size', V5_FFT_SIZE)
+
+        def reco(idx):
+            if idx < 0 or idx >= dm.total_frames or idx >= len(dm.fft_data):
+                return None
+            phases = dm.phase_data[idx] if idx < len(dm.phase_data) else np.array([], dtype=np.int8)
+            fr = reconstruct_frame_v5(
+                np.asarray(dm.fft_data[idx], dtype=np.float64),
+                np.asarray(phases, dtype=np.int8),
+                fs, fft_size, normalize=self.is_normalized,
+            )
+            return fr['signal'] if fr is not None else None
+
+        prev_sig, cur_sig, next_sig = reco(fi - 1), reco(fi), reco(fi + 1)
+        if cur_sig is None:
+            return None
+
+        parts = []
+        seam_idx = []
+        if prev_sig is not None:
+            parts.append(prev_sig)
+            seam_idx.append(len(prev_sig))
+        origin = sum(len(p) for p in parts)
+        parts.append(cur_sig)
+        if next_sig is not None:
+            seam_idx.append(sum(len(p) for p in parts))
+            parts.append(next_sig)
+
+        signal = np.concatenate(parts)
+
+        # Absolute time: sample `origin` is the start of frame fi.
+        frame_start = fi * (fft_size / fs)
+        time = frame_start + (np.arange(len(signal)) - origin) / fs
+
+        return {
+            'time': time,
+            'signal': signal,
+            'envelope': compute_hilbert_envelope(signal),
+            'origin': origin,
+            'seams': [float(time[i]) for i in seam_idx if 0 <= i < len(time)],
+            'fs': fs,
+            'fft_size': fft_size,
+        }
+
+    def _find_click_onset(self, ctx, peak_in_ext, level):
+        """
+        Locate where the click emerged from the noise: scanning BACKWARD from the
+        peak, the last envelope sample still below
+        LEVEL = noise_floor + LEVEL_STD_FACTOR × std_noise.
+
+        This is exactly the boundary the v5 pipeline itself uses — `rise_start` in
+        _feat_rise_fall_time, and the pre-window boundary in _build_pre_window,
+        which is why the pre-click noise window ends here.
+
+        The search runs over the STITCHED envelope, not the current frame alone,
+        so an onset that falls in the previous frame is found rather than clamped
+        away (_build_pre_window extends into the previous frame for the same
+        reason). Returns an index into ctx['signal'].
+        """
+        env_ext = ctx['envelope']
+        for n in range(int(peak_in_ext) - 1, -1, -1):
+            if env_ext[n] < level:
+                return n
+        return 0        # never dropped below LEVEL — the click fills the context
+
+    def _resolve_fitted_region(self, ctx):
+        """
+        Locate the click region, "if it exists".
+
+        The analysed region runs from the click's ONSET (where the envelope first
+        rises above LEVEL) to `decay_end`, so the spectrum covers the whole event
+        — attack and decay — rather than only its tail. `decay_start → decay_end`
+        remains available as a preset.
+
+        Reuses the result of Analyze Decay when it has already been run, and
+        otherwise computes the decay window on the fly — so the user is NOT
+        forced to press Analyze Decay first.
+
+        Returns (region, markers, banner), where `region` is (t0, t1) in absolute
+        seconds and `banner` is None when a genuine fit was found.
+        """
+        dm = getattr(self.parent, 'data_manager', None)
+        fi = int(self.frame_index) if self.frame_index is not None else 0
+        fs, origin = ctx['fs'], ctx['origin']
+        time = ctx['time']
+
+        def t_of(sample_in_frame):
+            """Frame-relative sample index → absolute time, clipped to the trace."""
+            return t_ext(origin + sample_in_frame)
+
+        def t_ext(sample_in_ext):
+            """Stitched-context sample index → absolute time."""
+            i = int(np.clip(sample_in_ext, 0, len(time) - 1))
+            return float(time[i])
+
+        whole_frame = (t_of(0), t_of(len(self.signal_data_raw) - 1))
+
+        # Noise estimates — without them there is neither a LEVEL nor a decay window.
+        if dm is None or fi >= len(dm.noise_floor_arr) or fi >= len(dm.std_noise_arr):
+            return whole_frame, {}, ("No adaptive noise estimate for this frame — "
+                                     "showing the whole frame. Drag the region to analyse "
+                                     "any part of the signal.")
+
+        noise_floor = float(dm.noise_floor_arr[fi])
+        std_noise = float(dm.std_noise_arr[fi])
+
+        signal = self.signal_data_normalized if self.is_normalized else self.signal_data_raw
+        envelope = compute_hilbert_envelope(signal)
+        peak_idx, _ = find_peak(envelope)
+
+        # Next frame's envelope, so decay_end may legitimately exceed 511.
+        next_env = None
+        if origin + len(signal) < len(ctx['signal']):
+            next_env = compute_hilbert_envelope(ctx['signal'][origin + len(signal):])
+
+        window = find_decay_window_v5(envelope, peak_idx, noise_floor, std_noise, next_env)
+        d_start = int(window['decay_start'])
+        d_end = int(window['decay_end'])
+
+        # ── Click onset — the same LEVEL crossing the v5 features use ─────────
+        level = noise_floor + LEVEL_STD_FACTOR * std_noise
+        onset_ext = self._find_click_onset(ctx, origin + peak_idx, level)
+
+        markers = {
+            'click start': t_ext(onset_ext),
+            'peak': t_of(peak_idx),
+            'decay start': t_of(d_start),
+            'decay end': t_of(d_end),
+        }
+
+        if d_end <= d_start:
+            return whole_frame, markers, ("No decay window could be located — "
+                                          "showing the whole frame.")
+
+        self._region_peak_idx = peak_idx
+        self._region_decay = (d_start, d_end)
+        self._region_onset_ext = onset_ext
+
+        # On a frame with no real click the "peak" is just a noise excursion, so
+        # onset and decay_end collapse onto each other. A handful of samples has
+        # no usable spectrum (Δf would be tens of kHz), so fall back to the whole
+        # frame and say so, rather than showing a meaningless curve.
+        n_region = (origin + d_end) - onset_ext
+        if n_region < MIN_CLICK_REGION_SAMPLES:
+            return whole_frame, markers, (
+                f"No click-like region in this frame (only {n_region} samples "
+                f"between onset and decay end) — showing the whole frame.")
+
+        # Default: the WHOLE click — onset through the end of the decay.
+        region = (t_ext(onset_ext), t_of(d_end))
+
+        # Is it a *valid fit*, or just a decay window?
+        if self._last_v5_features is not None:
+            tau = self._last_v5_features.get('tau_ms')
+        else:
+            tau = _fit_decay_segment(
+                window['extended_envelope'], d_start, d_end, fs
+            ).get('tau_ms')
+
+        banner = None
+        if tau is None or tau <= 0:
+            banner = ("No valid exponential fit for this frame (τ undefined) — "
+                      "the region shown is onset → raw decay window.")
+
+        return region, markers, banner
+
+    def open_region_fft(self):
+        """Open the Region FFT dialog on the fitted click region (Ctrl+F)."""
+        from components.region_fft_dialog import RegionFFTDialog
+        from core.click_pipeline_v5 import PRE_WINDOW_SAMPLES
+
+        ctx = self._build_frame_context()
+        if ctx is None:
+            QMessageBox.warning(self, "Region FFT",
+                                "Could not reconstruct this frame for spectral analysis.")
+            return
+
+        region, markers, banner = self._resolve_fitted_region(ctx)
+
+        origin, fs, time = ctx['origin'], ctx['fs'], ctx['time']
+        n_frame = len(self.signal_data_raw)
+
+        def t_of(s):
+            return float(time[int(np.clip(origin + s, 0, len(time) - 1))])
+
+        def t_ext(s):
+            return float(time[int(np.clip(s, 0, len(time) - 1))])
+
+        # ── Presets ──────────────────────────────────────────────────────────
+        # Default = the whole click: onset → decay end.
+        #
+        # There is deliberately no "decay start → decay end" preset: decay_start
+        # lands on (or within a couple of samples of) the peak in practice, so it
+        # was indistinguishable from "Peak → decay end".
+        presets = [("Click (onset → decay end)", region)]
+
+        peak_idx = getattr(self, '_region_peak_idx', None)
+        decay = getattr(self, '_region_decay', None)
+        onset_ext = getattr(self, '_region_onset_ext', None)
+
+        if peak_idx is not None and decay is not None:
+            presets.append(("Peak → decay end", (t_of(peak_idx), t_of(decay[1]))))
+        presets.append(("Whole frame", (t_of(0), t_of(n_frame - 1))))
+
+        # Pre-click noise: the PRE_WINDOW_SAMPLES immediately BEFORE the onset —
+        # the same window _build_pre_window feeds to pre_SNR / ZCR_pre.
+        if onset_ext is not None and onset_ext - PRE_WINDOW_SAMPLES >= 0:
+            presets.append(("Pre-click noise",
+                            (t_ext(onset_ext - PRE_WINDOW_SAMPLES), t_ext(onset_ext))))
+
+        # Reference overlay: the frame's transmitted spectrum. Since the iFFT
+        # scale fix both are in true volts, so they share one axis directly.
+        reference = None
+        dm = self.parent.data_manager
+        fi = int(self.frame_index)
+        if fi < len(dm.fft_data):
+            freqs, mags = self.parent._compute_fft_for_display(fi)
+            reference = (np.asarray(freqs), np.asarray(mags), "Frame FFT (transmitted)")
+
+        title = f"FFT of Region — Frame {fi}"
+        title += "  [Normalized]" if self.is_normalized else "  [Raw]"
+
+        self._region_fft_win = RegionFFTDialog(
+            ctx['time'], ctx['signal'], fs,
+            parent=self,
+            theme_manager=getattr(self.parent, 'theme_manager', None),
+            unit_y='V',
+            title=title,
+            band=(V5_BAND_LO_HZ, V5_BAND_HI_HZ),      # 20–80 kHz analysis band
+            initial_region=region,
+            markers=markers,
+            seams=ctx['seams'],
+            presets=presets,
+            reference=reference,
+            banner=banner,
+        )
+        self._region_fft_win.show()
+
+
 # Signal processing utilities (compute_hilbert_envelope, find_peak,
 # suppress_edge_artifacts, run_fit_pipeline_v5, etc.) are now in
 # core/click_pipeline_v5.py and imported at the top of this file.
