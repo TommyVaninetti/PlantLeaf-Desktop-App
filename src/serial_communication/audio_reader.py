@@ -26,6 +26,14 @@ class AudioSerialWorker(QtCore.QThread):
     new_data = Signal(np.ndarray, np.ndarray, float, int, bool, float)
     # ↑ magnitudes, ↑ phases, max_amp, peak_bin, above_threshold, threshold
 
+    # Frame layout (must match the firmware's sendFFT_20_80kHz_with_peak):
+    #   header:   0xAA 0x55, uint16 LE payload length
+    #   payload:  float32 max_amplitude, uint16 peak_bin, uint8 above_threshold,
+    #             float32 threshold, 154 x float32 magnitudes, 154 x int8 phases
+    NUM_BINS = 154                                   # bins 51..204 = 20-80 kHz
+    METADATA_SIZE = 4 + 2 + 1 + 4                    # 11 bytes
+    EXPECTED_PAYLOAD = METADATA_SIZE + NUM_BINS * 4 + NUM_BINS   # 781 bytes
+
     serial_connection_status_bool = Signal(bool)  # <--- aggiungi questo segnale
     error_popup = Signal(str)  # aggiungi questo segnale
 
@@ -43,7 +51,12 @@ class AudioSerialWorker(QtCore.QThread):
     def connection(self):
         try:
             print(f"Tentativo di apertura porta seriale: {self.serial_port}")
-            self.ser = serial.Serial(self.serial_port, baudrate=115200) #la connessione è VIRTUAL COM quindi non imposta il baudrate
+            # Virtual COM port: the baudrate value is ignored by USB CDC.
+            # The read timeout keeps the acquisition loop supervisable: a
+            # blocked read() returns after 1 s instead of hanging forever,
+            # so the thread re-checks is_running and can exit cleanly
+            # (previously shutdown relied on close() raising in the reader).
+            self.ser = serial.Serial(self.serial_port, baudrate=115200, timeout=1.0)
             self.is_connected = True
             self.serial_connection_status_bool.emit(self.is_connected)  # <--- emetti il segnale quando la porta si disconnette
             print(f"🔌 Connessione seriale avvenuta su {self.serial_port}")
@@ -66,64 +79,91 @@ class AudioSerialWorker(QtCore.QThread):
                     print("⚠️ Porta seriale chiusa durante il loop.")
                     break
 
-                # Leggi header (4 byte)
-                header = self.ser.read(4)
-                if len(header) < 4:
+                # === FRAME SYNC (byte-slip resync) ===
+                # Scan the byte stream one byte at a time until a real frame
+                # header is found. Advancing a single byte at a time (instead
+                # of a fixed 4-byte read) guarantees deterministic recovery
+                # within one frame after any desync: a truncated frame, a
+                # dropped byte, or connecting mid-stream. A 0xAA 0x55 pair
+                # can also legitimately occur INSIDE float payload data, so
+                # a candidate header is only accepted if its length field
+                # matches the one valid frame size - fake headers are
+                # rejected before their garbage 'length' can swallow real
+                # data (the old reader could read up to 64 KB of good bytes
+                # as one bogus payload, and its garbage peak_bin could crash
+                # the GUI with an IndexError).
+                b = self.ser.read(1)
+                if len(b) < 1 or b[0] != 0xAA:
+                    continue  # timeout or not a header start: slide one byte
+
+                # Consume a run of 0xAA bytes so that in '... AA AA 55' the
+                # last AA is still recognized as the true header start.
+                b = self.ser.read(1)
+                while len(b) == 1 and b[0] == 0xAA:
+                    b = self.ser.read(1)
+                if len(b) < 1 or b[0] != 0x55:
+                    continue  # not a header: keep scanning
+
+                # === LENGTH VALIDATION ===
+                len_bytes = self.ser.read(2)
+                if len(len_bytes) < 2:
+                    continue
+                payload_length = struct.unpack('<H', len_bytes)[0]
+                if payload_length != self.EXPECTED_PAYLOAD:
+                    # Fake header (sync pattern inside payload data) or a
+                    # protocol change: reject and resume scanning. Nothing
+                    # is consumed beyond the 4 header bytes.
                     continue
 
-                if header[0] != 0xAA or header[1] != 0x55:
-                    continue
-
-                # Lunghezza payload
-                payload_length = struct.unpack('<H', header[2:4])[0]
-                
-
-                # Leggi payload
+                # === PAYLOAD (781 bytes) ===
                 packet_data = self.ser.read(payload_length)
-
-                # Verifica dimensione effettiva
                 if len(packet_data) != payload_length:
-                    continue
+                    continue  # short read (timeout/disconnect): resync
 
+                # === METADATA (11 bytes) ===
                 offset = 0
-
-                # === METADATA (11 byte) ===
                 max_amplitude = struct.unpack('<f', packet_data[offset:offset+4])[0]
                 offset += 4
                 peak_bin = struct.unpack('<H', packet_data[offset:offset+2])[0]
                 offset += 2
-                above_threshold = bool(struct.unpack('<B', packet_data[offset:offset+1])[0])
+                above_threshold = bool(packet_data[offset])
                 offset += 1
                 current_threshold = struct.unpack('<f', packet_data[offset:offset+4])[0]
                 offset += 4
 
-                # === MAGNITUDINI FFT (154 bin × 4 byte = 616 byte) ===
-                num_bins = 154  # ✅ FISSO per 20-80 kHz
-                fft_bytes_size = num_bins * 4  # 616 byte
-                
-                if len(packet_data) - offset < fft_bytes_size:
+                # Sanity check on decoded content: peak_bin is an index into
+                # the 154 transmitted bins. An out-of-range value means the
+                # frame is corrupt even though the framing looked right.
+                # NOTE: framing + length checks cannot catch every corruption.
+                # If a frame is truncated mid-stream (e.g. firmware TX abort),
+                # its intact header swallows the following bytes as payload;
+                # at most ~2 frames (~5 ms) are lost before the scanner
+                # re-locks on the next real header. Only a checksum in the
+                # wire protocol could close that gap completely.
+                if peak_bin >= self.NUM_BINS:
                     continue
 
-                fft_data_bytes = packet_data[offset:offset + fft_bytes_size]
-                
-                if len(fft_data_bytes) % 4 != 0:
-                    continue
-                
-                fft_data = np.frombuffer(fft_data_bytes, dtype=np.float32)
+                # === FFT MAGNITUDES (154 x float32 = 616 bytes) ===
+                fft_bytes_size = self.NUM_BINS * 4
+                fft_data = np.frombuffer(
+                    packet_data[offset:offset + fft_bytes_size], dtype=np.float32)
                 offset += fft_bytes_size
 
-                # === FASI FFT (154 bin × 1 byte = 154 byte) ===
-                phase_bytes_size = num_bins  # 154 byte
-                
-                if len(packet_data) - offset < phase_bytes_size:
+                # Content sanity: real magnitudes are finite voltages (the
+                # firmware sends |FFT|/N in volts). NaN/Inf here means the
+                # payload bytes are not a real frame - drop it before it
+                # reaches the plot, the click detector or the save buffer.
+                if not (np.isfinite(max_amplitude) and
+                        np.isfinite(current_threshold) and
+                        np.isfinite(fft_data).all()):
                     continue
 
-                phase_data_bytes = packet_data[offset:offset + phase_bytes_size]
-                fft_phases = np.frombuffer(phase_data_bytes, dtype=np.int8)
-                offset += phase_bytes_size
+                # === FFT PHASES (154 x int8 = 154 bytes) ===
+                fft_phases = np.frombuffer(
+                    packet_data[offset:offset + self.NUM_BINS], dtype=np.int8)
 
-                # Emetti dati
-                self.new_data.emit(fft_data, fft_phases, max_amplitude, peak_bin, 
+                # Emit the decoded frame to the GUI thread
+                self.new_data.emit(fft_data, fft_phases, max_amplitude, peak_bin,
                                 above_threshold, current_threshold)
 
         except serial.SerialException as e:

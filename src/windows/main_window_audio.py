@@ -145,9 +145,14 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         bin_start = int(self.freq_min / bin_freq)
         bin_end = int(self.freq_max / bin_freq)
         num_bins = bin_end - bin_start + 1
-        
-        # Crea array frequenze corretto
-        self.data_x = np.linspace(self.freq_min, self.freq_max, num_bins)
+
+        # X axis = the true FFT bin center frequencies transmitted by the
+        # firmware: (bin_start + k) * bin_freq for k = 0..num_bins-1, i.e.
+        # 19921.875 .. 79687.5 Hz in 390.625 Hz steps. A linspace between
+        # the nominal 20 kHz / 80 kHz band edges would skew every label by
+        # up to ~312 Hz at the top of the band, because the true bin grid
+        # neither starts at exactly 20 kHz nor is spaced 60 kHz/153.
+        self.data_x = np.arange(bin_start, bin_start + num_bins) * bin_freq
 
         # Variabili per click detection OTTIMIZZATE
         self.click_active = False
@@ -290,6 +295,12 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
 
     def check_for_clicks_optimized(self, max_amplitude, peak_bin, above_threshold):
         """Controlla se c'è un click basato sui dati FFT ricevuti"""
+
+        # Defense in depth: peak_bin comes from the serial stream. The reader
+        # validates frame framing, but a corrupted frame must never be able to
+        # crash the GUI thread with an IndexError here - drop it instead.
+        if not (0 <= peak_bin < len(self.data_x)):
+            return
 
         current_time_us = time.time() * 1_000_000
         peak_frequency = self.data_x[peak_bin]
