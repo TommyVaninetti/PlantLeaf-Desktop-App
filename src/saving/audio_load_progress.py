@@ -225,9 +225,21 @@ class AudioLoadWorker(QObject):
                 if samples_per_fft == 0 or samples_per_fft > 200:
                     samples_per_fft = 154
 
-                freq_min = header_info['freq_min']
-                freq_max = header_info['freq_max']
-                frequency_axis = np.linspace(freq_min, freq_max, samples_per_fft)
+                # Frequency axis = the true FFT bin centers recorded by the
+                # firmware: (bin_start + k) * fs/fft_size, i.e. 19921.875 ..
+                # 79687.5 Hz in 390.625 Hz steps. freq_min/freq_max in the
+                # header are nominal band descriptors (20/80 kHz) used only to
+                # locate bin_start; a linspace between them would skew every
+                # frequency by up to ~312 Hz at the top of the band and
+                # disagree with the live window and the region-FFT axis.
+                # Rebuilt from fs/fft_size on every load, this is correct for
+                # old and new recordings alike (the firmware bins never
+                # changed - only the displayed axis was ever wrong).
+                fs = header_info.get('fs', 200000)
+                fft_size = header_info.get('fft_size', 512)
+                bin_freq = fs / fft_size
+                bin_start = int(header_info['freq_min'] / bin_freq)
+                frequency_axis = (bin_start + np.arange(samples_per_fft)) * bin_freq
 
                 # STEP 3: Click events
                 # CHECKPOINT 59%
