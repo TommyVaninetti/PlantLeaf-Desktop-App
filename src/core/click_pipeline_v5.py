@@ -465,7 +465,8 @@ def reconstruct_frame_v5(
         FFT magnitudes for the analysis band only (up to _K_BINS = 154 values).
         Already amplitude-normalized by the firmware → units of volts.
     phase_int8 : np.ndarray
-        Phase values for the same bins, encoded as int8 [-127, +127] → [-π, +π].
+        Phase values for the same bins, encoded as int8 on the firmware's
+        128-counts-per-π scale: [-128, +127] → [-π, +π).
     fs : int
         Sampling rate [Hz].
     fft_size : int
@@ -507,8 +508,11 @@ def reconstruct_frame_v5(
         fft_norm = full_mag.copy()   # skip correction
 
     # ── Step 1c: build complex spectrum ──────────────────────────────────────
-    # int8 phase [-127, +127] maps linearly to [-π, +π]
-    phases_rad       = (full_phase.astype(np.float64) / 127.0) * np.pi
+    # int8 phase decode on the firmware's 128-counts-per-π scale:
+    # [-128, +127] → [-π, +π). The firmware LUT is generated as
+    # round(atan(i/255)·128/π) with 64 = 90°, so the divisor must be 128
+    # (see docs/fft_and_ifft/FFT_PHASE_TECHNICAL_SPECIFICATION.md §4.2).
+    phases_rad       = (full_phase.astype(np.float64) / 128.0) * np.pi
     complex_spectrum = fft_norm * np.exp(1j * phases_rad)
 
     # ── Step 1d: Tukey taper on the analysis-band edges ──────────────────────
