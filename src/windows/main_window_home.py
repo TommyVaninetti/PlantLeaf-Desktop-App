@@ -47,6 +47,7 @@ class MainWindowHome(BaseWindow):
         self.actionLicense = QAction("License", self)
         self.actionOpenFile = QAction("Open File", self)
         self.actionDataCollection = QAction("Export Data Collection", self)
+        self.actionClickReview = QAction("Review && Label Clicks", self)
         self.actionDark = QAction("Dark", self)
         self.actionDark_Green = QAction("Dark Green", self)
         self.actionDark_Blue = QAction("Dark Blue", self)
@@ -95,6 +96,8 @@ class MainWindowHome(BaseWindow):
         menu_file.addSeparator()
         menu_file.addAction(self.actionDataCollection)
         self.actionDataCollection.setShortcut("Ctrl+E")
+        menu_file.addAction(self.actionClickReview)
+        self.actionClickReview.setShortcut("Ctrl+R")
 
         # Menu Settings (solo temi e font)
         menu_settings = QMenu("Settings", self)
@@ -147,6 +150,7 @@ class MainWindowHome(BaseWindow):
             (self.actionLicense, self.license_action),
             (self.actionOpenFile, self.open_file_action),
             (self.actionDataCollection, self._on_open_data_collection_dialog),
+            (self.actionClickReview, self._on_open_click_review_dialog),
             (self.actionDark, lambda: self.update_style(theme_name="dark.css")),
             (self.actionDark_Green, lambda: self.update_style(theme_name="dark_green.css")),
             (self.actionDark_Blue, lambda: self.update_style(theme_name="dark_blue.css")),
@@ -344,5 +348,17 @@ class MainWindowHome(BaseWindow):
             dialog.exec()
         except Exception as e:
             self.show_error_dialog("Error", f"Failed to open data collection dialog: {e}")
+
+    def _on_open_click_review_dialog(self):
+        """Open the labelling dialog on a candidates CSV."""
+        try:
+            from components.click_review_dialog import ClickReviewDialog
+            dialog = ClickReviewDialog(
+                parent=self,
+                theme_manager=getattr(self, 'theme_manager', None),
+            )
+            dialog.exec()
+        except Exception as e:
+            self.show_error_dialog("Error", f"Failed to open click review dialog: {e}")
 
 

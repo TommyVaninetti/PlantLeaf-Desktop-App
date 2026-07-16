@@ -191,6 +191,14 @@ class ReplayBaseWindow(FileHandlerMixin, QMainWindow):
             self.actionDataCollection.triggered.connect(self._on_open_data_collection_dialog)
             file_menu.addAction(self.actionDataCollection)
 
+            # LABELLING / REVIEW
+            self.actionClickReview = QAction("Review && Label Clicks", self)
+            self.actionClickReview.setToolTip(
+                "Open a candidates CSV to label each candidate and compare with the algorithm"
+            )
+            self.actionClickReview.triggered.connect(self._on_open_click_review_dialog)
+            file_menu.addAction(self.actionClickReview)
+
         self.actionMath = QAction("Select Region for Analysis", self)
         self.actionMath.setToolTip("Select a region in the plot to perform mathematical analysis")
         # Azione per aprire popup per aprire analisi salvate

@@ -27,13 +27,14 @@ ARCHITETTURA MULTI-LEVEL:
 
 import numpy as np
 import os
-from PySide6.QtWidgets import (QVBoxLayout, QHBoxLayout, QWidget, QTabWidget, 
-                              QSplitter, QTableWidget, QTableWidgetItem, 
+from pathlib import Path
+from PySide6.QtWidgets import (QVBoxLayout, QHBoxLayout, QWidget, QTabWidget,
+                              QSplitter, QTableWidget, QTableWidgetItem,
                               QHeaderView, QLabel, QPushButton, QMessageBox,
                               QSlider, QDoubleSpinBox, QSizePolicy, QDialog,
-                              QProgressDialog)
-from PySide6.QtCore import Qt, QTimer, QCoreApplication
-from PySide6.QtGui import QAction, QFont
+                              QProgressDialog, QComboBox, QMenu, QFileDialog)
+from PySide6.QtCore import Qt, QTimer, QCoreApplication, QThread
+from PySide6.QtGui import QAction, QFont, QColor
 from PySide6 import QtCore
 
 from core.replay_base_window import ReplayBaseWindow
@@ -1973,7 +1974,87 @@ class ReplayWindowAudio(ReplayBaseWindow):
 
         self.click_tab_widget.addTab(self.peak_table, "Above Threshold")
 
-       
+        ####
+
+        # TERZA TABELLA: i click confermati dall'algoritmo v5 (stage 1 → 2 → 3 → 4).
+        # Le altre due tabelle mostrano ciò che il firmware ha registrato e ciò che
+        # supera una soglia: questa mostra il verdetto del modello.
+        self.detection_table = QTableWidget()
+        self.detection_table.setColumnCount(8)
+        self.detection_table.setHorizontalHeaderLabels([
+            "Timestamp", "Frame", "P(click)", "τ (ms)", "R²",
+            "Peak SNR", "FPE (kHz)", "Verdict",
+        ])
+
+        self.detection_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.detection_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.detection_table.setAlternatingRowColors(True)
+
+        self.detection_table.itemDoubleClicked.connect(self._on_click_table_double_clicked)
+
+        # Right-click → open that frame in the iFFT window, which is where a click
+        # actually gets inspected.
+        self.detection_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.detection_table.customContextMenuRequested.connect(
+            self._on_detection_table_context_menu
+        )
+
+        det_header = self.detection_table.horizontalHeader()
+        for _c in range(7):
+            det_header.setSectionResizeMode(_c, QHeaderView.ResizeToContents)
+        det_header.setSectionResizeMode(7, QHeaderView.Stretch)
+
+        self.detection_table.verticalHeader().setVisible(False)
+
+        self.detection_table.setToolTip(
+            "Double-click a row to jump to that detection.\n"
+            "Right-click to open the frame in the iFFT window."
+        )
+
+        self.click_tab_widget.addTab(self.detection_table, "Detected Clicks (v5)")
+
+        # Holds the last full detection run (every Stage 1 candidate, annotated), so
+        # switching between 'confirmed only' and 'all candidates' is a re-filter of
+        # results already computed rather than a second pass over the recording.
+        self._v5_detections = []
+
+        # ── Control row for the v5 detector ──
+        detect_layout = QHBoxLayout()
+
+        self.btn_detect_clicks = QPushButton("Detect Clicks (v5)")
+        self.btn_detect_clicks.setToolTip(
+            "Run the full v5 pipeline (stages 1-4) on this recording.\n"
+            "Uses the k value set below."
+        )
+        self.btn_detect_clicks.clicked.connect(self._on_detect_clicks)
+        detect_layout.addWidget(self.btn_detect_clicks)
+
+        detect_layout.addWidget(QLabel("Show:"))
+        from components.wide_combo_box import WideComboBox
+        self.combo_detect_show = WideComboBox()
+        self.combo_detect_show.addItems(["Confirmed only", "All candidates"])
+        self.combo_detect_show.setToolTip(
+            "Confirmed = survived all four stages.\n"
+            "All candidates = every Stage 1 hit, with the stage that rejected it."
+        )
+        self.combo_detect_show.currentIndexChanged.connect(self._refresh_detection_table)
+        detect_layout.addWidget(self.combo_detect_show)
+
+        self.btn_export_detections = QPushButton("Export...")
+        self.btn_export_detections.setToolTip(
+            "Save these detections as a CSV, in the same format the Data Collection "
+            "dialog and src/ml/evaluate_candidates.py use."
+        )
+        self.btn_export_detections.setEnabled(False)
+        self.btn_export_detections.clicked.connect(self._on_export_detections)
+        detect_layout.addWidget(self.btn_export_detections)
+
+        self.label_detect_status = QLabel("")
+        self.label_detect_status.setStyleSheet("QLabel { color: gray; font-style: italic; }")
+        detect_layout.addWidget(self.label_detect_status, stretch=1)
+
+        table_layout.addLayout(detect_layout)
+
         self.PeakThresholdLabel = QLabel(table_container)
         self.PeakThresholdLabel.setObjectName(u"PeakThresholdLabel")
         font_peak = QFont()
@@ -2231,11 +2312,23 @@ class ReplayWindowAudio(ReplayBaseWindow):
             event_freq = float(freq_item.text().replace(' Hz', '')) if freq_item else 0
             event_amp = float(amp_item.text().replace(' mV', '')) if amp_item else 0
             event_type = "Auto-detected Peak"
-        
+
+        # ✅ CASO 3: Click su tabella "Detected Clicks (v5)"
+        elif sender_table is self.detection_table:
+            det = self._detection_for_row(row)
+            if det is None:
+                print(f"⚠️ Invalid detection_table row: {row}")
+                return
+
+            target_timestamp_sec = float(det.get('timestamp_s', 0.0))
+            event_freq = float(det.get('FPE_hz', 0.0))       # dominant frequency
+            event_amp  = float(det.get('peak_amp', 0.0))
+            event_type = "v5 Detection"
+
         else:
             print("⚠️ Unknown table sender")
             return
-        
+
         # ✅ COMUNE: NAVIGAZIONE AL TIMESTAMP
         target_position_ms = target_timestamp_sec * 1000
         
@@ -2264,6 +2357,232 @@ class ReplayWindowAudio(ReplayBaseWindow):
         # Feedback visivo
         print(f"✅ Jumped to: {target_timestamp_sec:.3f}s | {event_freq:.0f} Hz | {event_amp:.6f} V")
 
+
+    # === V5 CLICK DETECTION (stages 1-4) ===
+
+    def _visible_detections(self):
+        """The detections the table is currently showing, in display order."""
+        if self.combo_detect_show.currentIndex() == 0:
+            rows = [d for d in self._v5_detections if d.get('stage_blocked') == '']
+        else:
+            rows = list(self._v5_detections)
+        return sorted(rows, key=lambda d: d.get('frame_idx', 0))
+
+    def _detection_for_row(self, row: int):
+        """Map a table row back to its detection dict."""
+        visible = self._visible_detections()
+        if row < 0 or row >= len(visible):
+            return None
+        return visible[row]
+
+    def _on_detect_clicks(self):
+        """Run the v5 pipeline over the loaded recording in a background thread."""
+        if not hasattr(self, 'data_manager') or self.data_manager is None:
+            QMessageBox.warning(self, "No data", "Load a recording first.")
+            return
+
+        dm = self.data_manager
+        from core.click_detection_worker import ClickDetectionWorker
+
+        self.btn_detect_clicks.setEnabled(False)
+        self.label_detect_status.setText("Detecting…")
+
+        self._detect_progress = QProgressDialog(
+            "Running v5 click detection...", "Cancel", 0, 100, self
+        )
+        self._detect_progress.setWindowTitle("Detect Clicks (v5)")
+        self._detect_progress.setWindowModality(Qt.WindowModal)
+        self._detect_progress.setMinimumDuration(0)
+        self._detect_progress.setValue(0)
+
+        worker = ClickDetectionWorker(
+            fft_data=dm.fft_data,
+            phase_data=dm.phase_data,
+            fs=dm.header_info['fs'],
+            fft_size=dm.header_info['fft_size'],
+            frame_duration_ms=dm.frame_duration_ms,
+            k=self.PeakThresholdSpinBox.value(),
+            dm=dm,   # lets Stage 1 reuse the arrays computed at load time
+        )
+        thread = QThread(self)
+        worker.moveToThread(thread)
+
+        # Bound methods, never lambdas: a lambda has no thread affinity, so Qt would
+        # use a DirectConnection and run these slots on the worker thread — i.e. touch
+        # widgets off the GUI thread. Same reasoning as _launch_click_detector in the
+        # chemical simulator.
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_detect_progress)
+        worker.finished.connect(self._on_detect_finished)
+        worker.error.connect(self._on_detect_error)
+
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        self._detect_progress.canceled.connect(worker.request_stop)
+
+        # Keep references alive — a garbage-collected QThread takes the worker with it.
+        self._detect_thread = thread
+        self._detect_worker = worker
+        thread.start()
+
+    def _on_detect_progress(self, done: int, total: int):
+        if getattr(self, '_detect_progress', None) is None or total <= 0:
+            return
+        self._detect_progress.setValue(int(100 * done / total))
+
+    def _on_detect_finished(self, detections: list):
+        """Detections are in — populate the tab."""
+        if getattr(self, '_detect_progress', None) is not None:
+            self._detect_progress.close()
+            self._detect_progress = None
+
+        self._v5_detections = detections or []
+        self.btn_detect_clicks.setEnabled(True)
+        self.btn_export_detections.setEnabled(bool(self._v5_detections))
+
+        from core.click_pipeline_v5 import stage_summary
+        counts = stage_summary(self._v5_detections)
+
+        self.label_detect_status.setText(
+            f"{counts['total']} candidates → {counts['confirmed']} confirmed  "
+            f"(gates {counts['Stage2_R2'] + counts['Stage2_SPR']}, "
+            f"SVM {counts['Stage3_SVM']}, dedup {counts['Stage4_dedup']})"
+        )
+
+        self._refresh_detection_table()
+        self.click_tab_widget.setCurrentWidget(self.detection_table)
+
+    def _on_detect_error(self, msg: str):
+        if getattr(self, '_detect_progress', None) is not None:
+            self._detect_progress.close()
+            self._detect_progress = None
+        self.btn_detect_clicks.setEnabled(True)
+        self.label_detect_status.setText("Detection failed")
+        QMessageBox.critical(self, "Click detection failed", msg)
+
+    def _refresh_detection_table(self):
+        """Populate the table from the last run — no re-detection."""
+        visible = self._visible_detections()
+
+        self.detection_table.setRowCount(len(visible))
+
+        # Tint per verdict, so the blocked rows read at a glance in 'All candidates'.
+        tints = {
+            '':             QColor(46, 125, 50, 60),    # confirmed — green
+            'Stage2_R2':    QColor(120, 120, 120, 45),  # invalid fit — grey
+            'Stage2_SPR':   QColor(120, 120, 120, 45),
+            'Stage3_SVM':   QColor(211, 47, 47, 45),    # SVM said noise — red
+            'Stage4_dedup': QColor(255, 152, 0, 45),    # duplicate — amber
+        }
+
+        for r, det in enumerate(visible):
+            verdict = det.get('stage_blocked', '')
+            prob    = det.get('svm_probability')
+            tau     = det.get('tau_ms', -1.0)
+
+            cells = [
+                f"{det.get('timestamp_s', 0.0):.3f}s",
+                str(det.get('frame_idx', '')),
+                f"{prob:.3f}" if prob is not None else "—",
+                f"{tau:.4f}" if tau and tau > 0 else "—",
+                f"{det.get('R2', 0.0):.3f}",
+                f"{det.get('peak_SNR', 0.0):.2f}",
+                f"{det.get('FPE_hz', 0.0) / 1000.0:.1f}",
+                "CLICK" if verdict == '' else verdict,
+            ]
+
+            for c, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                tint = tints.get(verdict)
+                if tint is not None:
+                    item.setBackground(tint)
+                self.detection_table.setItem(r, c, item)
+
+    def _on_detection_table_context_menu(self, pos):
+        """Right-click → inspect this frame in the iFFT window."""
+        row = self.detection_table.rowAt(pos.y())
+        det = self._detection_for_row(row)
+        if det is None:
+            return
+
+        menu = QMenu(self)
+        action = menu.addAction("Open iFFT at this frame")
+        chosen = menu.exec(self.detection_table.viewport().mapToGlobal(pos))
+
+        if chosen is action:
+            self._open_ifft_at_frame(int(det['frame_idx']))
+
+    def _open_ifft_at_frame(self, frame_idx: int):
+        """Jump the replay to a frame and open the iFFT viewer on it."""
+        try:
+            # show_ifft_window() derives the frame from current_position_ms, so the
+            # playhead has to move first.
+            position_ms = frame_idx * self.data_manager.frame_duration_ms
+            self._on_position_changed(position_ms)
+            self.time_slider.setValue(int(position_ms))
+            self.show_ifft_window()
+        except Exception as e:
+            QMessageBox.warning(self, "Could not open iFFT", str(e))
+
+    def _on_export_detections(self):
+        """Write the detections as a CSV in the same schema as the Data Collection export."""
+        if not self._v5_detections:
+            return
+
+        default_name = f"{Path(self.file_path).stem}_detections.csv" \
+            if getattr(self, 'file_path', None) else "detections.csv"
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export detections", default_name, "CSV (*.csv)"
+        )
+        if not path:
+            return
+
+        # Export what is on screen: 'Confirmed only' exports the clicks, 'All
+        # candidates' exports the full annotated census.
+        rows = self._visible_detections()
+        stem = Path(self.file_path).stem if getattr(self, 'file_path', None) else ''
+
+        try:
+            import csv
+            from components.data_collection_dialog_v5 import CSV_COLUMNS, FEATURE_NAMES
+
+            with open(path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+                writer.writeheader()
+
+                for det in rows:
+                    row = {
+                        'file': stem,
+                        'frame_idx': det.get('frame_idx', ''),
+                        'timestamp_s': round(det.get('timestamp_s', 0.0), 6),
+                        'noise_floor_mV': round(det.get('noise_floor', 0.0) * 1e3, 4),
+                        'std_noise_mV': round(det.get('std_noise', 0.0) * 1e3, 4),
+                        'E_hat_floor': round(det.get('E_hat_floor', 0.0), 6),
+                        'label': '',
+                        'svm_probability': (
+                            round(det['svm_probability'], 4)
+                            if det.get('svm_probability') is not None else ''
+                        ),
+                        'svm_prediction': (
+                            det['svm_prediction']
+                            if det.get('svm_prediction') is not None else ''
+                        ),
+                        'stage_blocked': det.get('stage_blocked', ''),
+                    }
+                    for name in FEATURE_NAMES:
+                        row[name] = det.get(name, '')
+                    writer.writerow(row)
+
+            QMessageBox.information(
+                self, "Exported", f"{len(rows)} row(s) written to:\n{path}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", str(e))
 
     # === PEAK THRESHOLD FILTER METHODS ===
     def _apply_threshold_filter(self):
@@ -2504,3 +2823,15 @@ class ReplayWindowAudio(ReplayBaseWindow):
             dialog.exec()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open data collection dialog: {e}")
+
+    def _on_open_click_review_dialog(self):
+        """Open the labelling dialog on a candidates CSV."""
+        try:
+            from components.click_review_dialog import ClickReviewDialog
+            dialog = ClickReviewDialog(
+                parent=self,
+                theme_manager=getattr(self, 'theme_manager', None),
+            )
+            dialog.exec()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to open click review dialog: {e}")

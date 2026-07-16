@@ -213,6 +213,12 @@ STAGE2_R2_MIN  = 0.10   # Minimum acceptable R² from the log-linear decay fit.
                          # decay_start/decay_end are unreliable. Candidate is dropped.
                          # Mirrors NOISE_FILTER_R2_MIN in train_svm.py.
 
+STAGE2_TAU_MIN = 0.0    # τ must be strictly positive. _fit_decay_segment returns the
+                        # −1.0 sentinel when no exponential decay could be fitted; such
+                        # a candidate has no usable decay window, so every decay-derived
+                        # feature is meaningless. Rejected under the same verdict as the
+                        # R² gate (STAGE_BLOCKED_R2) — both mean "invalid fit".
+
 STAGE2_SPR_MAX = 100.0  # Maximum acceptable Spectral Peak Ratio.
                          # SPR = max(power) / mean(power) over the 20–80 kHz band.
                          # SPR ≥ 100 means the spectrum is dominated by a single
@@ -235,6 +241,16 @@ DEDUP_WINDOW_FRAMES = 3  # Maximum frame-index gap between two detections that
                           # of a 1-frame gap caused by the run-length filter keeping
                           # both the first and last frame of a 3-frame run.
                           # → verify experimentally if double-detections are observed.
+
+# STAGE VERDICT LABELS — the value of the 'stage_blocked' key written by
+# run_stages234_annotated(). The strings are part of the CSV contract: they must
+# stay identical to the ones src/ml/evaluate_candidates.py writes, otherwise the
+# in-app export and the offline CLI would disagree on the same recording.
+STAGE_OK            = ''              # survived all four stages — a confirmed click
+STAGE_BLOCKED_R2    = 'Stage2_R2'     # R² < STAGE2_R2_MIN   — invalid decay fit
+STAGE_BLOCKED_SPR   = 'Stage2_SPR'    # SPR ≥ STAGE2_SPR_MAX — out-of-distribution
+STAGE_BLOCKED_SVM   = 'Stage3_SVM'    # SVM scored it below the decision threshold
+STAGE_BLOCKED_DEDUP = 'Stage4_dedup'  # duplicate of a higher-confidence detection
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -871,19 +887,34 @@ def run_stage1_v5(dm, k: float = K_STAGE1_DEFAULT) -> list:
     for frame_idx in range(dm.total_frames):
         fft_mags = dm.fft_data[frame_idx]
 
-        # ── 1. FFT energy (cheap — no iFFT needed) ───────────────────────────
-        E_i = compute_fft_energy(fft_mags)
-
-        # ── 2. iFFT reconstruction for noise estimator B2 update ─────────────
+        # ── 1. iFFT reconstruction for noise estimator B2 update ─────────────
         # We need env_mean and env_std from the Hilbert envelope of every frame
         # (not just candidates) so that the B2 buffer stays current.
         if frame_idx < len(dm.phase_data):
             frame_data = reconstruct_frame_v5(
-                dm.fft_data[frame_idx], dm.phase_data[frame_idx], 
+                dm.fft_data[frame_idx], dm.phase_data[frame_idx],
                 fs, fft_size, normalize=True ###DEFAULT MIC CORRECTION ENABLED
             )
         else:
             frame_data = None
+
+        # ── 2. FFT energy — from the MIC-CORRECTED spectrum ──────────────────
+        # E_i must come from the same normalized data as everything else in the
+        # pipeline: the envelope above, every Stage 3 feature, and the E_i that
+        # AudioLoadWorker precomputes (audio_load_progress.py:304). Using the raw
+        # magnitudes here while the noise floor is built from mic-corrected data
+        # compares two different quantities — and because the mic correction is
+        # frequency-dependent (0.55x-1.49x across 20-80 kHz, not a constant), it
+        # does NOT cancel out of E_i > k * Ê_floor: it changes which frames become
+        # candidates. reconstruct_frame_v5 already returns the normalized spectrum,
+        # so reusing it here costs nothing.
+        if frame_data is not None:
+            E_i = compute_fft_energy(frame_data['fft_norm'][_BIN_START : _BIN_END + 1])
+        else:
+            # No phase data for this frame → no reconstruction, so fall back to the
+            # raw magnitudes. Rare (incomplete file), and the estimator is not
+            # updated for such frames anyway.
+            E_i = compute_fft_energy(fft_mags)
 
         if frame_data is not None:
             envelope   = compute_hilbert_envelope(frame_data['signal'])
@@ -1921,6 +1952,86 @@ def load_svm_model(model_path: Path) -> dict:
     return model
 
 
+def has_precomputed_stage1_arrays(dm) -> bool:
+    """True when `dm` carries the per-frame arrays AudioLoadWorker computes at load."""
+    return all(
+        getattr(dm, name, None) is not None
+        for name in ('fft_means', 'E_hat_floor_arr', 'noise_floor_arr', 'std_noise_arr')
+    ) and len(dm.fft_means) == dm.total_frames
+
+
+def run_stage1_v5_precomputed(dm, k: float = K_STAGE1_DEFAULT) -> list:
+    """
+    Stage 1 using the per-frame arrays AudioLoadWorker already computed at load time.
+
+    Same criterion and same run-length filter as run_stage1_v5, and returns candidate
+    dicts of exactly the same shape — but it is a vectorised threshold over arrays
+    instead of an iFFT + Hilbert transform per frame, so it is orders of magnitude
+    faster on a long recording.
+
+    IMPORTANT — this is not merely an optimisation of run_stage1_v5, it can select a
+    slightly different candidate set. AudioLoadWorker computes E_i from the *normalised*
+    (mic-corrected) spectrum, whereas run_stage1_v5 computes it from the raw magnitudes.
+    Every candidate CSV and therefore the trained SVM came from this path, so this is
+    the authoritative one: prefer it whenever the arrays are available, and treat
+    run_stage1_v5 as the fallback for files loaded without them.
+
+    Parameters
+    ----------
+    dm : data manager carrying fft_means, E_hat_floor_arr, noise_floor_arr,
+         std_noise_arr and total_frames (see has_precomputed_stage1_arrays).
+    k  : Stage 1 threshold multiplier.
+
+    Returns
+    -------
+    list of dict — identical keys to run_stage1_v5:
+        'frame_idx', 'E_i', 'E_hat_floor', 'noise_floor', 'std_noise', 'group_size'
+    """
+    fft_means     = np.asarray(dm.fft_means,       dtype=np.float64)
+    E_hat_arr     = np.asarray(dm.E_hat_floor_arr, dtype=np.float64)
+    noise_fl_arr  = np.asarray(dm.noise_floor_arr, dtype=np.float64)
+    std_noise_arr = np.asarray(dm.std_noise_arr,   dtype=np.float64)
+
+    # Threshold: E_i > k × Ê_floor  (vectorised, no Python loop over frames).
+    # Ê_floor == 0 means the estimator had not warmed up — those frames cannot
+    # be judged and are skipped.
+    valid   = E_hat_arr > 0
+    flagged = valid & (fft_means > k * E_hat_arr)
+    indices = np.where(flagged)[0]
+
+    if len(indices) == 0:
+        return []
+
+    above_threshold = [
+        {
+            'frame_idx'  : int(i),
+            'E_i'        : float(fft_means[i]),
+            'E_hat_floor': float(E_hat_arr[i]),
+            'noise_floor': float(noise_fl_arr[i]),
+            'std_noise'  : float(std_noise_arr[i]),
+        }
+        for i in indices
+    ]
+
+    # Run-length filter: a run longer than MAX_RUN is sustained noise, not a click.
+    runs, current = [], [above_threshold[0]]
+    for j in range(1, len(above_threshold)):
+        if above_threshold[j]['frame_idx'] == above_threshold[j - 1]['frame_idx'] + 1:
+            current.append(above_threshold[j])
+        else:
+            runs.append(current)
+            current = [above_threshold[j]]
+    runs.append(current)
+
+    candidates = []
+    for run in runs:
+        if len(run) <= MAX_RUN:
+            for entry in run:
+                candidates.append({**entry, 'group_size': len(run)})
+
+    return candidates
+
+
 # =============================================================================
 # STAGE 2 — Valid-fit gate  (§11)
 # =============================================================================
@@ -1978,26 +2089,50 @@ def run_stage2_v5(candidates: list) -> tuple:
     n_rejected = 0
 
     for cand in candidates:
-        r2  = cand.get('R2',  0.0)
-        spr = cand.get('SPR', 0.0)
-
-        # Gate 1: R² < 0.10 → decay fit is invalid; downstream features
-        # that depend on decay_start / decay_end are unreliable.
-        # _fit_decay_segment also returns R2=0.0 for degenerate windows
-        # (too short or near-zero denominator) — those fail here too.
-        if r2 < STAGE2_R2_MIN:
+        if _stage2_reason(cand) == STAGE_OK:
+            survivors.append(cand)
+        else:
             n_rejected += 1
-            continue #next candidate
-
-        # Gate 2: SPR ≥ 100 → extremely tonal signal, out-of-distribution
-        # for the SVM (never seen in training for either class).
-        if spr >= STAGE2_SPR_MAX:
-            n_rejected += 1
-            continue
-
-        survivors.append(cand)
 
     return survivors, n_rejected
+
+
+def _stage2_reason(cand: dict) -> str:
+    """
+    Which Stage 2 gate rejects this candidate, if any.
+
+    The single source of truth for the Stage 2 rule. run_stage2_v5 uses it to
+    drop rejects; run_stages234_annotated uses it to *label* them. Keeping both
+    on one implementation is what guarantees the survivor-only path and the
+    annotated path can never disagree about the same candidate.
+
+    Returns
+    -------
+    str
+        STAGE_OK ('') if every gate passes, otherwise STAGE_BLOCKED_R2 or
+        STAGE_BLOCKED_SPR — the first gate that rejects it, the fit gates first.
+    """
+    # Gate 1a: R² < 0.10 → decay fit is invalid; downstream features
+    # that depend on decay_start / decay_end are unreliable.
+    # _fit_decay_segment also returns R2=0.0 for degenerate windows
+    # (too short or near-zero denominator) — those fail here too.
+    if cand.get('R2', 0.0) < STAGE2_R2_MIN:
+        return STAGE_BLOCKED_R2
+
+    # Gate 1b: τ ≤ 0 → no decay was fitted at all. _fit_decay_segment returns the
+    # −1 sentinel, and every decay-window feature (fall_time_ms, post_SNR, ZCR_post,
+    # asymmetry_integral, centroid_shift_hz) is then an artefact of the fallback
+    # window placement rather than of the signal. Same failure as Gate 1a — an
+    # unusable exponential fit — so it carries the same verdict.
+    if cand.get('tau_ms', -1.0) <= STAGE2_TAU_MIN:
+        return STAGE_BLOCKED_R2
+
+    # Gate 2: SPR ≥ 100 → extremely tonal signal, out-of-distribution
+    # for the SVM (never seen in training for either class).
+    if cand.get('SPR', 0.0) >= STAGE2_SPR_MAX:
+        return STAGE_BLOCKED_SPR
+
+    return STAGE_OK
 
 
 # =============================================================================
@@ -2048,24 +2183,8 @@ def run_stage3_v5(candidates: list, svm_model: dict) -> tuple:
     if not candidates:
         return [], 0
 
-    pipeline   = svm_model['pipeline']
-    threshold  = float(svm_model['threshold'])
-    feat_names = svm_model['features']   # authoritative order from training
-
-    # ── Build feature matrix (n_candidates × n_features) ────────────────────
-    # Values are extracted in the exact column order the SVM was trained on.
-    # float64 is used throughout: the SVC C extension requires it, and it avoids
-    # the silent overflow that affected float32 on large peak_SNR values.
-    X = np.array(
-        [[cand.get(f, np.nan) for f in feat_names] for cand in candidates],
-        dtype=np.float64,
-    )
-
-    # ── Predict probabilities ────────────────────────────────────────────────
-    # Column 1 of predict_proba = P(class=1) = P(click).
-    # The pipeline internally applies SimpleImputer then StandardScaler before
-    # the SVC — no manual scaling is needed here.
-    proba = pipeline.predict_proba(X)[:, 1]
+    threshold = float(svm_model['threshold'])
+    proba     = _stage3_scores(candidates, svm_model)
 
     # ── Apply threshold and collect survivors ────────────────────────────────
     detections = []
@@ -2083,6 +2202,47 @@ def run_stage3_v5(candidates: list, svm_model: dict) -> tuple:
             n_rejected += 1
 
     return detections, n_rejected
+
+
+def _stage3_scores(candidates: list, svm_model: dict) -> np.ndarray:
+    """
+    P(click) for EVERY candidate — including the ones the threshold will reject.
+
+    run_stage3_v5 keeps only the survivors, so the probability of a rejected
+    candidate is lost. That number is the most informative diagnostic there is
+    ("how close was this to being a click?"), so the scoring step is factored
+    out here where both the survivor-only path and run_stages234_annotated can
+    reach it.
+
+    Parameters
+    ----------
+    candidates : list of dict
+        Stage 2 survivors. Each must carry every feature in svm_model['features'];
+        a missing one becomes NaN and is filled by the Pipeline's SimpleImputer.
+    svm_model : dict
+        From load_svm_model. Only 'pipeline' and 'features' are read — the
+        threshold is applied by the caller, so a caller may override it.
+
+    Returns
+    -------
+    np.ndarray, shape (len(candidates),)
+        P(class=1) = P(click), in the same order as `candidates`.
+    """
+    feat_names = svm_model['features']   # authoritative order from training
+
+    # ── Build feature matrix (n_candidates × n_features) ────────────────────
+    # Values are extracted in the exact column order the SVM was trained on.
+    # float64 is used throughout: the SVC C extension requires it, and it avoids
+    # the silent overflow that affected float32 on large peak_SNR values.
+    X = np.array(
+        [[cand.get(f, np.nan) for f in feat_names] for cand in candidates],
+        dtype=np.float64,
+    )
+
+    # Column 1 of predict_proba = P(class=1) = P(click).
+    # The pipeline internally applies SimpleImputer then StandardScaler before
+    # the SVC — no manual scaling is needed here.
+    return svm_model['pipeline'].predict_proba(X)[:, 1]
 
 
 # =============================================================================
@@ -2158,3 +2318,124 @@ def run_stage4_v5(detections: list) -> list:
         best.append(max(group, key=lambda d: d['svm_probability']))
 
     return best
+
+
+# =============================================================================
+# STAGES 2-4 — annotated run (keeps every candidate)
+# =============================================================================
+
+def run_stages234_annotated(
+    candidates: list,
+    svm_model: dict,
+    threshold: float = None,
+) -> list:
+    """
+    Run Stages 2, 3 and 4 while keeping EVERY input candidate.
+
+    run_stage2_v5 / run_stage3_v5 / run_stage4_v5 each return survivors plus a
+    reject count, which is what a live detector wants. An analyst wants the
+    opposite: the full census, with a verdict attached to each candidate saying
+    which stage rejected it and how confident the SVM was. That is this function.
+
+    It is the in-app equivalent of src/ml/evaluate_candidates.py, and produces
+    the same three columns with the same names and semantics — so a CSV exported
+    from the GUI and one produced by the offline CLI are interchangeable.
+
+    Three keys are added to every returned candidate:
+
+        stage_blocked   : str   — STAGE_OK ('') if it survived all four stages,
+                                  otherwise the label of the first stage that
+                                  rejected it (STAGE_BLOCKED_R2 / _SPR / _SVM /
+                                  _DEDUP).
+        svm_probability : float — P(click) from the SVM.
+                                  None if Stage 2 blocked it (it never reached
+                                  the model, so no score exists).
+        svm_prediction  : int   — 1 if P ≥ threshold, else 0.
+                                  None if Stage 2 blocked it.
+
+    Deduplication is applied within the given list, so callers must pass the
+    candidates of ONE recording at a time — otherwise clicks at similar frame
+    indices in different recordings would be merged.
+
+    Parameters
+    ----------
+    candidates : list of dict
+        Stage 1 survivors with features attached (compute_features_v5 output
+        merged in). Not mutated — each returned dict is a shallow copy.
+    svm_model : dict
+        From load_svm_model.
+    threshold : float, optional
+        Overrides svm_model['threshold']. Lowering it trades precision for
+        recall without retraining; this is what the UI's threshold control does.
+
+    Returns
+    -------
+    list of dict
+        One dict per input candidate, same order as the input, each annotated.
+    """
+    # Shallow-copy so the caller's dicts are never mutated, and pre-seed the
+    # three annotation keys so every returned dict has an identical shape —
+    # a CSV writer can then rely on them existing.
+    annotated = []
+    for cand in candidates:
+        row = dict(cand)
+        row['stage_blocked']   = _stage2_reason(row)
+        row['svm_probability'] = None
+        row['svm_prediction']  = None
+        annotated.append(row)
+
+    # ── Stage 3 — score everything that cleared the Stage 2 gates ────────────
+    survivors = [r for r in annotated if r['stage_blocked'] == STAGE_OK]
+    if not survivors:
+        return annotated
+
+    thr   = float(svm_model['threshold']) if threshold is None else float(threshold)
+    proba = _stage3_scores(survivors, svm_model)
+
+    for row, p in zip(survivors, proba):
+        row['svm_probability'] = float(p)
+        row['svm_prediction']  = int(p >= thr)
+        if row['svm_prediction'] == 0:
+            row['stage_blocked'] = STAGE_BLOCKED_SVM
+
+    # ── Stage 4 — deduplicate the confirmed clicks ───────────────────────────
+    # run_stage4_v5 returns the *same* dict objects it was given (its docstring
+    # guarantees no copying), so the survivors are identifiable by identity and
+    # everything else in `passers` is a duplicate that lost to a higher score.
+    passers = [r for r in survivors if r['stage_blocked'] == STAGE_OK]
+    if len(passers) > 1:
+        kept_ids = {id(r) for r in run_stage4_v5(passers)}
+        for row in passers:
+            if id(row) not in kept_ids:
+                row['stage_blocked'] = STAGE_BLOCKED_DEDUP
+
+    return annotated
+
+
+def stage_summary(annotated: list) -> dict:
+    """
+    Funnel counts for a run_stages234_annotated() result — for UI stats panels.
+
+    Returns
+    -------
+    dict
+        {'total', 'Stage2_R2', 'Stage2_SPR', 'Stage3_SVM', 'Stage4_dedup',
+         'confirmed'}. The four blocked counts plus 'confirmed' sum to 'total'.
+    """
+    counts = {
+        'total':               len(annotated),
+        STAGE_BLOCKED_R2:      0,
+        STAGE_BLOCKED_SPR:     0,
+        STAGE_BLOCKED_SVM:     0,
+        STAGE_BLOCKED_DEDUP:   0,
+        'confirmed':           0,
+    }
+
+    for row in annotated:
+        verdict = row.get('stage_blocked', STAGE_OK)
+        if verdict == STAGE_OK:
+            counts['confirmed'] += 1
+        elif verdict in counts:
+            counts[verdict] += 1
+
+    return counts

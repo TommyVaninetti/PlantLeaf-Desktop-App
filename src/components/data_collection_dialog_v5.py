@@ -19,7 +19,8 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
     QPushButton, QSpinBox, QDoubleSpinBox, QLabel, QFileDialog,
     QProgressBar, QPlainTextEdit, QCheckBox, QAbstractItemView,
-    QWidget, QSizePolicy, QApplication,
+    QWidget, QSizePolicy, QApplication, QRadioButton, QButtonGroup,
+    QMessageBox, QGridLayout,
 )
 from PySide6.QtCore import QThread, Signal, Qt, QPoint, QRect
 from PySide6.QtGui import QColor, QPixmap, QPainter, QFont, QImage, QPen
@@ -76,7 +77,30 @@ CSV_COLUMNS = [
     'R_spectral',
     'FPE_hz',
     'label',  # Empty column for manual labeling (1=click, 0=no click, empty=unknown)
+    # Stage 2/3/4 verdict — written when classification is enabled, otherwise left
+    # empty. Same three names, order and semantics as src/ml/evaluate_candidates.py,
+    # so a CSV exported here and one produced by the offline CLI are interchangeable
+    # and analyze_dataset.py reads either without modification.
+    'svm_probability',
+    'svm_prediction',
+    'stage_blocked',
 ]
+
+# The 17 features compute_features_v5 produces, in the order the docs list them.
+# The SVM reads only the 16 it was trained on (model['features'] is authoritative
+# and excludes fit_coverage) — this list is what the CSV and the pipeline exchange.
+FEATURE_NAMES = [
+    'peak_SNR', 'pre_SNR', 'post_SNR',
+    'rise_time_ms', 'fall_time_ms', 'asymmetry_integral',
+    'ZCR_pre', 'ZCR_click', 'ZCR_post',
+    'kurtosis', 'centroid_shift_hz',
+    'tau_ms', 'R2', 'fit_coverage',
+    'SPR', 'R_spectral', 'FPE_hz',
+]
+
+# Export modes for the classification section
+EXPORT_ALL       = 'all'        # every Stage 1 candidate, each with its verdict
+EXPORT_CONFIRMED = 'confirmed'  # only candidates that survived all four stages
 
 
 # ── CANDIDATE DATA STRUCTURE ────────────────────────────────────────────────
@@ -129,8 +153,31 @@ class CandidateData:
     # Label (empty for Phase 2, filled manually later)
     label: str = ''
 
+    # Stage 2/3/4 verdict — filled by the worker when classification is enabled.
+    # None/'' means the candidate was never classified (classification switched off),
+    # which is what leaves the three CSV columns empty.
+    svm_probability: Optional[float] = None
+    svm_prediction: Optional[int] = None
+    stage_blocked: str = ''
+
+    @property
+    def is_confirmed_click(self) -> bool:
+        """True once classified and it survived all four stages."""
+        return self.svm_prediction is not None and self.stage_blocked == ''
+
+    def to_feature_dict(self) -> Dict:
+        """
+        The dict the pipeline expects: frame_idx (for Stage 4 dedup) + the 17 features.
+
+        Values are taken unrounded from the dataclass, unlike to_csv_dict — the SVM
+        must see the same precision the features were computed at.
+        """
+        d = {name: getattr(self, name) for name in FEATURE_NAMES}
+        d['frame_idx'] = self.frame_idx
+        return d
+
     def to_csv_dict(self) -> Dict:
-        """Convert to dictionary for CSV export (24 columns)."""
+        """Convert to dictionary for CSV export (27 columns)."""
         return {
             'file': self.file,
             'frame_idx': self.frame_idx,
@@ -161,6 +208,17 @@ class CandidateData:
             'R_spectral': round(self.R_spectral, 3),
             'FPE_hz': round(self.FPE_hz, 2),
             'label': self.label,
+            # Rounded to 4 dp to match evaluate_candidates.py's output exactly.
+            # None → '' via csv.DictWriter, which is how an unclassified candidate
+            # and a Stage-2-blocked one (never scored) both read as blank.
+            'svm_probability': (
+                round(self.svm_probability, 4)
+                if self.svm_probability is not None else ''
+            ),
+            'svm_prediction': (
+                self.svm_prediction if self.svm_prediction is not None else ''
+            ),
+            'stage_blocked': self.stage_blocked,
         }
 
 
@@ -265,10 +323,13 @@ def _process_file_for_collection(
     # Lazy import to avoid circular imports
     from core.click_pipeline_v5 import (
         run_stage1_v5,
+        run_stage1_v5_precomputed,
+        has_precomputed_stage1_arrays,
         compute_hilbert_envelope,
         find_peak,
         compute_features_v5,
         FS, FFT_SIZE, MAX_RUN,
+        STAGE2_R2_MIN, STAGE2_TAU_MIN,
     )
 
     candidates = []
@@ -277,54 +338,8 @@ def _process_file_for_collection(
     # ── Stage 1: find above-threshold candidates ──────────────────────────────
     # Fast path: AudioLoadWorker already computed per-frame energy and adaptive
     # noise estimates.  Reuse them — no iFFT/Hilbert needed here.
-    _has_precomputed = (
-        hasattr(dm, 'fft_means')        and dm.fft_means       is not None and
-        hasattr(dm, 'E_hat_floor_arr')  and dm.E_hat_floor_arr is not None and
-        hasattr(dm, 'noise_floor_arr')  and dm.noise_floor_arr is not None and
-        hasattr(dm, 'std_noise_arr')    and dm.std_noise_arr   is not None and
-        len(dm.fft_means) == dm.total_frames
-    )
-
-    if _has_precomputed:
-        fft_means     = np.asarray(dm.fft_means,       dtype=np.float64)
-        E_hat_arr     = np.asarray(dm.E_hat_floor_arr, dtype=np.float64)
-        noise_fl_arr  = np.asarray(dm.noise_floor_arr, dtype=np.float64)
-        std_noise_arr = np.asarray(dm.std_noise_arr,   dtype=np.float64)
-
-        # Threshold: E_i > k × Ê_floor  (vectorised, no Python loop over frames)
-        valid   = E_hat_arr > 0
-        flagged = valid & (fft_means > k * E_hat_arr)
-        indices = np.where(flagged)[0]
-
-        if len(indices) == 0:
-            return candidates, csv_rows
-
-        # Run-length filter: discard runs > MAX_RUN consecutive frames (noise)
-        above_threshold = [
-            {
-                'frame_idx'  : int(i),
-                'E_i'        : float(fft_means[i]),
-                'E_hat_floor': float(E_hat_arr[i]),
-                'noise_floor': float(noise_fl_arr[i]),
-                'std_noise'  : float(std_noise_arr[i]),
-            }
-            for i in indices
-        ]
-
-        runs, current = [], [above_threshold[0]]
-        for j in range(1, len(above_threshold)):
-            if above_threshold[j]['frame_idx'] == above_threshold[j-1]['frame_idx'] + 1:
-                current.append(above_threshold[j])
-            else:
-                runs.append(current)
-                current = [above_threshold[j]]
-        runs.append(current)
-
-        candidates_raw = []
-        for run in runs:
-            if len(run) <= MAX_RUN:
-                for entry in run:
-                    candidates_raw.append({**entry, 'group_size': len(run)})
+    if has_precomputed_stage1_arrays(dm):
+        candidates_raw = run_stage1_v5_precomputed(dm, k=k)
     else:
         # Slow path: recompute noise estimator from scratch (file was loaded
         # without pre-computed arrays, e.g. older .paudio format).
@@ -408,8 +423,18 @@ def _process_file_for_collection(
 
             ### FILTERS ### (also skips screenshot rendering)
 
-            # Skip candidates with invalid R^2 or tau
-            if features.get('R2', 0.00) == 0.00 or features.get('tau_ms', -1.0) <= 0:
+            # Drop candidates with no exponential fit at all: R² is exactly 0 (the
+            # degenerate-window result) or τ is the −1 sentinel. There is nothing to
+            # see in their screenshot and nothing to learn from their features, which
+            # are artefacts of the fallback decay window.
+            #
+            # Deliberately NOT the full Stage 2 fit gate (R² < STAGE2_R2_MIN): rows
+            # with a low-but-nonzero R² are still exported and come back tagged
+            # 'Stage2_R2'. They are a large, legitimate part of the existing training
+            # CSVs (~23% of the current dataset), so filtering them here would silently
+            # change what future exports contain. Stage 2 is what rejects them, and it
+            # says so in the CSV.
+            if features.get('R2', 0.0) == 0.0 or features.get('tau_ms', -1.0) <= STAGE2_TAU_MIN:
                 continue
 
             ### ------- ###
@@ -632,6 +657,16 @@ def _draw_feature_footer(
                       f"R² = {c.R2:.4f}",
                       f"coverage = {c.fit_coverage:.3f}"]),
     ]
+
+    # Verdict line — only when the candidate went through Stages 2-4. Without it a
+    # PNG shows what the frame looked like but not what the algorithm made of it.
+    if c.svm_prediction is not None or c.stage_blocked:
+        if c.svm_probability is not None:
+            prob_str = f"P(click) = {c.svm_probability:.3f}"
+        else:
+            prob_str = "P(click) = n/a (never reached the SVM)"
+        verdict = "CONFIRMED CLICK" if c.is_confirmed_click else f"blocked at {c.stage_blocked}"
+        groups.append(("Verdict", [verdict, prob_str]))
 
     f_key = QFont("Arial", 9, QFont.Bold)
     f_val = QFont("Courier New", 9)
@@ -915,24 +950,41 @@ class DataCollectionWorkerV5(QThread):
         k: float = K_DEFAULT,
         output_dir: Path = None,
         normalize_mode: bool = True,
+        svm_model: dict = None,
+        export_mode: str = EXPORT_ALL,
+        threshold: float = None,
     ):
         """
         Initialize worker thread.
-        
+
         Args:
             file_list: List of .paudio file paths to process
             k: Stage 1 multiplier (default 1.5)
             output_dir: Directory to save CSVs and screenshots
             normalize_mode: Use normalized FFT if True (default True)
+            svm_model: Loaded model dict (from load_svm_model). None disables
+                       Stages 2-4 entirely — the export is then a plain Stage 1
+                       dump with the three verdict columns left empty.
+                       Loaded on the MAIN thread by the dialog so a bad .pkl is
+                       reported in a message box instead of killing the worker.
+            export_mode: EXPORT_ALL (every candidate, annotated) or
+                       EXPORT_CONFIRMED (only clicks that survived all 4 stages).
+                       Ignored when svm_model is None.
+            threshold: Override the model's own decision threshold. None = use it.
         """
         super().__init__()
         self.file_list = file_list
         self.k = k
         self.output_dir = Path(output_dir) if output_dir else Path.home() / 'plantleaf_data_collection'
         self.normalize_mode = normalize_mode
+        self.svm_model = svm_model
+        self.export_mode = export_mode
+        self.threshold = threshold
         self._stop_requested = False
         # Holds the active AudioLoadWorker so request_stop() can cancel it mid-load.
         self._current_audio_worker = None
+        # Funnel counts accumulated across every processed file, for the final summary.
+        self.totals = {}
     
     def run(self):
         """Main worker loop — pure numpy/IO work only. No Qt widgets created here."""
@@ -975,7 +1027,17 @@ class DataCollectionWorkerV5(QThread):
                             f"  → {paudio_file.name}: {done}/{total} survivors processed…"
                         ),
                     )
-                    
+
+                    ## STAGES 2-4 ##
+                    # Classification runs here, in the worker: SVC.predict_proba is
+                    # libsvm + pure numpy (no BLAS), so it is safe off the main thread
+                    # on macOS — see run_stage3_v5's docstring.
+                    # Candidates are classified one file at a time, which is exactly
+                    # what Stage 4 dedup requires: frame indices must never be compared
+                    # across recordings.
+                    if self.svm_model is not None:
+                        candidates = self._classify(candidates, paudio_file.name)
+
                     ## CSV ##
                     # Write CSV immediately — pure file I/O, safe in background thread.
                     # Does NOT depend on screenshots, so we don't need to wait for rendering.
@@ -1015,7 +1077,47 @@ class DataCollectionWorkerV5(QThread):
         except Exception as e:
             self.error_occurred.emit(f"Critical error in worker: {str(e)}")
             traceback.print_exc()
-    
+
+    def _classify(self, candidates: List[CandidateData], filename: str) -> List[CandidateData]:
+        """
+        Run Stages 2-4 over one file's candidates and attach the verdicts.
+
+        Returns the list to actually export: every candidate in EXPORT_ALL mode,
+        only the confirmed clicks in EXPORT_CONFIRMED mode. Filtering here (rather
+        than at CSV-write time) means the discarded candidates also skip screenshot
+        rendering, which is where nearly all the time goes — typically only ~5-10%
+        of candidates survive, so confirmed-only exports are dramatically faster.
+        """
+        if not candidates:
+            return candidates
+
+        from core.click_pipeline_v5 import run_stages234_annotated, stage_summary
+
+        annotated = run_stages234_annotated(
+            [c.to_feature_dict() for c in candidates],
+            self.svm_model,
+            threshold=self.threshold,
+        )
+
+        # run_stages234_annotated preserves input order, so zip is a safe pairing.
+        for cand, row in zip(candidates, annotated):
+            cand.svm_probability = row['svm_probability']
+            cand.svm_prediction  = row['svm_prediction']
+            cand.stage_blocked   = row['stage_blocked']
+
+        counts = stage_summary(annotated)
+        for key, value in counts.items():
+            self.totals[key] = self.totals.get(key, 0) + value
+
+        self.error_occurred.emit(
+            f"  → {filename}: {counts['total']} candidates → "
+            f"{counts['confirmed']} confirmed click(s)"
+        )
+
+        if self.export_mode == EXPORT_CONFIRMED:
+            return [c for c in candidates if c.is_confirmed_click]
+        return candidates
+
     def _load_audio_file(self, paudio_path: Path, file_idx: int = 0, total_files: int = 1):
         """
         Load a .paudio file into AudioDataManager.
@@ -1137,26 +1239,58 @@ class DataCollectionWorkerV5(QThread):
 class DataCollectionDialogV5(QDialog):
     """
     Dialog for batch data collection from multiple .paudio files.
-    
+
     Provides UI for:
     - Selecting .paudio files to process
     - Configuring Stage 1 multiplier (k)
+    - Running Stages 2-4 (SVM classification) and choosing what to export
     - Selecting output folder
     - Running batch export (with progress feedback)
     - Viewing results
     """
-    
+
+    # The app's QSS themes target QMainWindow, not QDialog, so under a light theme a
+    # dialog inherits the *dark* palette's pale text on a white background — i.e. the
+    # group boxes, check boxes and radios become unreadable. Every widget class used
+    # here has to be given an explicit colour. (Same approach as RegionFFTDialog.)
+    _LIGHT_CSS = """
+        QDialog, QWidget { background-color: white; color: black; }
+        QGroupBox { color: black; border: 1px solid #ccc; border-radius: 4px;
+                    margin-top: 8px; padding-top: 6px; font-weight: bold; }
+        QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 3px;
+                           color: black; }
+        QLabel { color: black; background: transparent; }
+        QCheckBox, QRadioButton { color: black; background: transparent; }
+        QPushButton { background-color: #f0f0f0; color: black;
+                      border: 1px solid #ccc; padding: 4px 8px; border-radius: 3px; }
+        QPushButton:hover { background-color: #e0e0e0; }
+        QPushButton:disabled { color: #999; }
+        QDoubleSpinBox, QSpinBox, QComboBox {
+            background-color: white; color: black;
+            border: 1px solid #ccc; padding: 2px 4px; border-radius: 3px; }
+        QComboBox QAbstractItemView { background-color: white; color: black;
+                                      selection-background-color: #d0e4ff;
+                                      selection-color: black; }
+        QListWidget, QPlainTextEdit { background-color: white; color: black;
+                                      border: 1px solid #ccc; }
+        QProgressBar { border: 1px solid #bbb; border-radius: 5px;
+                       background-color: #eee; color: black; }
+        QProgressBar::chunk { background-color: #1f77b4; }
+    """
+
+
     def __init__(self, parent=None):
         """Initialize data collection dialog."""
         super().__init__(parent)
         self.setWindowTitle("Data Collection — Stage 1 Batch Export (v5)")
-        self.setGeometry(100, 100, 900, 700)
-        
+        self.resize(820, 600)
+
         self.file_list = []
         self.output_dir = Path.home()
         self.worker = None
         self.is_processing = False
-        
+        self.last_csv_path = None   # most recent exported CSV — opened by 'Review & Label'
+
         self._setup_ui()
         self._setup_connections()
 
@@ -1172,19 +1306,7 @@ class DataCollectionDialogV5(QDialog):
                 theme = self.parent().theme_manager.load_saved_theme()
                 self.parent().theme_manager.apply_theme(self, theme)
                 if 'light' in theme.lower():  # known bug fix for light themes
-                    self.setStyleSheet("QDialog { background-color: white; }")
-                    # Make the loading bar darker for visibility in light mode (gray instead of white)
-                    self.progress_bar.setStyleSheet("""
-                        QProgressBar {
-                            border: 1px solid #bbb;
-                            border-radius: 5px;
-                            background-color: #eee;
-                        }
-                        QProgressBar::chunk {
-                            background-color: #1f77b4;
-                        }
-                    """)
-
+                    self.setStyleSheet(self._LIGHT_CSS)
             except Exception:
                 pass
 
@@ -1198,13 +1320,20 @@ class DataCollectionDialogV5(QDialog):
     def _setup_ui(self):
         """Build the dialog UI layout."""
         layout = QVBoxLayout(self)
-        
+        # Six stacked group boxes make this dialog tall; trim the default padding so
+        # it fits on a laptop screen without scrolling.
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
         # ── File List Section ──
         layout.addWidget(self._create_file_list_section())
         
         # ── Parameters Section ──
         layout.addWidget(self._create_parameters_section())
-        
+
+        # ── Classification Section (Stages 2-4) ──
+        layout.addWidget(self._create_classification_section())
+
         # ── Output Folder Section ──
         layout.addWidget(self._create_output_section())
         
@@ -1229,7 +1358,7 @@ class DataCollectionDialogV5(QDialog):
         # File list widget
         self.file_list_widget = QListWidget()
         self.file_list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.file_list_widget.setMaximumHeight(120)
+        self.file_list_widget.setMaximumHeight(90)
         layout.addWidget(self.file_list_widget)
         
         # Buttons
@@ -1281,10 +1410,203 @@ class DataCollectionDialogV5(QDialog):
 
         return group
     
+    def _create_classification_section(self):
+        """
+        Create the Stages 2-4 section: model choice, export mode, threshold.
+
+        Everything here is optional. With 'Run Stages 2-4' unticked the dialog
+        behaves exactly as it always has — a plain Stage 1 dump — and no model is
+        touched, so the training-data collection workflow is never blocked by a
+        missing or broken .pkl.
+        """
+        from PySide6.QtWidgets import QGroupBox
+
+        group = QGroupBox("Classification (Stages 2-4)")
+        layout = QVBoxLayout()
+
+        # ── Master switch ──
+        self.chk_classify = QCheckBox("Run Stages 2-4 (SVM classification)")
+        self.chk_classify.setChecked(True)
+        self.chk_classify.setToolTip(
+            "Run the hard gates, the SVM and deduplication on every Stage 1 candidate.\n"
+            "Unticked: export raw Stage 1 candidates only (no model needed)."
+        )
+        self.chk_classify.toggled.connect(self._on_classify_toggled)
+        layout.addWidget(self.chk_classify)
+
+        # ── Export mode ──
+        mode_layout = QHBoxLayout()
+        mode_layout.addSpacing(20)
+        mode_layout.addWidget(QLabel("Export:"))
+
+        self.radio_all = QRadioButton("All candidates + stats")
+        self.radio_all.setChecked(True)
+        self.radio_all.setToolTip(
+            "Every Stage 1 candidate, each tagged with the stage that rejected it\n"
+            "and its SVM probability. Best for analysis and for labelling."
+        )
+
+        self.radio_confirmed = QRadioButton("Confirmed clicks only")
+        self.radio_confirmed.setToolTip(
+            "Only candidates that survived all four stages.\n"
+            "Much faster: rejected candidates skip screenshot rendering."
+        )
+
+        self.export_mode_group = QButtonGroup(self)
+        self.export_mode_group.addButton(self.radio_all)
+        self.export_mode_group.addButton(self.radio_confirmed)
+
+        mode_layout.addWidget(self.radio_all)
+        mode_layout.addWidget(self.radio_confirmed)
+        mode_layout.addStretch()
+        layout.addLayout(mode_layout)
+
+        # ── Model picker ──
+        model_layout = QHBoxLayout()
+        model_layout.addSpacing(20)
+        model_layout.addWidget(QLabel("Model:"))
+
+        self.label_model = QLabel()
+        self.label_model.setStyleSheet("QLabel { padding: 4px; }")
+        model_layout.addWidget(self.label_model, stretch=1)
+
+        self.btn_browse_model = QPushButton("Browse...")
+        self.btn_browse_model.clicked.connect(self._on_browse_model)
+        model_layout.addWidget(self.btn_browse_model)
+
+        self.btn_reset_model = QPushButton("Reset")
+        self.btn_reset_model.setToolTip("Go back to the model shipped with the app")
+        self.btn_reset_model.clicked.connect(self._on_reset_model)
+        model_layout.addWidget(self.btn_reset_model)
+
+        layout.addLayout(model_layout)
+
+        # ── Model info + threshold override ──
+        thr_layout = QHBoxLayout()
+        thr_layout.addSpacing(20)
+
+        self.label_model_info = QLabel()
+        self.label_model_info.setStyleSheet("QLabel { color: gray; font-style: italic; }")
+        thr_layout.addWidget(self.label_model_info, stretch=1)
+
+        self.chk_use_model_threshold = QCheckBox("Use model threshold")
+        self.chk_use_model_threshold.setChecked(True)
+        self.chk_use_model_threshold.setToolTip(
+            "The threshold chosen during training to hit the target recall.\n"
+            "Untick to override it: lower = more clicks detected but more false\n"
+            "positives; higher = stricter."
+        )
+        self.chk_use_model_threshold.toggled.connect(
+            lambda on: self.spin_threshold.setEnabled(not on)
+        )
+        thr_layout.addWidget(self.chk_use_model_threshold)
+
+        self.spin_threshold = QDoubleSpinBox()
+        self.spin_threshold.setRange(0.0, 1.0)
+        self.spin_threshold.setSingleStep(0.01)
+        self.spin_threshold.setDecimals(3)
+        self.spin_threshold.setEnabled(False)
+        thr_layout.addWidget(self.spin_threshold)
+
+        layout.addLayout(thr_layout)
+
+        group.setLayout(layout)
+
+        # Load the default model so the info line and threshold are populated up front.
+        self._set_model_path(self._default_model_path(), announce=False)
+
+        return group
+
+    def _default_model_path(self) -> Optional[Path]:
+        """The model shipped with the app, or None if ml/ cannot be imported."""
+        try:
+            from ml import default_model_path
+            return default_model_path()
+        except Exception:
+            return None
+
+    def _set_model_path(self, path: Optional[Path], announce: bool = True):
+        """
+        Point the dialog at a model file and read its metadata.
+
+        The model is loaded here on the main thread — not in the worker — so a
+        missing or corrupt .pkl surfaces immediately, next to the control that
+        chose it, instead of aborting an export ten minutes in.
+        """
+        self.model_path = path
+        self.svm_model = None
+
+        if path is None:
+            self.label_model.setText("(no model found)")
+            self.label_model_info.setText("")
+            return
+
+        self.label_model.setText(path.name)
+        self.label_model.setToolTip(str(path))
+
+        try:
+            from core.click_pipeline_v5 import load_svm_model
+            self.svm_model = load_svm_model(path)
+        except Exception as e:
+            self.label_model_info.setText(f"could not load: {e}")
+            if announce:
+                QMessageBox.warning(
+                    self, "Model not loaded",
+                    f"Could not load the model:\n\n{path}\n\n{e}",
+                )
+            return
+
+        threshold = float(self.svm_model['threshold'])
+        n_feat    = len(self.svm_model['features'])
+        kernel    = self.svm_model.get('kernel', '?')
+
+        # AUC is informational, written by train_svm.py — absent on older models.
+        auc = None
+        all_results = self.svm_model.get('all_results') or {}
+        if isinstance(all_results, dict) and kernel in all_results:
+            auc = (all_results[kernel] or {}).get('auc')
+
+        info = f"kernel={kernel}  threshold={threshold:.3f}  features={n_feat}"
+        if auc is not None:
+            info += f"  AUC={auc:.3f}"
+        self.label_model_info.setText(info)
+
+        # Pre-fill the override with the model's own value, so unticking the box
+        # starts from the trained threshold rather than from zero.
+        self.spin_threshold.setValue(threshold)
+
+        if announce:
+            self._log(f"Model loaded: {path.name}  ({info})")
+
+    def _on_browse_model(self):
+        """Pick a different .pkl (other trained variants live in docs/autoclick/v5/pkl/)."""
+        start_dir = str(self.model_path.parent) if self.model_path else str(Path.home())
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Select SVM Model", start_dir, "SVM model (*.pkl)"
+        )
+        if filepath:
+            self._set_model_path(Path(filepath))
+
+    def _on_reset_model(self):
+        """Go back to the model shipped with the app."""
+        self._set_model_path(self._default_model_path())
+
+    def _on_classify_toggled(self, enabled: bool):
+        """Grey out the whole classification sub-section when Stages 2-4 are off."""
+        for w in (
+            self.radio_all, self.radio_confirmed,
+            self.label_model, self.btn_browse_model, self.btn_reset_model,
+            self.label_model_info, self.chk_use_model_threshold,
+        ):
+            w.setEnabled(enabled)
+        self.spin_threshold.setEnabled(
+            enabled and not self.chk_use_model_threshold.isChecked()
+        )
+
     def _create_output_section(self):
         """Create output folder selection section."""
         from PySide6.QtWidgets import QGroupBox
-        
+
         group = QGroupBox("Output Folder")
         layout = QHBoxLayout()
         
@@ -1328,7 +1650,7 @@ class DataCollectionDialogV5(QDialog):
         
         self.log_area = QPlainTextEdit()
         self.log_area.setReadOnly(True)
-        self.log_area.setMaximumHeight(150)
+        self.log_area.setMaximumHeight(120)
         layout.addWidget(self.log_area)
         
         group.setLayout(layout)
@@ -1340,11 +1662,19 @@ class DataCollectionDialogV5(QDialog):
         layout = QHBoxLayout(container)
         layout.addStretch()
         
+        # Enabled once an export finishes — the natural next step is to label it.
+        self.btn_review = QPushButton("Review && Label...")
+        self.btn_review.setMinimumWidth(120)
+        self.btn_review.setEnabled(False)
+        self.btn_review.setToolTip("Open the exported candidates in the labelling dialog")
+        self.btn_review.clicked.connect(self._on_review)
+        layout.addWidget(self.btn_review)
+
         self.btn_export = QPushButton("Export")
         self.btn_export.setMinimumWidth(100)
         self.btn_export.clicked.connect(self._on_export)
         layout.addWidget(self.btn_export)
-        
+
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setMinimumWidth(100)
         self.btn_cancel.setEnabled(False)
@@ -1417,7 +1747,31 @@ class DataCollectionDialogV5(QDialog):
         
         # Update file list from widget
         self.file_list = [Path(self.file_list_widget.item(i).text()) for i in range(self.file_list_widget.count())]
-        
+
+        # ── Resolve classification settings ──
+        # The model is validated BEFORE the worker starts: an unusable .pkl must
+        # stop the export here, not after minutes of feature extraction.
+        classify = self.chk_classify.isChecked()
+        svm_model = None
+        threshold = None
+        export_mode = EXPORT_ALL
+
+        if classify:
+            if self.svm_model is None:
+                QMessageBox.warning(
+                    self, "No model",
+                    "Stages 2-4 are enabled but no usable SVM model is loaded.\n\n"
+                    "Choose a valid .pkl, or untick 'Run Stages 2-4' to export "
+                    "raw Stage 1 candidates.",
+                )
+                return
+            svm_model = self.svm_model
+            export_mode = (
+                EXPORT_CONFIRMED if self.radio_confirmed.isChecked() else EXPORT_ALL
+            )
+            if not self.chk_use_model_threshold.isChecked():
+                threshold = self.spin_threshold.value()
+
         # Disable/enable buttons
         self.btn_export.setEnabled(False)
         self.btn_add.setEnabled(False)
@@ -1431,15 +1785,26 @@ class DataCollectionDialogV5(QDialog):
         self._log(f"Starting data collection for {len(self.file_list)} file(s)...")
         self._log(f"  k = {self.spinbox_k.value()}")
         self._log(f"  Normalize: True (fixed)")
+        if classify:
+            eff_thr = threshold if threshold is not None else float(svm_model['threshold'])
+            mode_txt = ("confirmed clicks only" if export_mode == EXPORT_CONFIRMED
+                        else "all candidates + stats")
+            self._log(f"  Stages 2-4: {self.model_path.name}  (threshold = {eff_thr:.3f})")
+            self._log(f"  Export: {mode_txt}")
+        else:
+            self._log(f"  Stages 2-4: off (Stage 1 candidates only)")
         self._log(f"  Output: {self.output_dir}")
         self._log("")
-        
+
         # Create and start worker
         self.worker = DataCollectionWorkerV5(
             file_list=self.file_list,
             k=self.spinbox_k.value(),
             output_dir=self.output_dir,
             normalize_mode=True,
+            svm_model=svm_model,
+            export_mode=export_mode,
+            threshold=threshold,
         )
         
         # QueuedConnection → slot always executes on the main thread.
@@ -1553,6 +1918,22 @@ class DataCollectionDialogV5(QDialog):
     def _on_file_complete(self, filename: str, candidate_count: int, csv_path: str):
         """Log file completion."""
         self._log(f"✓ {filename}: {candidate_count} candidates → {Path(csv_path).name}")
+        # Remember the most recent CSV so 'Review & Label' can open it directly.
+        self.last_csv_path = Path(csv_path)
+
+    def _on_review(self):
+        """Open the labelling dialog, on the last exported CSV if there is one."""
+        try:
+            from components.click_review_dialog import ClickReviewDialog
+            theme_manager = getattr(self.parent(), 'theme_manager', None)
+            dialog = ClickReviewDialog(
+                csv_path=getattr(self, 'last_csv_path', None),
+                parent=self,
+                theme_manager=theme_manager,
+            )
+            dialog.exec()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to open click review dialog: {e}")
     
     def _on_error(self, error_msg: str):
         """Log error message."""
@@ -1562,10 +1943,47 @@ class DataCollectionDialogV5(QDialog):
         """Worker finished — reset UI and show results."""
         self._log("")
         self._log(f"✅ Collection complete: {total_candidates} total candidates exported")
+
+        self._log_funnel()
+
         self._log(f"📁 Output: {output_dir}")
         self.progress_bar.setValue(100)
-        
+
+        if self.last_csv_path is not None:
+            self.btn_review.setEnabled(True)
+            self._log("")
+            self._log("→ 'Review & Label...' opens these candidates for labelling.")
+
         self._reset_ui()
+
+    def _log_funnel(self):
+        """
+        Log the per-stage funnel accumulated over every processed file.
+
+        Note this counts what the pipeline *saw*, which in 'confirmed clicks only'
+        mode is more than what was written to disk — that is the point: it shows
+        what was discarded and why.
+        """
+        totals = getattr(self.worker, 'totals', None)
+        if not totals or not totals.get('total'):
+            return
+
+        from core.click_pipeline_v5 import (
+            STAGE_BLOCKED_R2, STAGE_BLOCKED_SPR,
+            STAGE_BLOCKED_SVM, STAGE_BLOCKED_DEDUP,
+        )
+
+        total     = totals['total']
+        confirmed = totals['confirmed']
+        pct       = (100.0 * confirmed / total) if total else 0.0
+
+        self._log("")
+        self._log(f"  Stage 1 candidates : {total}")
+        self._log(f"    Stage2_R2        : {totals.get(STAGE_BLOCKED_R2, 0)}")
+        self._log(f"    Stage2_SPR       : {totals.get(STAGE_BLOCKED_SPR, 0)}")
+        self._log(f"    Stage3_SVM       : {totals.get(STAGE_BLOCKED_SVM, 0)}")
+        self._log(f"    Stage4_dedup     : {totals.get(STAGE_BLOCKED_DEDUP, 0)}")
+        self._log(f"  Confirmed clicks   : {confirmed}  ({pct:.1f}%)")
     
     def _reset_ui(self):
         """Reset UI after export completes or cancels."""

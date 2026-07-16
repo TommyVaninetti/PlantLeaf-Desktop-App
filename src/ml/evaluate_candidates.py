@@ -86,11 +86,21 @@ import joblib
 
 
 # ── Stage constants ──────────────────────────────────────────────────────────
-# Must stay in sync with STAGE2_R2_MIN, STAGE2_SPR_MAX, DEDUP_WINDOW_FRAMES
-# in click_pipeline_v5.py.
-_R2_MIN         = 0.10   # Minimum R² for a valid exponential fit (Stage 2)
-_SPR_MAX        = 100.0  # Maximum SPR before candidate is out-of-distribution (Stage 2)
-_DEDUP_FRAMES   = 3      # Frame-index proximity window for deduplication (Stage 4)
+# Imported from the pipeline rather than re-declared, so this script and the
+# in-app detector can never drift apart on the thresholds.
+#
+# src/core/ is put on the path and the module imported *directly*, rather than as
+# `core.click_pipeline_v5`: importing it through the package would execute
+# src/core/__init__.py, which pulls in the entire PySide6 window stack. This
+# script must stay runnable without a GUI. click_pipeline_v5 itself only imports
+# numpy, so loading it standalone is safe.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'core')) #KEEP IT THIS WAY, IT'S NEEDED TO IMPORT WITH NO GUI COMPONENTS
+from click_pipeline_v5 import (   # noqa: E402
+    STAGE2_R2_MIN       as _R2_MIN,        # Minimum R² for a valid exponential fit (Stage 2)
+    STAGE2_TAU_MIN      as _TAU_MIN,       # τ must be > 0, else no decay was fitted (Stage 2)
+    STAGE2_SPR_MAX      as _SPR_MAX,       # Max SPR before a candidate is out-of-distribution (Stage 2)
+    DEDUP_WINDOW_FRAMES as _DEDUP_FRAMES,  # Frame-index proximity window for deduplication (Stage 4)
+)
 
 # All 17 feature names in the order computed by compute_features_v5.
 # fit_coverage is intentionally excluded from the SVM (see train_svm.py
@@ -206,8 +216,10 @@ def apply_stage2(df: pd.DataFrame) -> pd.DataFrame:
         The SVM training distribution never included such samples for either
         class, so a prediction there is out-of-distribution and meaningless.
     """
-    # Gate 1: invalid fit
-    fail_r2  = df['R2'].lt(_R2_MIN)
+    # Gate 1: invalid fit — either R² below the minimum, or no decay fitted at all
+    # (τ ≤ 0, the sentinel from _fit_decay_segment). Both mean the decay window is
+    # unusable, so they share the Stage2_R2 verdict.
+    fail_r2  = df['R2'].lt(_R2_MIN) | df['tau_ms'].le(_TAU_MIN)
     df.loc[fail_r2 & (df['stage_blocked'] == ''), 'stage_blocked'] = 'Stage2_R2'
 
     # Gate 2: out-of-distribution spectrum — checked only if Gate 1 passed
