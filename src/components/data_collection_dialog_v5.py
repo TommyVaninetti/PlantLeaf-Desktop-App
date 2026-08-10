@@ -140,14 +140,29 @@ class CandidateData:
     R_spectral: float
     FPE_hz: float
     
-    # Signal data for screenshot rendering
-    signal: np.ndarray = field(default_factory=lambda: np.array([]))
-    envelope: np.ndarray = field(default_factory=lambda: np.array([]))
+    # Absolute, model-independent click identity (from click_event_key). peak_abs
+    # is the peak's absolute sample in the recording; canonical_frame_idx is the
+    # frame that owns it. Both Stage 1 candidates of a straddling click share
+    # these, which is how Stage 4 collapses them.
+    peak_abs: int = 0
+    canonical_frame_idx: int = 0
+
+    # Screenshot render window — a slice of the stitched context centred on the
+    # peak (2.56 ms, widened if the click is longer). Time axis is peak-relative
+    # milliseconds (peak at t = 0), so the picture is frame-grid independent.
+    render_signal: np.ndarray = field(default_factory=lambda: np.array([]))
+    render_envelope: np.ndarray = field(default_factory=lambda: np.array([]))
+    render_t_ms: np.ndarray = field(default_factory=lambda: np.array([]))
+    mark_onset_ms: float = 0.0          # onset marker, peak-relative ms (≤ 0)
+    mark_decay_end_ms: float = 0.0      # decay-end marker, peak-relative ms (≥ 0)
+    seams_ms: list = field(default_factory=list)  # frame-join times in the window
     fft_norm: np.ndarray = field(default_factory=lambda: np.array([]))
     freq_axis: np.ndarray = field(default_factory=lambda: np.array([]))
 
-    # Pre-computed exponential fit curve (worker thread) — avoids scipy on main thread
-    fit_t_ms: Optional[np.ndarray] = field(default=None)  # time axis [ms] from frame start
+    # Pre-computed exponential fit curve (worker thread) — avoids scipy on main
+    # thread. Time axis is peak-relative ms, spanning the REAL decay window
+    # [decay_start, decay_end] with no frame-edge clip.
+    fit_t_ms: Optional[np.ndarray] = field(default=None)  # peak-relative time [ms]
     fit_y: Optional[np.ndarray] = field(default=None)     # fit amplitude [V]
 
     # Label (empty for Phase 2, filled manually later)
@@ -167,13 +182,16 @@ class CandidateData:
 
     def to_feature_dict(self) -> Dict:
         """
-        The dict the pipeline expects: frame_idx (for Stage 4 dedup) + the 17 features.
+        The dict the pipeline expects: the 17 features + the identity keys Stage 4
+        deduplicates on (peak_abs / canonical_frame_idx) and frame_idx.
 
         Values are taken unrounded from the dataclass, unlike to_csv_dict — the SVM
         must see the same precision the features were computed at.
         """
         d = {name: getattr(self, name) for name in FEATURE_NAMES}
         d['frame_idx'] = self.frame_idx
+        d['peak_abs'] = self.peak_abs
+        d['canonical_frame_idx'] = self.canonical_frame_idx
         return d
 
     def to_csv_dict(self) -> Dict:
@@ -241,6 +259,7 @@ def _get_frame_envelope_pair(
         next_envelope : ndarray or None
         curr_signal   : ndarray
         prev_signal   : ndarray or None
+        next_signal   : ndarray or None  ← needed to build the stitched context
         curr_fft_norm : ndarray  ← mic-corrected FFT magnitudes (full half-spectrum)
         curr_freq_axis: ndarray  ← frequency axis [Hz] for curr_fft_norm
     """
@@ -279,9 +298,10 @@ def _get_frame_envelope_pair(
     next_envelope = envelopes.get(frame_idx + 1) if frame_idx < len(dm.fft_mags) - 1 else None
     curr_signal   = signals[frame_idx]
     prev_signal   = signals.get(frame_idx - 1) if frame_idx > 0 else None
+    next_signal   = signals.get(frame_idx + 1) if frame_idx < len(dm.fft_mags) - 1 else None
 
     return (prev_envelope, curr_envelope, next_envelope,
-            curr_signal, prev_signal,
+            curr_signal, prev_signal, next_signal,
             curr_fft_norm, curr_freq_axis)
 
 
@@ -325,8 +345,9 @@ def _process_file_for_collection(
         run_stage1_v5,
         run_stage1_v5_precomputed,
         has_precomputed_stage1_arrays,
-        compute_hilbert_envelope,
-        find_peak,
+        build_click_context,
+        resolve_click,
+        click_event_key,
         compute_features_v5,
         FS, FFT_SIZE, MAX_RUN,
         STAGE2_R2_MIN, STAGE2_TAU_MIN,
@@ -367,57 +388,63 @@ def _process_file_for_collection(
             # returns curr_fft_norm and curr_freq_axis so we never reconstruct
             # the same frame twice.
             (prev_env, curr_env, next_env,
-             curr_sig, prev_sig,
+             curr_sig, prev_sig, next_sig,
              curr_fft_norm, curr_freq_axis) = _get_frame_envelope_pair(
                 dm, frame_idx, normalize=normalize
             )
 
-            # Compute peak index
-            peak_idx, peak_amp = find_peak(curr_env)
+            noise_floor = survivor['noise_floor']
+            std_noise   = survivor['std_noise']
 
-            # Compute all 17 features (calls run_fit_pipeline_v5 internally)
+            # Stitch prev|curr|next and resolve the click on that continuous
+            # trace, then compute all features in one coordinate system.
+            ctx      = build_click_context(prev_sig, curr_sig, next_sig)
+            resolved = resolve_click(ctx, noise_floor, std_noise)
             features = compute_features_v5(
-                signal=curr_sig,
-                envelope=curr_env,
-                fft_norm=curr_fft_norm,
-                freq_axis=curr_freq_axis,
-                noise_floor=survivor['noise_floor'],
-                std_noise=survivor['std_noise'],
-                peak_idx=peak_idx,
-                fs=FS,
-                next_frame_envelope=next_env,
-                prev_frame_envelope=prev_env,
-                prev_frame_signal=prev_sig,
+                ctx, resolved,
+                curr_fft_norm, curr_freq_axis,
+                noise_floor, std_noise, FS,
             )
+            peak_abs, canonical_frame_idx = click_event_key(ctx, resolved, frame_idx)
 
             # Calculate timestamp
             timestamp_s = frame_idx / (FS / FFT_SIZE)
 
-            # Pre-compute fit curve for the renderer.
-            # Use find_decay_window_v5 directly (already imported inside
-            # compute_features_v5) to get the window bounds without calling
-            # the full run_fit_pipeline_v5 a second time.
+            env_ctx  = ctx['envelope']
+            sig_ctx  = ctx['signal']
+            peak     = resolved['peak']
+            onset    = resolved['onset']
+            d_start  = resolved['decay_start']
+            d_end    = resolved['decay_end']
+
+            # ── Render window: 2.56 ms centred on the peak, widened so the whole
+            #    click (onset → decay_end) always fits. Time axis is peak-relative
+            #    ms, so the picture is identical regardless of frame alignment. ──
+            half = FFT_SIZE // 2
+            w0   = max(0, min(peak - half, onset))
+            w1   = min(len(sig_ctx), max(peak + half, d_end + 1))
+            render_signal   = sig_ctx[w0:w1]
+            render_envelope = env_ctx[w0:w1]
+            render_t_ms     = (np.arange(w0, w1, dtype=np.float64) - peak) / FS * 1000.0
+            mark_onset_ms     = (onset - peak) / FS * 1000.0
+            mark_decay_end_ms = (d_end - peak) / FS * 1000.0
+            seams_ms = [float((s - peak) / FS * 1000.0)
+                        for s in ctx['seams'] if w0 <= s < w1]
+
+            # Pre-compute the exponential fit curve for the renderer, spanning the
+            # REAL decay window on the stitched envelope — no frame-edge clip.
             fit_t_ms_arr = None
             fit_y_arr    = None
             tau_ms_val   = features.get('tau_ms', -1.0)
             R2_val       = features.get('R2', 0.0)
-            if tau_ms_val > 0 and R2_val > 0.1:
+            if tau_ms_val > 0 and R2_val > 0.1 and d_end > d_start + 2:
                 try:
-                    from core.click_pipeline_v5 import find_decay_window_v5
-                    win    = find_decay_window_v5(
-                        curr_env, peak_idx,
-                        survivor['noise_floor'], survivor['std_noise'],
-                        next_env,
-                    )
-                    d_start = win['decay_start']
-                    d_end   = min(win['decay_end'], len(curr_env))
-                    if d_end > d_start + 2:
-                        n_arr        = np.arange(d_end - d_start, dtype=np.float64)
-                        tau_s        = max(tau_ms_val, 0.01) / 1000.0
-                        rate         = 1.0 / (tau_s * FS)
-                        A0           = float(curr_env[min(d_start, len(curr_env) - 1)])
-                        fit_t_ms_arr = np.arange(d_start, d_end, dtype=np.float64) / FS * 1000.0
-                        fit_y_arr    = A0 * np.exp(-rate * n_arr)
+                    n_arr        = np.arange(d_end - d_start, dtype=np.float64)
+                    tau_s        = max(tau_ms_val, 0.01) / 1000.0
+                    rate         = 1.0 / (tau_s * FS)
+                    A0           = float(env_ctx[min(d_start, len(env_ctx) - 1)])
+                    fit_t_ms_arr = (np.arange(d_start, d_end, dtype=np.float64) - peak) / FS * 1000.0
+                    fit_y_arr    = A0 * np.exp(-rate * n_arr)
                 except Exception:
                     pass
 
@@ -464,8 +491,14 @@ def _process_file_for_collection(
                 SPR=features.get('SPR', 0.0),
                 R_spectral=features.get('R_spectral', 0.0),
                 FPE_hz=features.get('FPE_hz', 0.0),
-                signal=curr_sig,
-                envelope=curr_env,
+                peak_abs=peak_abs,
+                canonical_frame_idx=canonical_frame_idx,
+                render_signal=render_signal,
+                render_envelope=render_envelope,
+                render_t_ms=render_t_ms,
+                mark_onset_ms=mark_onset_ms,
+                mark_decay_end_ms=mark_decay_end_ms,
+                seams_ms=seams_ms,
                 fft_norm=curr_fft_norm,
                 freq_axis=curr_freq_axis,
                 fit_t_ms=fit_t_ms_arr,
@@ -619,6 +652,25 @@ def _draw_hline(
     py = int(r.bottom() - (y_val - y_min) / yr * r.height())
     p.setPen(QPen(color, lw, Qt.DashLine))
     p.drawLine(r.left(), py, r.right(), py)
+
+
+def _draw_vline(
+    p: QPainter, panel: QRect,
+    x_val: float, x_min: float, x_max: float,
+    color: QColor, lw: int = 1, dashed: bool = True, label: str = None,
+):
+    """Draw a vertical reference line at x_val across the inner plot area."""
+    if not (x_min <= x_val <= x_max):
+        return
+    r  = _px_rect(panel)
+    xr = max(x_max - x_min, 1e-30)
+    px = int(r.left() + (x_val - x_min) / xr * r.width())
+    p.setPen(QPen(color, lw, Qt.DashLine if dashed else Qt.SolidLine))
+    p.drawLine(px, r.top(), px, r.bottom())
+    if label:
+        p.setFont(QFont("Arial", 8))
+        p.setPen(color)
+        p.drawText(px + 2, r.top() + 10, label)
 
 
 def _draw_feature_footer(
@@ -820,11 +872,14 @@ def _render_candidate_screenshot(
                        C_FFT, lw=1)
 
             # ── iFFT Panel ────────────────────────────────────────────────────
-            n_samp  = len(candidate.signal)
-            time_ms = np.arange(n_samp, dtype=np.float64) / FS * 1000.0
+            # The render window is a slice of the stitched prev|curr|next context
+            # centred on the peak; time is peak-relative ms (peak at 0), so the
+            # picture is frame-grid independent and the whole click is visible.
+            time_ms = candidate.render_t_ms
+            n_samp  = len(time_ms)
 
-            sig_raw = np.where(np.isfinite(candidate.signal),   candidate.signal,   0.0)
-            env_raw = np.where(np.isfinite(candidate.envelope),  candidate.envelope, 0.0)
+            sig_raw = np.where(np.isfinite(candidate.render_signal),   candidate.render_signal,   0.0)
+            env_raw = np.where(np.isfinite(candidate.render_envelope), candidate.render_envelope, 0.0)
 
             # Auto-scale: pick unit from peak envelope amplitude
             env_max = float(np.max(np.abs(env_raw))) if n_samp > 0 else 1e-10
@@ -849,19 +904,34 @@ def _render_candidate_screenshot(
             if np.isfinite(floor_v) and floor_v > 0:
                 i_y_min = min(i_y_min, floor_v * 0.9)
 
-            t0, t1 = float(time_ms[0]), float(time_ms[-1])
+            t0, t1 = (float(time_ms[0]), float(time_ms[-1])) if n_samp else (-1.28, 1.28)
+            span_ms = t1 - t0
 
             _draw_axes(p, IFFT_panel,
                        t0, t1, i_y_min, i_y_max,
-                       title="iFFT Signal + Envelope",
-                       x_label="Time (ms)", y_label=f"Amplitude ({i_unit})",
+                       title=f"iFFT Signal + Envelope  (span {span_ms:.2f} ms)",
+                       x_label="Time (ms, peak at 0)", y_label=f"Amplitude ({i_unit})",
                        c_grid=C_GRID, c_axis=C_AXIS, c_title=C_TITLE)
             _draw_line(p, IFFT_panel, time_ms, sig_sc,  t0, t1, i_y_min, i_y_max, C_SIG, lw=1)
             _draw_line(p, IFFT_panel, time_ms, env_sc,  t0, t1, i_y_min, i_y_max, C_ENV, lw=2)
             _draw_hline(p, IFFT_panel, floor_v, i_y_min, i_y_max, C_FLOOR, lw=1)
             _draw_hline(p, IFFT_panel, std_v,   i_y_min, i_y_max, C_STD,   lw=1)
 
-            # Pre-computed fit curve (no scipy on main thread)
+            # Frame joins (seams) — drawn honestly since each frame carries its
+            # own Tukey taper. Faint, so they don't compete with the click.
+            for s_ms in candidate.seams_ms:
+                _draw_vline(p, IFFT_panel, s_ms, t0, t1, C_GRID, lw=1, dashed=True)
+
+            # Click markers: onset, peak (t=0), decay end.
+            _draw_vline(p, IFFT_panel, candidate.mark_onset_ms, t0, t1,
+                        C_AXIS, lw=1, dashed=True, label="onset")
+            _draw_vline(p, IFFT_panel, 0.0, t0, t1,
+                        C_ENV, lw=1, dashed=False, label="peak")
+            _draw_vline(p, IFFT_panel, candidate.mark_decay_end_ms, t0, t1,
+                        C_AXIS, lw=1, dashed=True, label="decay end")
+
+            # Pre-computed fit curve (no scipy on main thread) — spans the real
+            # decay window, no frame-edge clip.
             if candidate.fit_t_ms is not None and len(candidate.fit_t_ms) > 1:
                 fit_sc = candidate.fit_y * i_sc
                 _draw_line(p, IFFT_panel, candidate.fit_t_ms, fit_sc,
@@ -1050,10 +1120,24 @@ class DataCollectionWorkerV5(QThread):
                     # Emit each candidate to the main thread for screenshot rendering.
                     # Qt.QueuedConnection (set in dialog) guarantees _on_candidate_ready
                     # runs on the main thread — mandatory on macOS for any Qt widget.
+                    #
+                    # A borderline click's Stage 4 duplicate (tagged Stage4_dedup) is
+                    # the SAME physical click as its confirmed sibling — same peak,
+                    # same picture — so we skip rendering it: one screenshot per
+                    # click. Its CSV row is still exported (census intact); the
+                    # review dialog just shows it without a screenshot.
+                    from core.click_pipeline_v5 import STAGE_BLOCKED_DEDUP
                     for candidate in candidates:
                         if self._stop_requested:
                             return
 
+                        if candidate.stage_blocked == STAGE_BLOCKED_DEDUP:
+                            continue
+
+                        # Name by the candidate's own frame_idx so it matches this
+                        # row's frame_idx in the CSV (how click_review_dialog looks
+                        # the screenshot up). For a confirmed click the kept
+                        # candidate owns the peak, so frame_idx == canonical anyway.
                         screenshot_filename = f"{paudio_file.stem}_{candidate.frame_idx:06d}.png"
                         screenshot_path = screenshots_dir / screenshot_filename
 

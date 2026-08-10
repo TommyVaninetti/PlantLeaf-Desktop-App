@@ -93,7 +93,8 @@ class ClickDetectorWorker(QObject):
             from pathlib import Path
             from core.click_pipeline_v5 import (
                 run_stage1_v5, run_stage2_v5, run_stage3_v5, run_stage4_v5,
-                reconstruct_frame_v5, compute_hilbert_envelope, find_peak,
+                reconstruct_frame_v5,
+                build_click_context, resolve_click, click_event_key,
                 compute_features_v5, load_svm_model,
             )
             from config.app_config import AppConfig
@@ -121,31 +122,33 @@ class ClickDetectorWorker(QObject):
                     if fd is None:
                         continue
                     curr_sig = fd['signal']
-                    curr_env = compute_hilbert_envelope(curr_sig)
-                    peak_idx, peak_amp = find_peak(curr_env)
 
-                    prev_env, prev_sig = None, None
+                    prev_sig = None
                     if fi > 0 and fi - 1 < len(phase_data):
                         pf = reconstruct_frame_v5(fft_data[fi-1], phase_data[fi-1], fs, fft_size, normalize=True)
                         if pf is not None:
                             prev_sig = pf['signal']
-                            prev_env = compute_hilbert_envelope(prev_sig)
 
-                    next_env = None
+                    next_sig = None
                     if fi + 1 < len(fft_data) and fi + 1 < len(phase_data):
                         nf = reconstruct_frame_v5(fft_data[fi+1], phase_data[fi+1], fs, fft_size, normalize=True)
                         if nf is not None:
-                            next_env = compute_hilbert_envelope(nf['signal'])
+                            next_sig = nf['signal']
 
+                    ctx      = build_click_context(prev_sig, curr_sig, next_sig)
+                    resolved = resolve_click(ctx, cand['noise_floor'], cand['std_noise'])
                     features = compute_features_v5(
-                        signal=curr_sig, envelope=curr_env,
-                        fft_norm=fd['fft_norm'], freq_axis=fd['freq_axis'],
-                        noise_floor=cand['noise_floor'], std_noise=cand['std_noise'],
-                        peak_idx=peak_idx, fs=fs,
-                        next_frame_envelope=next_env,
-                        prev_frame_envelope=prev_env, prev_frame_signal=prev_sig,
+                        ctx, resolved,
+                        fd['fft_norm'], fd['freq_axis'],
+                        cand['noise_floor'], cand['std_noise'], fs,
                     )
-                    candidates_with_features.append({**cand, **features, 'peak_amp': peak_amp})
+                    peak_abs, canonical_frame_idx = click_event_key(ctx, resolved, fi)
+                    candidates_with_features.append({
+                        **cand, **features,
+                        'peak_amp': resolved['peak_amp'],
+                        'peak_abs': peak_abs,
+                        'canonical_frame_idx': canonical_frame_idx,
+                    })
                 except Exception as e:
                     print(f"Warning: frame {fi} skipped: {e}")
                     continue

@@ -232,15 +232,34 @@ STAGE2_SPR_MAX = 100.0  # Maximum acceptable Spectral Peak Ratio.
                          # Mirrors NOISE_FILTER_SPR_MAX in train_svm.py.
 
 # STAGE 4 — Deduplication (§13)
-DEDUP_WINDOW_FRAMES = 3  # Maximum frame-index gap between two detections that
-                          # are considered to belong to the same physical click.
-                          # At ~390 FPS: 3 frames ≈ 7.7 ms.
-                          # A genuine cavitation click lasts ≤ 0.5 ms (1–2 frames).
-                          # Gaps up to 3 frames cover borderline events that trigger
-                          # Stage 1 in two consecutive frames AND the unlikely case
-                          # of a 1-frame gap caused by the run-length filter keeping
-                          # both the first and last frame of a 3-frame run.
-                          # → verify experimentally if double-detections are observed.
+# Deduplication now groups by the click's ABSOLUTE peak sample (peak_abs), not by
+# frame-index proximity: once every candidate resolves its peak on the stitched
+# prev|curr|next trace (resolve_click), the two Stage 1 candidates a straddling
+# click produces resolve to the *same* peak_abs and collapse exactly. This makes
+# click identity deterministic and model-independent (the old logic broke ties by
+# svm_probability, so identity moved with every retrained model).
+PEAK_MATCH_SAMPLES = 8   # Two detections belong to the same physical click when
+                          # their peak_abs differ by ≤ this many samples (= 40 µs
+                          # @ 200 kHz). A margin, not a window: the fi and fi+1
+                          # candidates of one click resolve to an integer-identical
+                          # peak_abs, but per-frame adaptive noise can nudge the
+                          # onset/peak search by a sample or two.
+
+DEDUP_WINDOW_FRAMES = 3  # DEPRECATED for Stage 4 (superseded by PEAK_MATCH_SAMPLES).
+                          # Kept defined because src/ml/evaluate_candidates.py still
+                          # imports it; do not reference it from run_stage4_v5.
+                          # Historical meaning: max frame-index gap between two
+                          # detections treated as the same physical click (~7.7 ms).
+
+# CLICK RESOLUTION (§8 pre-processing) — used by resolve_click on the stitched trace
+CLICK_PEAK_SEARCH_SAMPLES = FFT_SIZE  # After locating the click onset, the true peak
+                                       # is argmax of the envelope over
+                                       # [onset : onset + this]. One frame (2.56 ms)
+                                       # comfortably contains a single click's rise +
+                                       # peak while being short enough that a *distinct*
+                                       # louder click rarely falls inside it. Both the
+                                       # fi and fi+1 candidates share one onset, so they
+                                       # search the identical window and agree on the peak.
 
 # STAGE VERDICT LABELS — the value of the 'stage_blocked' key written by
 # run_stages234_annotated(). The strings are part of the CSV contract: they must
@@ -1273,6 +1292,13 @@ def _build_pre_window(
     """
     Build the pre-window for a click candidate, extending into the previous frame.
 
+    DEPRECATED / no longer on the live path. compute_features_v5 now resolves the
+    click on the stitched prev|curr|next context (build_click_context +
+    resolve_click) and slices the pre-window directly from it, so the previous
+    frame no longer needs special-casing here. Kept for reference and any external
+    caller; the two now-inlined behaviours (pre_env/pre_sig) are equivalent for a
+    click fully inside the current frame.
+
     The pre-window is defined as the PRE_WINDOW_SAMPLES samples immediately
     before the click emerged from the noise floor — i.e., the last 100 samples
     before the first sample above LEVEL = noise_floor + LEVEL_STD_FACTOR × std_noise
@@ -1775,61 +1801,191 @@ def _feat_fft_features(
 # MASTER FEATURE FUNCTION
 # =============================================================================
 
-def compute_features_v5(
-    signal:              np.ndarray,
-    envelope:            np.ndarray,
-    fft_norm:            np.ndarray,
-    freq_axis:           np.ndarray,
-    noise_floor:         float,
-    std_noise:           float,
-    peak_idx:            int,
-    fs:                  int = FS,
-    next_frame_envelope: Optional[np.ndarray] = None,
-    prev_frame_envelope: Optional[np.ndarray] = None,
-    prev_frame_signal:   Optional[np.ndarray] = None,
+def build_click_context(
+    prev_sig: Optional[np.ndarray],
+    curr_sig: np.ndarray,
+    next_sig: Optional[np.ndarray],
 ) -> dict:
     """
-    Compute all 17 v5 features for a single click candidate.
+    Stitch up to three consecutive reconstructed frames into ONE continuous
+    time-domain trace, so a click that straddles a frame boundary is analysed on
+    a single array instead of being silently truncated at the 512-sample edge.
 
-    This is the single entry point for feature extraction. It:
-      1. Finds the decay window [decay_start, decay_end] via find_decay_window_v5.
-      2. Runs the OLS fit via _fit_decay_segment → τ_ms, R², fit_coverage.
-      3. Builds the pre-window (with previous-frame context) via _build_pre_window.
-      4. Calls each sub-function to compute the remaining 14 features.
-      5. Returns a flat dict with all 17 keys.
+    Only the current frame (curr_sig) is mandatory; prev_sig / next_sig are None
+    at the recording edges and are simply omitted (origin adjusts accordingly).
 
-    All shared intermediate results (decay window, pre-window) are computed once
-    and reused — no redundant work.
+    The Hilbert envelope is computed on the STITCHED signal (not per-frame then
+    concatenated), matching the Region-FFT path and giving a continuous envelope
+    across the joins. Each frame was reconstructed with its own Tukey taper, so
+    the joins carry a mild seam — their positions are returned in 'seams' so
+    callers can draw them honestly rather than pretend they are not there.
 
     Parameters
     ----------
-    signal : np.ndarray
-        Gibbs-suppressed iFFT time-domain signal for this frame [512 samples].
-    envelope : np.ndarray
-        Hilbert amplitude envelope of `signal` [512 samples, all ≥ 0].
-    fft_norm : np.ndarray
-        Mic-normalized FFT magnitudes for the full half-spectrum [256 bins].
-    freq_axis : np.ndarray
-        Frequency axis for `fft_norm` [Hz, 256 values].
-    noise_floor : float
-        Adaptive noise floor estimate [V] from AdaptiveNoiseEstimatorV5.
-    std_noise : float
-        Adaptive noise std estimate [V] from AdaptiveNoiseEstimatorV5.
-    peak_idx : int
-        Index of the amplitude peak in `envelope`.
+    prev_sig, next_sig : np.ndarray or None
+        Reconstructed iFFT signal of the previous / next frame, or None at a
+        recording boundary.
+    curr_sig : np.ndarray
+        Reconstructed iFFT signal of the current (candidate) frame.
+
+    Returns
+    -------
+    dict with keys:
+        'signal'   : np.ndarray – the stitched trace [prev | curr | next].
+        'envelope' : np.ndarray – Hilbert envelope of the stitched trace.
+        'origin'   : int        – index of curr_sig's first sample in 'signal'.
+        'n_frame'  : int        – len(curr_sig); the current-frame span is
+                                  [origin : origin + n_frame].
+        'seams'    : list[int]  – sample indices of the frame joins within
+                                  'signal' (for honest rendering).
+    """
+    parts: list = []
+    seams: list = []
+    if prev_sig is not None and len(prev_sig) > 0:
+        parts.append(np.asarray(prev_sig, dtype=np.float64))
+        seams.append(len(parts[-1]))
+    origin = sum(len(p) for p in parts)
+    parts.append(np.asarray(curr_sig, dtype=np.float64))
+    if next_sig is not None and len(next_sig) > 0:
+        seams.append(sum(len(p) for p in parts))
+        parts.append(np.asarray(next_sig, dtype=np.float64))
+
+    signal = np.concatenate(parts) if len(parts) > 1 else parts[0]
+    return {
+        'signal':   signal,
+        'envelope': compute_hilbert_envelope(signal),
+        'origin':   int(origin),
+        'n_frame':  int(len(curr_sig)),
+        'seams':    seams,
+    }
+
+
+def resolve_click(
+    ctx:         dict,
+    noise_floor: float,
+    std_noise:   float,
+) -> dict:
+    """
+    Locate the click on the stitched context and return its boundaries in a
+    SINGLE coordinate system (indices into ctx['signal'] / ctx['envelope']).
+
+    This is what makes borderline features frame-grid independent AND makes the
+    two Stage 1 candidates of a straddling click collapse:
+
+      1. Frame-local peak — argmax of the envelope over the current frame only
+         (the excursion Stage 1 actually flagged for this candidate).
+      2. Onset — scan BACKWARD from that peak to the last sample below
+         LEVEL = noise_floor + LEVEL_STD_FACTOR × std_noise. Because the search
+         runs over the stitched trace, an onset in the previous frame is found
+         rather than clamped away. The fi and fi+1 candidates of one click reach
+         the SAME onset here.
+      3. True peak — argmax of the envelope over
+         [onset : onset + CLICK_PEAK_SEARCH_SAMPLES]. Both candidates share the
+         onset and the window, so they recover the SAME peak (the fi+1
+         candidate's frame-local peak is only the decay tail; scanning back and
+         re-maximising recovers the real peak).
+      4. Decay window — find_decay_window_v5 on the stitched envelope from the
+         true peak. next_frame_envelope=None because ctx['envelope'] already
+         contains the next frame.
+
+    Returns
+    -------
+    dict with keys (int indices into ctx arrays, except peak_amp):
+        'onset', 'peak', 'decay_start', 'decay_end', 'peak_amp'
+    """
+    env     = ctx['envelope']
+    origin  = ctx['origin']
+    n_frame = ctx['n_frame']
+    n_ext   = len(env)
+
+    # 1. Frame-local peak — the Stage-1 excursion for THIS candidate's frame.
+    frame_hi   = min(origin + n_frame, n_ext)
+    frame_peak = origin + int(np.argmax(env[origin:frame_hi]))
+
+    # 2. Onset — last sub-LEVEL sample before the frame-local peak.
+    level = noise_floor + LEVEL_STD_FACTOR * std_noise
+    onset = 0
+    for n in range(frame_peak - 1, -1, -1):
+        if env[n] < level:
+            onset = n
+            break
+
+    # 3. True peak — global max of the click from the onset.
+    search_hi = min(n_ext, onset + CLICK_PEAK_SEARCH_SAMPLES)
+    peak = onset + int(np.argmax(env[onset:search_hi]))
+
+    # 4. Decay window on the stitched envelope (already includes the next frame).
+    window      = find_decay_window_v5(env, peak, noise_floor, std_noise,
+                                       next_frame_envelope=None)
+    decay_start = min(int(window['decay_start']), n_ext - 1)
+    decay_end   = min(int(window['decay_end']),   n_ext - 1)
+    if decay_end < decay_start:
+        decay_end = decay_start
+
+    return {
+        'onset':       int(onset),
+        'peak':        int(peak),
+        'decay_start': int(decay_start),
+        'decay_end':   int(decay_end),
+        'peak_amp':    float(env[peak]),
+    }
+
+
+def click_event_key(ctx: dict, resolved: dict, frame_idx: int) -> tuple:
+    """
+    Absolute, model-independent identity of a resolved click.
+
+    peak_abs            : the peak's absolute sample index in the recording,
+                          independent of which frame's candidate resolved it. The
+                          fi and fi+1 candidates of a straddling click yield an
+                          integer-identical peak_abs (it is exact sample
+                          arithmetic), which is what lets Stage 4 collapse them.
+    canonical_frame_idx : the frame that OWNS the peak (peak_abs // FFT_SIZE).
+
+    frame_idx is the candidate's own frame (the frame at ctx['origin']).
+    """
+    peak_abs = frame_idx * FFT_SIZE + (resolved['peak'] - ctx['origin'])
+    canonical_frame_idx = peak_abs // FFT_SIZE
+    return int(peak_abs), int(canonical_frame_idx)
+
+
+def compute_features_v5(
+    ctx:         dict,
+    resolved:    dict,
+    fft_norm:    np.ndarray,
+    freq_axis:   np.ndarray,
+    noise_floor: float,
+    std_noise:   float,
+    fs:          int = FS,
+) -> dict:
+    """
+    Compute all 17 v5 features for a single resolved click candidate.
+
+    Every time-domain feature is computed on the STITCHED context
+    (ctx['signal'] / ctx['envelope']) using the context-relative indices in
+    `resolved` (onset, peak, decay_start, decay_end). Because the arrays already
+    span prev|curr|next, an index past the current-frame boundary addresses real
+    samples instead of silently truncating — the frame-straddle bug that made
+    ZCR_post / kurtosis / centroid_shift_hz / asymmetry_integral wrong for
+    borderline clicks is structurally impossible here.
+
+    The spectral features (SPR, R_spectral, FPE_hz via _feat_fft_features) still
+    use the frame's transmitted FFT — migrating them to a Region-FFT window over
+    [onset, decay_end] is a separate, deferred change.
+
+    Parameters
+    ----------
+    ctx : dict
+        Output of build_click_context — stitched 'signal'/'envelope' + 'origin'.
+    resolved : dict
+        Output of resolve_click — onset/peak/decay_start/decay_end (indices into
+        the ctx arrays) + peak_amp.
+    fft_norm, freq_axis : np.ndarray
+        Mic-normalized frame FFT magnitudes and their frequency axis [Hz].
+    noise_floor, std_noise : float
+        Adaptive noise estimates [V] for the candidate frame.
     fs : int
         Sampling rate [Hz].
-    next_frame_envelope : np.ndarray or None
-        Hilbert envelope of the next frame — used to extend the decay_end search
-        (find_decay_window_v5) and the post-SNR window.
-    prev_frame_envelope : np.ndarray or None
-        Hilbert envelope of the previous frame — used by _build_pre_window to
-        give pre_SNR and ZCR_pre a full frame of pre-click context regardless
-        of where in the current frame the peak lands.
-    prev_frame_signal : np.ndarray or None
-        Raw iFFT signal of the previous frame — used by _build_pre_window for
-        ZCR_pre. If None but prev_frame_envelope is given, the signal portion
-        of the previous frame is conservatively treated as zeros.
 
     Returns
     -------
@@ -1843,44 +1999,56 @@ def compute_features_v5(
         tau_ms, R2, fit_coverage,
         SPR, R_spectral, FPE_hz
     """
-    peak_amp = float(envelope[peak_idx])
+    signal   = ctx['signal']
+    envelope = ctx['envelope']
+    n_ext    = len(envelope)
 
-    # ── Step 1: decay window (shared by many features) ────────────────────────
-    window      = find_decay_window_v5(envelope, peak_idx, noise_floor, std_noise,
-                                       next_frame_envelope)
-    decay_start = window['decay_start']
-    decay_end   = window['decay_end']
-    extended    = window['extended_envelope']
+    onset       = resolved['onset']
+    peak_idx    = resolved['peak']
+    decay_start = resolved['decay_start']
+    decay_end   = resolved['decay_end']
+    peak_amp    = resolved['peak_amp']
 
-    # ── Step 2: τ, R², fit_coverage ───────────────────────────────────────────
-    fit = _fit_decay_segment(extended, decay_start, decay_end, fs)
+    # One coordinate system: every index must land inside the stitched arrays.
+    # Cheap guards that turn a would-be silent truncation into a loud failure if
+    # resolve_click and build_click_context ever disagree.
+    assert 0 <= onset <= peak_idx < n_ext, \
+        f"onset/peak out of context bounds: {onset}/{peak_idx}/{n_ext}"
+    assert peak_idx <= decay_start <= decay_end < n_ext, \
+        f"decay window out of context bounds: {decay_start}/{decay_end}/{n_ext}"
 
-    # ── Step 3: pre-window (shared by pre_SNR, ZCR_pre, kurtosis) ────────────
-    # _build_pre_window extends into the previous frame so a click near the
-    # start of a frame still gets a full pre-window for reliable estimation.
-    pre = _build_pre_window(envelope, signal, peak_idx, noise_floor, std_noise,
-                            prev_frame_envelope, prev_frame_signal)
+    # ── Decay fit: τ, R², fit_coverage (§10) ──────────────────────────────────
+    fit = _fit_decay_segment(envelope, decay_start, decay_end, fs)
 
-    # ── Step 4: compute all 17 features ───────────────────────────────────────
+    # ── Pre-window (shared by pre_SNR, ZCR_pre) — the PRE_WINDOW_SAMPLES of the
+    #    stitched trace immediately before the onset. No previous-frame special
+    #    casing: the previous frame is already part of ctx. ──────────────────────
+    pre_end   = onset + 1                       # exclusive: first click sample
+    pre_start = max(0, pre_end - PRE_WINDOW_SAMPLES)
+    pre_env   = envelope[pre_start:pre_end]
+    pre_sig   = signal[pre_start:pre_end]
+
+    # ── All 17 features ────────────────────────────────────────────────────────
     features = {}
 
     # Amplitude / SNR (§8.1–8.3)
     features['peak_SNR'] = _feat_peak_snr(peak_amp, noise_floor)
-    features['pre_SNR']  = _feat_pre_snr(pre['pre_env'], noise_floor)
-    features['post_SNR'] = _feat_post_snr(extended, decay_end, noise_floor)
+    features['pre_SNR']  = _feat_pre_snr(pre_env, noise_floor)
+    features['post_SNR'] = _feat_post_snr(envelope, decay_end, noise_floor)
 
-    # Temporal shape (§8.4–8.5)
+    # Temporal shape (§8.4–8.5) — rise/fall now cross the seam; asymmetry sees
+    # the full decay instead of a frame-clipped one.
     features.update(_feat_rise_fall_time(envelope, peak_idx, noise_floor, std_noise, fs))
     features['asymmetry_integral'] = _feat_asymmetry_integral(envelope, peak_idx, decay_end)
 
-    # Zero-crossing rates (§8.6) — ZCR_pre uses previous-frame-aware pre_sig
-    features.update(_feat_zcr_triple(signal, pre['pre_sig'], peak_idx, decay_end,
+    # Zero-crossing rates (§8.6) — ZCR_post spans the whole decay [peak, decay_end]
+    features.update(_feat_zcr_triple(signal, pre_sig, peak_idx, decay_end,
                                      fit['tau_ms'], std_noise, fs))
 
-    # Impulsivity (§8.7) — kurtosis event window starts at boundary_in_frame
-    features['kurtosis'] = _feat_kurtosis(signal, pre['boundary_in_frame'], decay_end)
+    # Impulsivity (§8.7) — event window is the whole click [onset, decay_end]
+    features['kurtosis'] = _feat_kurtosis(signal, onset, decay_end)
 
-    # Spectral evolution (§8.8)
+    # Spectral evolution (§8.8) — late segment is no longer empty for borderline clicks
     features['centroid_shift_hz'] = _feat_centroid_shift(signal, peak_idx, decay_end, fs)
 
     # Fit results as features (§10)
@@ -1888,7 +2056,7 @@ def compute_features_v5(
     features['R2']           = fit['R2']
     features['fit_coverage'] = fit['fit_coverage']
 
-    # FFT-domain features (§8.9)
+    # FFT-domain features (§8.9) — still the frame FFT (Region-FFT migration TODO)
     features.update(_feat_fft_features(fft_norm, freq_axis))
 
     return features
@@ -2033,7 +2201,7 @@ def run_stage1_v5_precomputed(dm, k: float = K_STAGE1_DEFAULT) -> list:
 
 
 # =============================================================================
-# STAGE 2 — Valid-fit gate  (§11)
+# STAGE 2 — Valid-fit gate and single tone rejection  (§11)
 # =============================================================================
 
 def run_stage2_v5(candidates: list) -> tuple:
@@ -2249,75 +2417,89 @@ def _stage3_scores(candidates: list, svm_model: dict) -> np.ndarray:
 # STAGE 4 — Deduplication  (§13)
 # =============================================================================
 
+def _det_peak_abs(det: dict) -> int:
+    """Absolute peak sample of a detection, with a frame-index fallback.
+
+    Every candidate built through resolve_click / click_event_key carries
+    'peak_abs'. The fallback keeps run_stage4_v5 usable for any legacy dict that
+    only has 'frame_idx' (treated as the frame start).
+    """
+    pa = det.get('peak_abs')
+    if pa is not None:
+        return int(pa)
+    return int(det['frame_idx']) * FFT_SIZE
+
+
 def run_stage4_v5(detections: list) -> list:
     """
     Stage 4 of the v5 click detection pipeline: deduplication  (§13).
 
-    A single physical cavitation click can produce Stage 1 candidates in more
-    than one consecutive frame when:
-      (a) the click straddles a frame boundary — Stage 1 detects it in both
-          the frame where it rises and the frame where it decays;
-      (b) the click's total energy is high enough that the first frame of a
-          2- or 3-frame run passes Stage 1 and also survives Stage 2/3.
+    A single physical cavitation click produces Stage 1 candidates in more than
+    one consecutive frame when it straddles a frame boundary — Stage 1 detects it
+    in the frame where it rises and again in the frame where it decays.
 
-    The run-length filter in Stage 1 (MAX_RUN = 3) guarantees at most 3
-    consecutive candidates per physical event. Deduplication resolves the
-    remaining duplicates by grouping nearby detections and keeping the one
-    with the highest SVM probability (highest model confidence).
+    Deduplication now groups by the click's ABSOLUTE peak sample (peak_abs), not
+    by frame-index proximity. Once every candidate resolves its peak on the
+    stitched prev|curr|next trace (resolve_click), the two candidates of one
+    straddling click carry an integer-identical peak_abs, so they land in the
+    same group by construction. This makes identity deterministic and
+    model-independent — the old logic broke ties by svm_probability, so which
+    frame "was" the click shifted with every retrained model.
 
     Algorithm:
-        1. Sort detections by frame_idx.
-        2. Assign each detection to a group: a new group starts whenever the
-           gap to the previous detection exceeds DEDUP_WINDOW_FRAMES.
-           (Single-linkage chaining: frames 10-11-14 with window=3 form one
-            group because each consecutive pair is within the window.)
-        3. From each group, keep only the detection with the highest
-           svm_probability. Ties are broken by keeping the earlier frame.
+        1. Sort detections by peak_abs.
+        2. Start a new group whenever the peak_abs gap exceeds
+           PEAK_MATCH_SAMPLES (a small margin for per-frame noise jitter, NOT a
+           multi-millisecond window — two genuinely distinct clicks are now kept
+           separate instead of being merged).
+        3. From each group keep the CANONICAL representative: the candidate whose
+           own frame owns the peak (frame_idx == canonical_frame_idx), because
+           its context has the peak centred and therefore the cleanest envelope.
+           If none/several qualify, fall back to highest svm_probability, then
+           earliest frame.
 
     Parameters
     ----------
     detections : list of dict
-        Stage 3 survivors. Each dict must contain:
-            'frame_idx'       : int   — frame index in the recording
-            'svm_probability' : float — SVM confidence score (used to break ties)
+        Stage 3 survivors. Each dict should carry 'peak_abs' and
+        'canonical_frame_idx' (from click_event_key); 'frame_idx' and
+        'svm_probability' are used for representative selection.
 
     Returns
     -------
     list of dict
-        Deduplicated detections, sorted by frame_idx.
-        The returned dicts are the same objects as in the input (no copying),
-        so all original keys (features, noise estimates, etc.) are preserved.
+        Deduplicated detections, sorted by peak_abs. The returned dicts are the
+        same objects as in the input (no copying), so all keys are preserved.
     """
     if len(detections) <= 1:
         return list(detections)
 
-    # ── Step 1: sort by frame index ──────────────────────────────────────────
-    sorted_dets = sorted(detections, key=lambda d: d['frame_idx'])
+    # ── Step 1: sort by absolute peak sample ─────────────────────────────────
+    sorted_dets = sorted(detections, key=_det_peak_abs)
 
-    # ── Step 2: group by proximity ───────────────────────────────────────────
-    # Build a list of groups, where each group is a list of detections.
-    # A new group starts when the frame gap to the previous detection exceeds
-    # DEDUP_WINDOW_FRAMES.
+    # ── Step 2: group by peak-sample proximity ───────────────────────────────
     groups  = []
     current = [sorted_dets[0]]
-
     for det in sorted_dets[1:]:
-        gap = det['frame_idx'] - current[-1]['frame_idx']
-        if gap <= DEDUP_WINDOW_FRAMES:
+        if _det_peak_abs(det) - _det_peak_abs(current[-1]) <= PEAK_MATCH_SAMPLES:
             current.append(det)   # same physical click → extend current group
         else:
-            groups.append(current)   # unambiguously a new event
+            groups.append(current)
             current = [det]
-    groups.append(current)           # close the final group
+    groups.append(current)
 
-    # ── Step 3: keep the highest-confidence detection from each group ─────────
-    best = []
-    for group in groups:
-        # argmax on svm_probability; Python's max() is stable so equal values
-        # naturally preserve the earlier frame (sorted order from Step 1).
-        best.append(max(group, key=lambda d: d['svm_probability']))
+    # ── Step 3: keep the canonical representative from each group ─────────────
+    def pick(group):
+        canon = group[0].get('canonical_frame_idx')
+        if canon is None:
+            canon = _det_peak_abs(group[0]) // FFT_SIZE
+        owners = [d for d in group if d.get('frame_idx') == canon]
+        pool = owners if owners else group
+        # highest svm_probability, ties broken toward the earliest frame
+        return max(pool, key=lambda d: (d.get('svm_probability', 0.0),
+                                        -int(d.get('frame_idx', 0))))
 
-    return best
+    return [pick(g) for g in groups]
 
 
 # =============================================================================

@@ -50,6 +50,8 @@ from core.click_pipeline_v5 import (
     run_fit_pipeline_v5,
     find_decay_window_v5,
     _fit_decay_segment,
+    build_click_context,
+    resolve_click,
     compute_features_v5,
     _normalize_fft,
     _feat_fft_features,
@@ -711,9 +713,9 @@ class IFFTWindow(QDialog):
             full_freq     = np.zeros(V5_FFT_SIZE // 2)
             fft_norm_full = np.zeros(V5_FFT_SIZE // 2)
 
-        # ── Fetch adjacent frame envelopes for pre/post SNR ───────────────────
-        prev_env = None; prev_sig = None
-        next_env = None
+        # ── Fetch adjacent frame SIGNALS for the stitched context ─────────────
+        prev_sig = None
+        next_sig = None
 
         if dm is not None and fi > 0:
             prev_frame = reconstruct_frame_v5(
@@ -723,7 +725,6 @@ class IFFTWindow(QDialog):
             )
             if prev_frame:
                 prev_sig = prev_frame['signal']
-                prev_env = compute_hilbert_envelope(prev_sig)
 
         if dm is not None and fi + 1 < dm.total_frames:
             next_frame = reconstruct_frame_v5(
@@ -732,21 +733,19 @@ class IFFTWindow(QDialog):
                 normalize=self.is_normalized
             )
             if next_frame:
-                next_env = compute_hilbert_envelope(next_frame['signal'])
+                next_sig = next_frame['signal']
 
-        # ── Compute all 17 features ───────────────────────────────────────────
+        # ── Compute all 17 features on the stitched context ───────────────────
+        ctx      = build_click_context(prev_sig, current_signal, next_sig)
+        resolved = resolve_click(ctx, noise_floor, std_noise)
         features = compute_features_v5(
-            signal              = current_signal,
-            envelope            = self.envelope_data,
-            fft_norm            = fft_norm_full,
-            freq_axis           = full_freq,
-            noise_floor         = noise_floor,
-            std_noise           = std_noise,
-            peak_idx            = peak_idx,
-            next_frame_envelope = next_env,
-            prev_frame_envelope = prev_env,
-            prev_frame_signal   = prev_sig,
+            ctx, resolved,
+            fft_norm_full, full_freq,
+            noise_floor, std_noise,
         )
+        # next-frame envelope kept for the frame-relative fit overlay below
+        next_env = ctx['envelope'][ctx['origin'] + ctx['n_frame']:] \
+            if ctx['origin'] + ctx['n_frame'] < len(ctx['envelope']) else None
 
         print(f"   τ = {features['tau_ms']:.4f} ms   R² = {features['R2']:.4f}")
 
@@ -1108,18 +1107,12 @@ class IFFTWindow(QDialog):
         if cur_sig is None:
             return None
 
-        parts = []
-        seam_idx = []
-        if prev_sig is not None:
-            parts.append(prev_sig)
-            seam_idx.append(len(prev_sig))
-        origin = sum(len(p) for p in parts)
-        parts.append(cur_sig)
-        if next_sig is not None:
-            seam_idx.append(sum(len(p) for p in parts))
-            parts.append(next_sig)
-
-        signal = np.concatenate(parts)
+        # Stitching + envelope are shared with the click pipeline so Region-FFT
+        # and the detector see byte-identical context. build_click_context
+        # returns seams as sample indices; we map them onto the absolute axis.
+        ctx    = build_click_context(prev_sig, cur_sig, next_sig)
+        signal = ctx['signal']
+        origin = ctx['origin']
 
         # Absolute time: sample `origin` is the start of frame fi.
         frame_start = fi * (fft_size / fs)
@@ -1128,9 +1121,10 @@ class IFFTWindow(QDialog):
         return {
             'time': time,
             'signal': signal,
-            'envelope': compute_hilbert_envelope(signal),
+            'envelope': ctx['envelope'],
             'origin': origin,
-            'seams': [float(time[i]) for i in seam_idx if 0 <= i < len(time)],
+            'n_frame': ctx['n_frame'],
+            'seams': [float(time[i]) for i in ctx['seams'] if 0 <= i < len(time)],
             'fs': fs,
             'fft_size': fft_size,
         }
