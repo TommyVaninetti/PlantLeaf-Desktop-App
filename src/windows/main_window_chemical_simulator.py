@@ -529,11 +529,12 @@ class MainWindowChemicalSimulator(QMainWindow):
 
     def _load_paudio(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Open .paudio File", "",
+            self, "Open .paudio File", self.settings_manager.get_last_directory("chem_sim_paudio"),
             "PlantLeaf Audio (*.paudio);;All Files (*)"
         )
         if not file_path:
             return
+        self.settings_manager.set_last_directory("chem_sim_paudio", file_path)
 
         try:
             import struct, zlib, json as _json
@@ -957,14 +958,16 @@ class MainWindowChemicalSimulator(QMainWindow):
         if not self.sim_result:
             QMessageBox.warning(self, "No Data", "Run a simulation first.")
             return
+        start_dir = self.settings_manager.get_last_directory("chem_sim_report")
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "Save PDF Report", "report_acoustic.pdf", "PDF Files (*.pdf)"
+            self, "Save PDF Report", os.path.join(start_dir, "report_acoustic.pdf"), "PDF Files (*.pdf)"
         )
         if not file_path:
             return
         try:
             from chemical_simulators.report_acoustic import generate_report
             generate_report(simulation_result=self.sim_result, output_path=file_path)
+            self.settings_manager.set_last_directory("chem_sim_report", file_path)
             QMessageBox.information(self, "Done", f"PDF saved to:\n{file_path}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not generate report:\n{str(e)}")

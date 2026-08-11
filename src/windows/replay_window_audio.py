@@ -2529,12 +2529,14 @@ class ReplayWindowAudio(ReplayBaseWindow):
 
         default_name = f"{Path(self.file_path).stem}_detections.csv" \
             if getattr(self, 'file_path', None) else "detections.csv"
+        start_dir = self.settings_manager.get_last_directory("export_detections")
 
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export detections", default_name, "CSV (*.csv)"
+            self, "Export detections", os.path.join(start_dir, default_name), "CSV (*.csv)"
         )
         if not path:
             return
+        self.settings_manager.set_last_directory("export_detections", path)
 
         # Export what is on screen: 'Confirmed only' exports the clicks, 'All
         # candidates' exports the full annotated census.

@@ -682,10 +682,11 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
 
         # --- Selezione file ---
         if ask_filename:
+            start_dir = self.settings_manager.get_last_directory("save_voltage")
             filename, _ = QFileDialog.getSaveFileName(
                 self,
                 "Save Voltage Data",
-                f"voltage_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pvolt",
+                os.path.join(start_dir, f"voltage_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pvolt"),
                 "PlantLeaf Voltage (*.pvolt);;All Files (*)"
             )
             if not filename:
@@ -693,6 +694,7 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
             if not filename.endswith('.pvolt'):
                 filename += '.pvolt'
             self._last_saved_file = filename
+            self.settings_manager.set_last_directory("save_voltage", filename)
             print(f"📁 File definitivo scelto: {filename}")
         else:
             # Salvataggio automatico: usa il file definitivo se esiste

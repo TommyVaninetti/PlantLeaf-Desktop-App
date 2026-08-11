@@ -30,9 +30,6 @@ class FileHandlerMixin:
     - Callback di caricamento (progress, finished, error, cancel)
     """
     
-    # Variabile di classe per memorizzare l'ultima directory usata
-    _last_used_directory = None
-    
     def open_file_action(self, file_path=None):
         """
         Apre un file di analisi PlantLeaf (.pvolt o .paudio).
@@ -54,12 +51,9 @@ class FileHandlerMixin:
             if hasattr(self, 'clear_experiment_action') and not getattr(self, 'replay_requested', False):
                 self.clear_experiment_action()
             
-            # Determina la directory di partenza
-            if FileHandlerMixin._last_used_directory and os.path.exists(FileHandlerMixin._last_used_directory):
-                start_directory = FileHandlerMixin._last_used_directory
-            else:
-                start_directory = os.path.expanduser("~")  # Home dell'utente
-            
+            # Determina la directory di partenza (ultima usata, persistita tra sessioni)
+            start_directory = self.settings_manager.get_last_directory("open_analysis_file")
+
             print(f"📁 Opening file dialog from: {start_directory}")
             file_dialog = QFileDialog()
             self.file_path, _ = file_dialog.getOpenFileName(
@@ -68,10 +62,10 @@ class FileHandlerMixin:
                 start_directory,  # ← Qui impostiamo la directory di partenza
                 "PlantLeaf Files (*.pvolt *.paudio);;PlantLeaf Voltage (*.pvolt);;PlantLeaf Audio (*.paudio);;All Files (*)"
             )
-            
+
             # Memorizza la directory per la prossima volta
             if self.file_path:
-                FileHandlerMixin._last_used_directory = os.path.dirname(self.file_path)
+                self.settings_manager.set_last_directory("open_analysis_file", self.file_path)
         
         else:
             self.file_path = file_path

@@ -3280,20 +3280,24 @@ class MathOperations(QDialog, Ui_QDialogMath):
         Esporta i dati dell'analisi corrente (parametri e segnale) in un file CSV.
         """
         import csv
+        import os
         from PySide6.QtWidgets import QFileDialog, QMessageBox
 
         # 1. Chiedi all'utente dove salvare il file
         default_filename = f"analysis_{self.name_of_analysis.replace(' ', '_')}.csv" if self.name_of_analysis else "analysis_export.csv"
+        start_dir = self.settings_manager.get_last_directory("export_csv")
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Export Analysis to CSV",
-            default_filename,
+            os.path.join(start_dir, default_filename),
             "CSV Files (*.csv)"
         )
 
         if not file_path:
             print("⚠️ CSV export cancelled.")
             return
+
+        self.settings_manager.set_last_directory("export_csv", file_path)
 
         print(f"📦 Exporting analysis to: {file_path}")
 

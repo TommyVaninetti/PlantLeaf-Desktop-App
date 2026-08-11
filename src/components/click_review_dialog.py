@@ -27,6 +27,7 @@ from PySide6.QtCore import Qt, QEvent
 from PySide6.QtGui import QPixmap, QColor, QFont
 
 from components.wide_combo_box import WideComboBox
+from core.settings_manager import SettingsManager
 
 
 SCREENSHOTS_FOLDER = 'screenshots'
@@ -125,6 +126,7 @@ class ClickReviewDialog(QDialog):
     def __init__(self, csv_path: Optional[Path] = None, parent=None, theme_manager=None):
         super().__init__(parent)
 
+        self.settings_manager = SettingsManager()
         self.theme_manager = theme_manager
         self.csv_path: Optional[Path] = None
         self.df = None                # pandas DataFrame, all columns kept as text
@@ -343,16 +345,17 @@ class ClickReviewDialog(QDialog):
     # ── Loading ───────────────────────────────────────────────────────────────
 
     def _on_open(self):
-        start = str(self.csv_path.parent) if self.csv_path else str(Path.home())
+        start = str(self.csv_path.parent) if self.csv_path else self.settings_manager.get_last_directory("review_csv")
         path, _ = QFileDialog.getOpenFileName(
             self, "Open candidates CSV", start, "Candidate CSV (*.csv)"
         )
         if path:
             self._load_csv(Path(path))
+            self.settings_manager.set_last_directory("review_csv", path)
 
     def _on_choose_screenshots_dir(self):
         """Look for screenshots somewhere other than beside the CSV."""
-        start = str(self._search_root()) if self.csv_path else str(Path.home())
+        start = str(self._search_root()) if self.csv_path else self.settings_manager.get_last_directory("review_screenshots")
         chosen = QFileDialog.getExistingDirectory(self, "Screenshots folder", start)
         if not chosen:
             return
@@ -360,6 +363,7 @@ class ClickReviewDialog(QDialog):
         self.screenshots_dir = Path(chosen)
         self._png_index = None          # different tree → the cached index is stale
         self.btn_shots_dir.setToolTip(f"Screenshots folder: {chosen}")
+        self.settings_manager.set_last_directory("review_screenshots", chosen)
         self._show_current()
 
     def _load_csv(self, path: Path):

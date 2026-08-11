@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import QThread, Signal, Qt, QPoint, QRect
 from PySide6.QtGui import QColor, QPixmap, QPainter, QFont, QImage, QPen
 
+from core.settings_manager import SettingsManager
+
 # Import v5 signal processing pipeline (use lazy imports to avoid circular imports)
 import importlib.util
 import sys
@@ -1369,8 +1371,9 @@ class DataCollectionDialogV5(QDialog):
         self.setWindowTitle("Data Collection — Stage 1 Batch Export (v5)")
         self.resize(820, 600)
 
+        self.settings_manager = SettingsManager()
         self.file_list = []
-        self.output_dir = Path.home()
+        self.output_dir = Path(self.settings_manager.get_last_directory("data_collection_output"))
         self.worker = None
         self.is_processing = False
         self.last_csv_path = None   # most recent exported CSV — opened by 'Review & Label'
@@ -1664,12 +1667,13 @@ class DataCollectionDialogV5(QDialog):
 
     def _on_browse_model(self):
         """Pick a different .pkl (other trained variants live in docs/autoclick/v5/pkl/)."""
-        start_dir = str(self.model_path.parent) if self.model_path else str(Path.home())
+        start_dir = str(self.model_path.parent) if self.model_path else self.settings_manager.get_last_directory("svm_model")
         filepath, _ = QFileDialog.getOpenFileName(
             self, "Select SVM Model", start_dir, "SVM model (*.pkl)"
         )
         if filepath:
             self._set_model_path(Path(filepath))
+            self.settings_manager.set_last_directory("svm_model", filepath)
 
     def _on_reset_model(self):
         """Go back to the model shipped with the app."""
@@ -1784,16 +1788,19 @@ class DataCollectionDialogV5(QDialog):
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "Select .paudio files",
-            str(Path.home()),
+            self.settings_manager.get_last_directory("add_paudio_files"),
             "Audio Files (*.paudio);;All Files (*)",
         )
-        
+
         for filepath in files:
             path = Path(filepath)
             if path not in [Path(self.file_list_widget.item(i).text()) for i in range(self.file_list_widget.count())]:
                 self.file_list_widget.addItem(str(path))
                 self.file_list.append(path)
-        
+
+        if files:
+            self.settings_manager.set_last_directory("add_paudio_files", files[0])
+
         self._update_export_button()
     
     def _on_remove_file(self):
@@ -1822,6 +1829,7 @@ class DataCollectionDialogV5(QDialog):
         if folder:
             self.output_dir = Path(folder)
             self.label_output.setText(str(self.output_dir))
+            self.settings_manager.set_last_directory("data_collection_output", folder)
     
     def _on_export(self):
         """Start data collection worker."""

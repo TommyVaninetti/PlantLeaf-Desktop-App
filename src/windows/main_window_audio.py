@@ -501,10 +501,11 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
 
         # --- Selezione file ---
         if ask_filename:
+            start_dir = self.settings_manager.get_last_directory("save_audio")
             filename, _ = QFileDialog.getSaveFileName(
                 self,
                 "Save Audio Data",
-                f"audio_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.paudio",
+                os.path.join(start_dir, f"audio_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.paudio"),
                 "PlantLeaf Audio (*.paudio);;All Files (*)"
             )
             if not filename:
@@ -512,6 +513,7 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
             if not filename.endswith('.paudio'):
                 filename += '.paudio'
             self._last_saved_file = filename
+            self.settings_manager.set_last_directory("save_audio", filename)
             print(f"📁 File definitivo scelto: {filename}")
         else:
             if self._last_saved_file:

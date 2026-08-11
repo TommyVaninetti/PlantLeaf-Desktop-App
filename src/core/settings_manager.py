@@ -19,6 +19,7 @@
 Gestione centralizzata delle impostazioni dell'applicazione
 """
 
+import os
 from PySide6.QtCore import QSettings
 from config.app_config import AppConfig
 
@@ -60,6 +61,24 @@ class SettingsManager:
         self.settings.sync()  # Sincronizza le impostazioni
 
     
+    # Ottiene l'ultima directory usata per un dato contesto (es. "open_analysis_file")
+    def get_last_directory(self, context: str) -> str:
+        """Restituisce l'ultima directory usata per il contesto specificato, se ancora valida"""
+        path = self.settings.value(f"last_dir/{context}", "")
+        if path and os.path.isdir(path):
+            return path
+        return os.path.expanduser("~")
+
+    # Salva l'ultima directory usata per un dato contesto
+    def set_last_directory(self, context: str, path: str):
+        """Salva la directory (dedotta da un file path o una cartella) per il contesto specificato"""
+        if not path:
+            return
+        directory = path if os.path.isdir(path) else os.path.dirname(path)
+        if directory and os.path.isdir(directory):
+            self.set_value(f"last_dir/{context}", directory)
+
+
     # Reset alle impostazioni predefinite
     def reset_to_defaults(self):
         """Reset alle impostazioni predefinite"""
