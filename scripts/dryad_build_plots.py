@@ -118,6 +118,7 @@ def _process_batch(job: dict) -> dict:
 
     mags, phases, results = inj.inject_batch(
         bed, audio, rng,
+        amplitude_mode=job["amplitude_mode"],
         target_peak_snr=job["target_snr"], spacing_s=job["spacing_s"],
         keep_render_payload=job["render_png"],
     )
@@ -179,6 +180,7 @@ def _build_jobs(clips: list[dio.DryadClip], args) -> list[dict]:
                            "condition": c.condition} for c in chunk],
                 "out_dir": str(args.out),
                 "bed_roots": list(args.bed_roots),
+                "amplitude_mode": args.amplitude_mode,
                 "target_snr": args.target_snr,
                 "spacing_s": args.spacing_s,
                 "write_paudio": not args.no_paudio,
@@ -198,11 +200,21 @@ def main(argv=None) -> int:
                         help=f"subset of {sorted(dio.CLASS_INFO)}")
     parser.add_argument("--limit-per-class", type=int, default=0,
                         help="render at most N clips per class (0 = all)")
+    parser.add_argument("--amplitude-mode", choices=inj.AMPLITUDE_MODES,
+                        default=inj.AMPLITUDE_GLOBAL_G,
+                        help="how loud each clip is injected. 'global-g' (default) applies one "
+                             "constant to every clip, so peak_SNR inherits Khait's real "
+                             "click-to-click amplitude spread and PlantLeaf's real bed floors "
+                             "- use this for anything feeding training. 'fixed-snr' forces every "
+                             "clip to --target-snr, which is right for the visualization PNGs "
+                             "(one common scale) but makes peak_SNR a label leak, so never train "
+                             "on it.")
     parser.add_argument("--target-snr", type=float, default=inj.PLANTLEAF_MEDIAN_PEAK_SNR,
-                        help="target peak_SNR. Default 12.8 is PlantLeaf's own median, the "
-                             "honest match; note Dryad clicks decay faster than PlantLeaf's, so "
-                             "at 12.8 the decay window is short and ~40%% of tau fits fail. "
-                             "Raise to 25-40 for a higher tau yield.")
+                        help="target peak_SNR for --amplitude-mode fixed-snr. Default 12.79 is "
+                             "PlantLeaf's own median. Do NOT raise it to improve the tau yield: "
+                             "higher SNR lengthens the decay window by keeping the tail above "
+                             "noise longer, which makes synthetic clicks less SNR-realistic than "
+                             "real ones.")
     parser.add_argument("--spacing-s", type=float, default=inj.DEFAULT_SPACING_S,
                         help="seconds between injected clicks within a batch")
     parser.add_argument("--clicks-per-batch", type=int, default=40,
@@ -321,18 +333,32 @@ def main(argv=None) -> int:
     snr = snr[np.isfinite(snr)]
     tau = np.array([r.get("feat_tau_ms", np.nan) for r in rows], dtype=float)
     detected = sum(1 for r in rows if r["detected"])
-    dead = sum(1 for r in rows if r.get("feat_fit_dead_zone", 0.0))
+    click_snr = np.array([r["measured_peak_snr"] for r in rows
+                          if r["is_click"] and np.isfinite(r["measured_peak_snr"])])
+    neg_snr = np.array([r["measured_peak_snr"] for r in rows
+                        if not r["is_click"] and np.isfinite(r["measured_peak_snr"])])
 
     print(f"\n{'=' * 68}\nDone in {elapsed / 60:.1f} min - {len(rows)} clips\n{'=' * 68}")
+    print(f"  amplitude mode      : {args.amplitude_mode}")
     print(f"  detected by Stage 1 : {detected}/{len(rows)} ({100 * detected / len(rows):.1f} %)")
     if len(snr):
-        print(f"  measured peak_SNR   : median {np.median(snr):.2f} "
-              f"(target {args.target_snr}, ratio {np.median(snr) / args.target_snr:.3f})")
+        if args.amplitude_mode == inj.AMPLITUDE_FIXED_SNR:
+            print(f"  measured peak_SNR   : median {np.median(snr):.2f} "
+                  f"(target {args.target_snr}, ratio {np.median(snr) / args.target_snr:.3f})")
+        else:
+            print(f"  measured peak_SNR   : p10 {np.percentile(snr, 10):.2f}  "
+                  f"median {np.median(snr):.2f}  p90 {np.percentile(snr, 90):.2f}   "
+                  f"(PlantLeaf real: {inj.PLANTLEAF_PEAK_SNR_P10} / "
+                  f"{inj.PLANTLEAF_MEDIAN_PEAK_SNR} / {inj.PLANTLEAF_PEAK_SNR_P90})")
+    if len(click_snr) and len(neg_snr):
+        # PlantLeaf's own data separates clicks from negatives by ~2.4x in median
+        # peak_SNR. Whatever ratio appears here is KHAIT'S, inherited rather than
+        # imposed -- report it rather than assume it transfers (spec B4).
+        print(f"  click/negative sep  : {np.median(click_snr) / max(np.median(neg_snr), 1e-9):.2f}x "
+              f"median peak_SNR (PlantLeaf's own data: 2.4x)")
     valid = tau[tau > 0]
     print(f"  tau_ms              : median {np.median(valid) if len(valid) else float('nan'):.3f} "
           f"over {len(valid)}/{len(tau)} successful fits")
-    print(f"  fit dead zone       : {dead} clips with decay_len in [13, 21] "
-          f"(always tau = -1; pre-existing pipeline defect)")
     if repaired_total:
         print(f"  b'CLCK' collisions repaired in .paudio payloads: {repaired_total}")
     if failures:

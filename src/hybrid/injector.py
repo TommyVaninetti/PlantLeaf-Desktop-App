@@ -73,40 +73,86 @@ from .noise_bed import BedWindow
 from .pipeline_loader import FrameDataManager, compute_stage1_arrays, load_pipeline
 
 # PlantLeaf's own confirmed clicks, from Dataset_20June2026.csv (91 positives):
-# peak_SNR median 12.8, p10 7.2, p90 39.1, heavily right-skewed.
-PLANTLEAF_MEDIAN_PEAK_SNR = 12.8
-
-# The augmentation ladder for stage 2 — spanning p10 to p90 of the distribution
-# above. Step 1 renders one image per clip, so it draws a single target.
-SNR_LADDER = (7.0, 13.0, 25.0, 40.0)
+# peak_SNR median 12.79, p10 7.19, p90 39.11, heavily right-skewed.
+PLANTLEAF_MEDIAN_PEAK_SNR = 12.79
+PLANTLEAF_PEAK_SNR_P10 = 7.19
+PLANTLEAF_PEAK_SNR_P90 = 39.11
 
 DEFAULT_SPACING_S = 1.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Amplitude model
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# AMPLITUDE_GLOBAL_G is the one used for anything feeding training.
+# AMPLITUDE_FIXED_SNR forces every clip to one target and exists only so the
+# visualization PNGs share a common scale.
+#
+# Why a single global gain, and not a target SNR
+# ----------------------------------------------
+# Forcing every clip to a fixed peak_SNR makes peak_SNR a LABEL LEAK: injected
+# clicks would sit at one value and injected negatives at another, so the feature
+# alone identifies the class. But flattening both classes onto one distribution
+# is equally wrong -- peak_SNR carries real physical information (single-feature
+# AUC 0.823 on the 285 real rows, a top-3 permutation-importance feature).
+#
+# A single global gain solves both. It IMPORTS Khait's real click-to-click
+# amplitude variation instead of inventing a distribution:
+#
+#     peak_SNR = GLOBAL_G * A_peak / nf_bed
+#
+# with spread coming from A_peak (Khait's real amplitudes) and nf_bed (PlantLeaf's
+# real 2.43-3.49 mV session floors). Both physical; neither hand-specified. The
+# click-vs-negative separation then emerges from Khait's own data.
+AMPLITUDE_GLOBAL_G = "global-g"
+AMPLITUDE_FIXED_SNR = "fixed-snr"
+AMPLITUDE_MODES = (AMPLITUDE_GLOBAL_G, AMPLITUDE_FIXED_SNR)
+
+# Volts per Dryad amplitude unit. Derived by `calibrate_global_g()` over 400
+# randomly drawn click-class clips (seed 20260813) run through the full channel
+# model and `measure_template_peak`, against the median noise floor of the 12
+# screened bed sessions (2.987 mV):
+#
+#     median A_peak = 5370.03   ->   GLOBAL_G = 12.79 * 2.987e-3 / 5370.03
+#
+# Calibrated on `measure_template_peak` output, NOT the raw int16 peak: peak_SNR
+# is defined on the reconstructed envelope, and the mic filter is
+# frequency-dependent, so int16 peak -> A_peak is not a pure scalar.
+#
+# Resulting synthetic distribution vs PlantLeaf's real clicks:
+#
+#            p10     median    p90
+#   synth    5.61    12.79     37.05
+#   real     7.19    12.79     39.11
+#
+# One constant reproduces the real dynamic range to within ~10% at both tails,
+# and the synthetic low end extends BELOW the real p10 -- so Khait's detection
+# threshold (a hard wall at peak/background ~7-10) has not truncated the range
+# that matters. That is why no coverage multiplier is applied: the measurement
+# says the range is already there.
+GLOBAL_G = 7.1142433e-06
+
+# Reference floor the constant above was calibrated against. Only used to
+# re-derive GLOBAL_G; injection always divides by the bed's own measured floor.
+CALIBRATION_NF_BED_V = 2.987e-3
 
 # How far from the predicted peak frame a Stage-1 candidate may sit and still be
 # considered this injection's detection. A click straddling a frame boundary
 # produces candidates at both fi and fi+1, which resolve_click collapses.
 _DETECTION_TOLERANCE_FRAMES = 2
 
-# Decay-window lengths for which `_fit_decay_segment` ALWAYS returns tau = -1,
-# even on a noiseless exponential. Cause (click_pipeline_v5.py:1110-1117): the
-# Gaussian smoothing uses mode='valid', which drops len(kernel)-1 = 12 samples,
-# but the convolution is skipped entirely when the segment is shorter than the
-# 13-sample kernel. So n_fit jumps 12 -> 1 as decay_len goes 12 -> 13, and does
-# not clear MIN_FIT_SAMPLES = 10 again until decay_len reaches 22.
-#
-# Verified against a pure exponential: decay_len 12 -> tau 0.150 ms, 13..21 ->
-# tau -1, 22 -> tau 0.150 ms.
-#
-# This is a pre-existing defect in the shared pipeline, not something injection
-# introduces, and it is deliberately NOT patched here: changing feature
-# computation would invalidate the trained SVM and every exported dataset.
-# It happens to be latent for PlantLeaf's own data (0 of 285 rows in
-# Dataset_20June2026.csv land in the zone; decay windows there run 39 samples
-# median for clicks, 82 for negatives), but Dryad clicks decay faster and hit it
-# often at low target SNR. Flagged per-row so the affected rows can be excluded
-# rather than silently read as "no decay".
-DEAD_ZONE_LO = 13
-DEAD_ZONE_HI = 21
+# Strata. Greenhouse Noises is acoustically a different room from the anechoic
+# chamber the rest of the corpus was recorded in -- background RMS median 942
+# against 284-312 -- so its template is windowed to the event before injection
+# (channel_model.window_to_event) and its provenance is tagged separately.
+STRATUM_ANECHOIC = "anechoic"
+STRATUM_GREENHOUSE = "greenhouse"
+_GREENHOUSE_CLASSES = ("Greenhouse Noises",)
+
+
+def stratum_for(class_name: str) -> str:
+    """Which acoustic environment a Dryad class was recorded in."""
+    return STRATUM_GREENHOUSE if class_name in _GREENHOUSE_CLASSES else STRATUM_ANECHOIC
 
 
 @dataclass
@@ -126,6 +172,8 @@ class InjectionResult:
     session_id: str
     room: str
     regime: str
+    stratum: str                # anechoic | greenhouse (acoustic environment)
+    amplitude_mode: str         # global-g | fixed-snr
     t0_sample: int
     subframe_phase: int
     frame_idx: int
@@ -155,6 +203,7 @@ class InjectionResult:
             "plant_id": self.plant_id, "sound_id": self.sound_id,
             "bed_id": self.bed_id, "session_id": self.session_id,
             "room": self.room, "regime": self.regime,
+            "stratum": self.stratum, "amplitude_mode": self.amplitude_mode,
             "t0_sample": self.t0_sample, "subframe_phase": self.subframe_phase,
             "frame_idx": self.frame_idx, "gain": self.gain,
             "target_peak_snr": self.target_peak_snr,
@@ -210,7 +259,7 @@ def measure_template_peak(template: np.ndarray) -> tuple[float, int]:
 
 def injection_gain(target_peak_snr: float, bed_noise_floor: float, template_peak: float) -> float:
     """
-    g such that the injected click lands at approximately `target_peak_snr`.
+    Fixed-SNR gain: g such that the click lands at approximately `target_peak_snr`.
 
         peak_SNR = peak_amp / noise_floor  ->  g = S * nf_bed / A_peak
 
@@ -218,10 +267,48 @@ def injection_gain(target_peak_snr: float, bed_noise_floor: float, template_peak
     envelopes, so bed noise at the peak shifts the result either way. Spec
     section 15.6 — always store the pipeline's measured value as ground truth,
     never this target.
+
+    Use this ONLY for visualization output. It flattens every clip onto one
+    amplitude and so makes peak_SNR a label leak; see `AMPLITUDE_GLOBAL_G`.
     """
     if template_peak <= 0:
         raise ValueError("template has zero amplitude; cannot scale it")
     return float(target_peak_snr) * float(bed_noise_floor) / float(template_peak)
+
+
+def calibrate_global_g(template_peaks, *, target_median_snr: float = PLANTLEAF_MEDIAN_PEAK_SNR,
+                       nf_bed: float = CALIBRATION_NF_BED_V) -> float:
+    """
+    Re-derive `GLOBAL_G` from a sample of measured template peaks.
+
+    `template_peaks` must come from `measure_template_peak()` on click-class
+    clips that have been through the full channel model — not raw int16 peaks.
+
+    Kept in the module rather than in a one-off script so the constant's
+    derivation travels with the constant, and so it can be re-run when the corpus
+    or the channel model changes.
+    """
+    peaks = np.asarray(list(template_peaks), dtype=np.float64)
+    peaks = peaks[peaks > 0]
+    if len(peaks) < 20:
+        raise ValueError(f"need at least 20 valid template peaks, got {len(peaks)}")
+    return float(target_median_snr) * float(nf_bed) / float(np.median(peaks))
+
+
+def global_gain(template_peak: float) -> float:
+    """
+    Global-gain injection: one constant for every clip, click and negative alike.
+
+    Deliberately ignores both the clip's own amplitude and the bed's floor. The
+    resulting peak_SNR = GLOBAL_G * A_peak / nf_bed then varies exactly as the
+    two physical quantities do, which is the whole point — see AMPLITUDE_GLOBAL_G.
+
+    Takes `template_peak` only to reject degenerate templates, so that both gain
+    functions have the same failure behaviour.
+    """
+    if template_peak <= 0:
+        raise ValueError("template has zero amplitude; cannot scale it")
+    return GLOBAL_G
 
 
 def plan_placements(bed: BedWindow, n_clicks: int, template_len: int,
@@ -263,6 +350,7 @@ def plan_placements(bed: BedWindow, n_clicks: int, template_len: int,
 
 def inject_batch(bed: BedWindow, clips: Sequence[ClipAudio],
                  rng: np.random.Generator, *,
+                 amplitude_mode: str = AMPLITUDE_GLOBAL_G,
                  target_peak_snr: float = PLANTLEAF_MEDIAN_PEAK_SNR,
                  spacing_s: float = DEFAULT_SPACING_S,
                  keep_render_payload: bool = True) -> tuple[np.ndarray, np.ndarray, list[InjectionResult]]:
@@ -273,6 +361,13 @@ def inject_batch(bed: BedWindow, clips: Sequence[ClipAudio],
     pipeline pass. Returns `(mags, phases, results)` — the frames are ready for
     `frame_emulator.write_paudio`.
 
+    `amplitude_mode` selects how loud each clip is injected:
+      AMPLITUDE_GLOBAL_G  — one constant for every clip. Use for anything feeding
+                            training; preserves Khait's real amplitude spread.
+      AMPLITUDE_FIXED_SNR — every clip forced to `target_peak_snr`. Visualization
+                            only: one common scale makes PNGs comparable, but it
+                            makes peak_SNR a label leak, so never train on it.
+
     All clicks in a batch share a bed, which makes the batch the natural
     bed-level grouping unit for splitting (spec section 12.4): keep a batch's
     clicks on one side of any train/validation split.
@@ -282,21 +377,31 @@ def inject_batch(bed: BedWindow, clips: Sequence[ClipAudio],
     a missed detection is itself information worth seeing.
     """
     cp = load_pipeline()
+    if amplitude_mode not in AMPLITUDE_MODES:
+        raise ValueError(f"amplitude_mode must be one of {AMPLITUDE_MODES}, got {amplitude_mode!r}")
 
     # ── 1-3. Colorize each clip and measure its reconstructed peak ────────────
-    templates, peaks, offsets = [], [], []
+    # Greenhouse clips are windowed to the event first: their chamber background
+    # is ~3x the anechoic set's and would otherwise be transplanted into the bed.
+    templates, peaks, offsets, strata = [], [], [], []
     for audio in clips:
-        template = cm.prepare_dryad_click(audio.samples)
+        stratum = stratum_for(audio.clip.class_name)
+        template = cm.prepare_dryad_click(
+            audio.samples, window_event=(stratum == STRATUM_GREENHOUSE))
         peak, offset = measure_template_peak(template)
         templates.append(template)
         peaks.append(peak)
         offsets.append(offset)
+        strata.append(stratum)
 
     template_len = max(len(t) for t in templates)
 
-    # ── 4-6. Gain from the bed's own measured floor; randomised placement ─────
+    # ── 4-6. Gain, then randomised placement ─────────────────────────────────
     placements = plan_placements(bed, len(clips), template_len, rng, spacing_s=spacing_s)
-    gains = [injection_gain(target_peak_snr, bed.noise_floor, p) for p in peaks]
+    if amplitude_mode == AMPLITUDE_GLOBAL_G:
+        gains = [global_gain(p) for p in peaks]
+    else:
+        gains = [injection_gain(target_peak_snr, bed.noise_floor, p) for p in peaks]
 
     # ── 7. Mix in the time domain, raw recorded space ─────────────────────────
     mixed = bed.signal.copy()
@@ -313,7 +418,8 @@ def inject_batch(bed: BedWindow, clips: Sequence[ClipAudio],
 
     # ── 9-10. Measure and record ─────────────────────────────────────────────
     results = []
-    for audio, template, gain, t0, offset in zip(clips, templates, gains, placements, offsets):
+    for audio, template, gain, t0, offset, stratum in zip(
+            clips, templates, gains, placements, offsets, strata):
         expected_peak = t0 + offset
         frame_idx = expected_peak // fe.FFT_SIZE
 
@@ -325,9 +431,15 @@ def inject_batch(bed: BedWindow, clips: Sequence[ClipAudio],
                 anchor = frame_idx + delta
                 break
 
+        # In global-g mode there is no per-clip target; record what the amplitude
+        # model implies for this clip so target-vs-measured stays checkable.
+        target = (target_peak_snr if amplitude_mode == AMPLITUDE_FIXED_SNR
+                  else gain * peaks[len(results)] / max(bed.noise_floor, 1e-30))
+
         result = _analyse_injection(
             cp, mags, phases, arrays, anchor, audio.clip, bed,
-            t0=t0, gain=gain, target=target_peak_snr, detected=detected,
+            t0=t0, gain=gain, target=target, detected=detected,
+            amplitude_mode=amplitude_mode, stratum=stratum,
             template=template if keep_render_payload else None,
             native=audio.samples if keep_render_payload else None,
         )
@@ -338,7 +450,8 @@ def inject_batch(bed: BedWindow, clips: Sequence[ClipAudio],
 
 def _analyse_injection(cp, mags, phases, arrays, frame_idx: int, clip: DryadClip,
                        bed: BedWindow, *, t0: int, gain: float, target: float,
-                       detected: bool, template, native) -> InjectionResult:
+                       detected: bool, amplitude_mode: str, stratum: str,
+                       template, native) -> InjectionResult:
     """
     Reconstruct the prev|curr|next context around `frame_idx` and extract features.
 
@@ -378,9 +491,11 @@ def _analyse_injection(cp, mags, phases, arrays, frame_idx: int, clip: DryadClip
         ctx, resolved, curr["fft_norm"], curr["freq_axis"], noise_floor, std_noise, fe.FS
     )
 
-    decay_len = int(resolved["decay_end"] - resolved["decay_start"])
-    features["decay_len_samples"] = float(decay_len)
-    features["fit_dead_zone"] = float(DEAD_ZONE_LO <= decay_len <= DEAD_ZONE_HI)
+    # Kept because decay_len explains most of the variation in tau and R2, and
+    # short windows are exactly where Dryad clicks differ from PlantLeaf's
+    # (median 24 vs 39). No dead-zone flag any more: the [13,21] hole in
+    # _fit_decay_segment was fixed August 2026.
+    features["decay_len_samples"] = float(resolved["decay_end"] - resolved["decay_start"])
 
     render = None
     if template is not None:
@@ -396,6 +511,7 @@ def _analyse_injection(cp, mags, phases, arrays, frame_idx: int, clip: DryadClip
         condition=clip.condition, is_click=clip.is_click, source_path=str(clip.path),
         plant_id=clip.plant_id, sound_id=clip.sound_id,
         bed_id=bed.bed_id, session_id=bed.session_id, room=bed.room, regime=bed.regime,
+        stratum=stratum, amplitude_mode=amplitude_mode,
         t0_sample=int(t0), subframe_phase=int(t0 % fe.FFT_SIZE), frame_idx=int(frame_idx),
         gain=float(gain), target_peak_snr=float(target), detected=bool(detected),
         measured_peak_snr=float(features.get("peak_SNR", float("nan"))),

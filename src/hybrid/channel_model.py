@@ -312,11 +312,97 @@ def colorize(x: np.ndarray, fs: int = PLANTLEAF_FS, magnitude_exponent: float = 
     return np.fft.ifft(np.fft.fft(x) * filt).real
 
 
-def prepare_dryad_click(x_500k: np.ndarray, magnitude_exponent: float = 1.0) -> np.ndarray:
+def window_to_event(x: np.ndarray, fs: int = PLANTLEAF_FS, *,
+                    pre_ms: float = 0.15, post_ms: float = 0.60,
+                    taper_fraction: float = 0.25) -> np.ndarray:
     """
-    Full Dryad -> PlantLeaf channel model: resample, then colorize.
+    Suppress everything outside the event, with a soft taper.
+
+    A Dryad clip is 2 ms long but the event occupies well under 1 ms of it. The
+    rest is Khait's own chamber background, and injecting the whole clip
+    transplants that background into a PlantLeaf noise bed on top of the bed's
+    own noise. Measured at peak_SNR 12.8, the added noise is:
+
+        four click classes + Empty Pot : 0.38 - 0.68 x nf_bed
+        Greenhouse Noises              : 2.17 x nf_bed   <-- roughly triples it
+
+    Greenhouse recordings are a genuinely louder room (background RMS median 942
+    against 284-312 for the anechoic set), so without this they would carry a
+    systematic noise signature into every negative built from them — precisely
+    the domain-bias failure the name-the-dataset check looks for.
+
+    Spec section 10 asks for exactly this treatment, and for the same reason:
+    "requires tight extraction/windowing with a soft taper, not a naive crop" —
+    a hard crop drags a spectral discontinuity in at the template edges.
+
+    Note this does NOT lengthen decay windows. That was tested directly: full
+    clip vs windowed gives decay_len median 24 -> 23 and dead-zone hits
+    16/50 -> 18/50 on Tomato Cut. Dryad's short decays are intrinsic, so this
+    helps the noise budget only.
+
+    Parameters
+    ----------
+    pre_ms, post_ms : float
+        Kept span either side of the envelope peak. The default 0.15/0.60 ms
+        comfortably contains the measured decay (peak to 3x-noise takes 16-22
+        samples median, p90 <= 43, i.e. under 0.22 ms).
+    taper_fraction : float
+        Raised-cosine fraction at each edge of the kept span.
+
+    Returns a signal of the same length, zero outside the tapered span.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    envelope = _hilbert_envelope(x)
+    peak = int(np.argmax(envelope))
+
+    lo = max(0, peak - int(pre_ms * 1e-3 * fs))
+    hi = min(len(x), peak + int(post_ms * 1e-3 * fs))
+    span = hi - lo
+    if span < 4:
+        return x.copy()
+
+    taper = int(max(2, round(taper_fraction * span)))
+    taper = min(taper, span // 2)
+    window = np.ones(span, dtype=np.float64)
+    ramp = 0.5 * (1.0 - np.cos(np.pi * np.arange(taper) / taper))
+    window[:taper] = ramp
+    window[span - taper:] = ramp[::-1]
+
+    out = np.zeros_like(x)
+    out[lo:hi] = x[lo:hi] * window
+    return out
+
+
+def _hilbert_envelope(x: np.ndarray) -> np.ndarray:
+    """
+    Analytic-signal envelope, pure numpy.
+
+    Mirrors `click_pipeline_v5.compute_hilbert_envelope` rather than calling it,
+    so this module keeps working with no pipeline present (and for the same
+    reason that function exists: scipy's hilbert triggers BLAS calls that
+    segfault inside QThreads on macOS).
+    """
+    n = len(x)
+    weights = np.zeros(n)
+    weights[0] = 1.0
+    weights[1:n // 2] = 2.0
+    weights[n // 2] = 1.0
+    return np.abs(np.fft.ifft(np.fft.fft(x) * weights))
+
+
+def prepare_dryad_click(x_500k: np.ndarray, magnitude_exponent: float = 1.0, *,
+                        window_event: bool = False) -> np.ndarray:
+    """
+    Full Dryad -> PlantLeaf channel model: resample, colorize, optionally window.
 
     Returns a 200 kHz signal in raw recorded space (by default), ready to be
     scaled by the injection gain and added to a noise bed.
+
+    `window_event=True` applies `window_to_event()` afterwards — used for the
+    Greenhouse stratum, whose background would otherwise dominate the bed.
+    Windowing happens AFTER colorization so the mic filter sees the clip's real
+    edges rather than a taper's, keeping the circular-convolution wrap (see
+    `colorize`) inside the noise region where it is harmless.
     """
-    return colorize(resample_500k_to_200k(x_500k), PLANTLEAF_FS, magnitude_exponent)
+    signal = colorize(resample_500k_to_200k(x_500k), PLANTLEAF_FS, magnitude_exponent)
+    return window_to_event(signal, PLANTLEAF_FS) if window_event else signal

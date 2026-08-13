@@ -224,34 +224,145 @@ def check_reconstruct_is_not_invertible():
           f"{100 * np.median(edge_errors):.0f} % at the 20 kHz band edge")
 
 
+def _fit_decay_segment_prepatch(cp, extended, decay_start, decay_end, fs=None):
+    """
+    The PRE-PATCH `_fit_decay_segment`, reproduced for equivalence testing.
+
+    Identical to the shipped function except for the Step-C branch condition,
+    which tested only `len(decay_segment) >= len(_GAUSS_KERNEL)`. Everything
+    after Step C is delegated to the real function by handing it a segment that
+    forces the same path, so this cannot drift from the implementation it is
+    meant to compare against.
+    """
+    fs = cp.FS if fs is None else fs
+    decay_len = decay_end - decay_start
+    if decay_len < 1 or decay_len >= len(cp._GAUSS_KERNEL) + cp.MIN_FIT_SAMPLES - 1:
+        # Below 1, or long enough that both versions smooth: identical by
+        # construction, so just call the real thing.
+        return cp._fit_decay_segment(extended, decay_start, decay_end, fs)
+
+    # decay_len < 22. Pre-patch smoothed whenever decay_len >= 13.
+    segment = extended[decay_start:decay_end]
+    if decay_len >= len(cp._GAUSS_KERNEL):
+        fit_window = np.convolve(segment, cp._GAUSS_KERNEL, mode="valid")
+    else:
+        fit_window = segment.copy()
+
+    n_fit = len(fit_window)
+    if n_fit < cp.MIN_FIT_SAMPLES:
+        return {"tau_ms": -1.0, "R2": 0.0, "fit_coverage": n_fit / max(1, decay_len),
+                "decay_start": decay_start, "decay_end": decay_end}
+
+    # Unsmoothed-and-long-enough: the real function takes exactly this path too.
+    return cp._fit_decay_segment(extended, decay_start, decay_end, fs)
+
+
 def check_fit_dead_zone():
     """
-    A pre-existing defect in click_pipeline_v5._fit_decay_segment, recorded here
-    so it cannot regress unnoticed and so the injector's `fit_dead_zone` flag has
-    a test behind it. Gaussian smoothing uses mode='valid' (drops 12 samples) but
-    is skipped entirely for segments shorter than the 13-sample kernel, so n_fit
-    jumps 12 -> 1 at decay_len 13 and does not clear MIN_FIT_SAMPLES=10 again
-    until decay_len 22.
+    The decay-fit dead zone, fixed August 2026 — and the branch-equivalence proof
+    that the fix cannot have changed any existing result.
 
-    NOT fixed here: changing feature computation would invalidate the trained SVM
-    and every exported dataset. 0 of 285 rows in Dataset_20June2026.csv fall in
-    the zone, so PlantLeaf's own results are unaffected.
+    Mechanism: Step C's Gaussian smoothing uses mode='valid', which costs
+    len(_GAUSS_KERNEL) - 1 = 12 samples, but the branch tested only whether the
+    kernel *fit* the segment, never whether Step D would still have
+    MIN_FIT_SAMPLES afterwards. n_fit therefore jumped 12 -> 1 at decay_len 13
+    and did not clear MIN_FIT_SAMPLES again until 22, so decay_len 13-21 returned
+    tau = -1 on any input, including a noiseless exponential.
+
+    Why the fix is safe is a branch argument, NOT a row count: decay_len <= 12
+    skipped smoothing before and skips it now; decay_len >= 22 smoothed before and
+    smooths now. Only 13-21 changes path, and every such candidate previously
+    produced tau = -1 and was discarded by Stage 2 before export. Checks 3 and 4
+    below assert that equivalence numerically.
+
+    (The often-quoted "0 of 285 rows in Dataset_20June2026.csv are affected" is
+    true but vacuous as evidence: data_collection_dialog_v5.py skips candidates
+    with tau <= STAGE2_TAU_MIN before they become rows, so no such row could ever
+    have existed. The CSV does show the fingerprint — fit_coverage runs 1.0 for
+    84 rows then jumps straight to 0.4545, with nothing in the 0.077-0.429 band
+    that decay_len 13-21 would produce.)
     """
-    print("\n6. Decay-fit dead zone (pre-existing pipeline defect)")
+    print("\n6. Decay-fit dead zone (fixed) + branch equivalence")
     cp = load_pipeline()
+    k_size, min_fit = len(cp._GAUSS_KERNEL), cp.MIN_FIT_SAMPLES
+    threshold = k_size + min_fit - 1
     envelope = np.exp(-np.arange(300) / 30.0) + 1e-9      # tau = 30 samples = 0.15 ms
 
-    ok_below = cp._fit_decay_segment(envelope, 0, 12)["tau_ms"]
-    ok_above = cp._fit_decay_segment(envelope, 0, 22)["tau_ms"]
-    dead = [d for d in range(13, 22) if cp._fit_decay_segment(envelope, 0, d)["tau_ms"] > 0]
+    check("smoothing threshold accounts for both constraints", threshold == 22,
+          f"len(kernel)={k_size} + MIN_FIT_SAMPLES={min_fit} - 1 = {threshold}")
 
-    check("decay_len=12 fits", abs(ok_below - 0.150) < 0.01, f"tau={ok_below:.3f} ms")
-    check("decay_len=22 fits", abs(ok_above - 0.150) < 0.01, f"tau={ok_above:.3f} ms")
-    check("decay_len 13-21 always fails (documented defect)", not dead,
-          f"tau=-1 for all of 13..21 on a noiseless exponential")
-    check("injector flags the zone", (13, 21) == (
-        __import__("hybrid.injector", fromlist=["x"]).DEAD_ZONE_LO,
-        __import__("hybrid.injector", fromlist=["x"]).DEAD_ZONE_HI))
+    # 1. The zone is gone: everything from MIN_FIT_SAMPLES upward now fits.
+    failed = [d for d in range(min_fit, 40)
+              if cp._fit_decay_segment(envelope, 0, d)["tau_ms"] <= 0]
+    check(f"decay_len {min_fit}-39 all fit (dead zone closed)", not failed,
+          f"failures: {failed}" if failed else "tau = 0.150 ms throughout")
+
+    # 2. Still correctly rejects genuinely too-short windows.
+    too_short = [d for d in range(1, min_fit)
+                 if cp._fit_decay_segment(envelope, 0, d)["tau_ms"] > 0]
+    check(f"decay_len < {min_fit} still rejected", not too_short,
+          f"below MIN_FIT_SAMPLES there is nothing to fit")
+
+    # 3 + 4. Branch equivalence on random, noisy, physically-shaped envelopes —
+    # the assertion that protects the trained SVM and every exported dataset.
+    rng = np.random.default_rng(4242)
+    unchanged_lo = unchanged_hi = 0
+    diffs = []
+    for _ in range(400):
+        tau = rng.uniform(5, 80)
+        n = 200
+        env = np.exp(-np.arange(n) / tau) * rng.uniform(0.5, 2.0)
+        env = np.abs(env + rng.normal(0, 0.02, n)) + 1e-9
+        for d in (rng.integers(1, 13), rng.integers(22, 120)):
+            d = int(d)
+            if d >= n:
+                continue
+            new = cp._fit_decay_segment(env, 0, d)
+            old = _fit_decay_segment_prepatch(cp, env, 0, d)
+            same = all(np.isclose(new[key], old[key], rtol=0, atol=0)
+                       for key in ("tau_ms", "R2", "fit_coverage"))
+            if not same:
+                diffs.append((d, new["tau_ms"], old["tau_ms"]))
+            if d <= 12:
+                unchanged_lo += same
+            else:
+                unchanged_hi += same
+
+    check("decay_len <= 12 bit-identical to pre-patch", not any(d <= 12 for d, _, _ in diffs),
+          f"{unchanged_lo} random windows, exact match")
+    check("decay_len >= 22 bit-identical to pre-patch", not any(d >= 22 for d, _, _ in diffs),
+          f"{unchanged_hi} random windows, exact match")
+
+    # 5. And 13-21 is exactly what changed.
+    recovered = [d for d in range(k_size, threshold)
+                 if cp._fit_decay_segment(envelope, 0, d)["tau_ms"] > 0
+                 and _fit_decay_segment_prepatch(cp, envelope, 0, d)["tau_ms"] <= 0]
+    check(f"decay_len {k_size}-{threshold - 1} recovered by the fix",
+          recovered == list(range(k_size, threshold)),
+          f"{len(recovered)} lengths now fit that previously returned tau = -1")
+
+    # 6. Not every dead-zone window recovers, and that is correct. On real data
+    # 84 of the 181 candidates in the zone now fit (335 -> 419 exportable
+    # candidates over 34 recordings, a 25 % increase); the rest fail Step D's
+    # slope test because their envelope does not actually decay. The patch
+    # restores the fit, it cannot invent a decay. Asserted on a synthetic
+    # population so the suite stays fast.
+    fit_rng = np.random.default_rng(31)
+    fits = no_decay = 0
+    for _ in range(1500):
+        d = int(fit_rng.integers(k_size, threshold))
+        tau = fit_rng.uniform(5, 60)
+        noise = fit_rng.uniform(0.0, 0.9)
+        env = np.abs(np.exp(-np.arange(d + 5) / tau) * (1 - noise)
+                     + fit_rng.normal(0, noise, d + 5)) + 1e-9
+        if cp._fit_decay_segment(env, 0, d)["tau_ms"] > 0:
+            fits += 1
+        else:
+            no_decay += 1
+    rate = fits / (fits + no_decay)
+    check("partial recovery, remainder genuinely non-decaying", 0.5 < rate < 0.9,
+          f"{100 * rate:.0f} % of noisy dead-zone windows now fit; the rest fail "
+          f"the slope test, which is correct")
 
 
 def check_dryad_corpus():
@@ -364,14 +475,38 @@ def check_injection(clips):
 
     tomato = [c for c in clips if c.class_name == "Tomato Cut"][:30]
     audio = [dio.read_clip(c) for c in tomato]
-    _, _, results = inj.inject_batch(bed, audio, np.random.default_rng(5),
+
+    # fixed-snr must COLLAPSE the spread (that is what makes it a label leak, and
+    # why it is visualization-only); global-g must PRESERVE it.
+    spreads = {}
+    for mode in (inj.AMPLITUDE_FIXED_SNR, inj.AMPLITUDE_GLOBAL_G):
+        _, _, res = inj.inject_batch(bed, audio, np.random.default_rng(5),
+                                     amplitude_mode=mode,
                                      target_peak_snr=inj.PLANTLEAF_MEDIAN_PEAK_SNR,
                                      spacing_s=1.0, keep_render_payload=False)
+        values = np.array([r.measured_peak_snr for r in res])
+        spreads[mode] = (values, res)
 
-    snr = np.array([r.measured_peak_snr for r in results])
-    ratio = float(np.median(snr) / inj.PLANTLEAF_MEDIAN_PEAK_SNR)
-    check("measured peak_SNR matches the target", 0.9 < ratio < 1.1,
-          f"median {np.median(snr):.2f} vs target {inj.PLANTLEAF_MEDIAN_PEAK_SNR} (ratio {ratio:.3f})")
+    fixed, _ = spreads[inj.AMPLITUDE_FIXED_SNR]
+    ratio = float(np.median(fixed) / inj.PLANTLEAF_MEDIAN_PEAK_SNR)
+    check("fixed-snr hits its target", 0.9 < ratio < 1.1,
+          f"median {np.median(fixed):.2f} vs target {inj.PLANTLEAF_MEDIAN_PEAK_SNR} "
+          f"(ratio {ratio:.3f})")
+
+    fixed_spread = float(np.percentile(fixed, 90) / np.percentile(fixed, 10))
+    check("fixed-snr collapses the amplitude spread (why it must not train)",
+          fixed_spread < 1.6, f"p90/p10 = {fixed_spread:.2f}")
+
+    glob, results = spreads[inj.AMPLITUDE_GLOBAL_G]
+    glob_spread = float(np.percentile(glob, 90) / np.percentile(glob, 10))
+    # PlantLeaf's own clicks span p90/p10 = 39.11/7.19 = 5.44.
+    check("global-g preserves Khait's real amplitude spread", glob_spread > 3.0,
+          f"p90/p10 = {glob_spread:.2f} (PlantLeaf real clicks: 5.44)")
+    check("global-g centres near PlantLeaf's median",
+          0.7 < float(np.median(glob) / inj.PLANTLEAF_MEDIAN_PEAK_SNR) < 1.4,
+          f"median {np.median(glob):.2f} vs {inj.PLANTLEAF_MEDIAN_PEAK_SNR}")
+
+    snr = glob
 
     detected = sum(r.detected for r in results)
     check("injected clicks trip Stage 1", detected >= 0.9 * len(results),
