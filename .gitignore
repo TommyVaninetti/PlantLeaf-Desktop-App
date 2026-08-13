@@ -9,7 +9,7 @@ firmware/
 implementations_docs/
 test_scripts/
 other/
-scripts/
+#scripts/
 
 # Python bytecode
 __pycache__/
