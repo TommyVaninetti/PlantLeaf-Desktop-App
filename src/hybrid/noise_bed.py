@@ -24,24 +24,34 @@ needs ~750 frames (~1.92 s) of running context before `noise_floor` and
 to divide by. So a clip cannot be analysed on its own — it has to be transplanted
 into a real recording. This module produces the host signal.
 
-Why the screening step is mandatory
------------------------------------
-"Recorded in an empty room" is not sufficient evidence that a stretch is
-event-free. Measured across the two bed rooms, four windows of 2500 frames each,
-at the Stage-1 default k = 1.5:
+Where the events actually are: the recording edges
+--------------------------------------------------
+Measured by streaming ONE estimator across each file, the way the application
+does, and counting post-`MAX_RUN` Stage-1 candidates at k = 1.5 in 2250-frame
+windows:
 
-    Stanza Tommy, all 6 sessions   : 0.00 % candidate frames throughout
-    Stanza Ricy  misurazione4      : 0.00 %
-    Stanza Ricy  misurazione3      : up to 0.06 %
-    Stanza Ricy  misurazione6      : up to 0.77 %
-    Stanza Ricy  misurazione1      : up to 1.06 %
-    Stanza Ricy  misurazione5      : up to 5.94 %
-    Stanza Ricy  misurazione2      : up to 9.01 %
+    file        first 2250   last 2250   interior (20/40/60/80 % in)
+    ricy mis5            0          14   0, 0, 0, 0
+    ricy mis2           10           0   0, 0, 0, 0
+    ricy mis6           13           4   201, 0, 0, 0
+    tommy mis1           0           0   0, 0, 0, 0
 
-Ricy contains windows where nearly one frame in ten trips Stage 1, despite the
-room being empty. Selection therefore screens **per window**, never per file. A
-bed carrying a real transient would inject a phantom event next to the Dryad
-click and silently poison whatever was trained on it.
+The interiors of these recordings are clean. What trips Stage 1 is the first and
+last few seconds — the operator starting and stopping the acquisition, plus the
+estimator's own warm-up, during which `is_burst` is forced False
+(click_pipeline_v5 §4.4) so genuine start transients are written straight into
+the noise buffer.
+
+Hence EDGE_GUARD_FRAMES: window selection excludes both ends outright. Screening
+alone is not enough protection there, because `screen_window` only counts
+candidates past its own warm-up prefix — a transient inside the first 750 frames
+of a window placed at the file's start would escape the candidate count while
+still contaminating the noise estimate the injection gain is scaled against.
+
+Screening remains mandatory on top of the guard: ricy mis6 carries a genuine
+event region ~20 % into the file, far from either edge. A bed with a real
+transient would inject a phantom event next to the Dryad click and silently
+poison whatever was trained on it.
 
 Reconstruction uses `frame_emulator.inverse_raw()`, not
 `reconstruct_frame_v5()` — see the frame_emulator module docstring for why that
@@ -61,9 +71,7 @@ import numpy as np
 from . import frame_emulator as fe
 from .pipeline_loader import FrameDataManager, compute_stage1_arrays, load_pipeline
 
-# Bed source rooms. Note "Stanza Tommy vuota" holds the same six
-# `stanzavuota_nessunostimolo_*` recordings as the repo-local
-# audio_tests/OFFICIALS/Stanza vuota camera/ — one room, not two.
+# Bed source rooms.
 DEFAULT_BED_ROOTS = (
     "/Volumes/Lexar 1TB/PlantLeaf/Audio Experiments/Noise/Stanza Ricy vuota",
     "/Volumes/Lexar 1TB/PlantLeaf/Audio Experiments/Noise/Stanza Tommy vuota",
@@ -76,6 +84,12 @@ WARMUP_FRAMES = 750
 
 # Default usable span per window, on top of the warm-up.
 DEFAULT_USABLE_FRAMES = 1500        # ~3.84 s
+
+# Frames excluded at BOTH ends of every recording before a window may be drawn.
+# The measured contamination sits inside the first and last ~2250 frames (see the
+# module docstring); 5000 frames = 12.8 s gives better than 2x margin and costs
+# nothing against recordings that run 6-90 minutes.
+EDGE_GUARD_FRAMES = 5000
 
 # Spec section 7 regime boundary. Both bed rooms measure well below this; the
 # high-floor regime (aloe_6jan, test_aloe_1 at 4.61-4.99 mV) has no empty-room
@@ -171,7 +185,8 @@ def discover_bed_sources(roots=DEFAULT_BED_ROOTS) -> list[BedSource]:
                 continue
             if header["version"] < 3.0:
                 continue        # magnitude-only; no phase, so no resynthesis
-            if header["total_frames"] < WARMUP_FRAMES + DEFAULT_USABLE_FRAMES:
+            if header["total_frames"] < (WARMUP_FRAMES + DEFAULT_USABLE_FRAMES
+                                         + 2 * EDGE_GUARD_FRAMES):
                 continue
             sources.append(BedSource(
                 path=path, session_id=path.stem, room=room,
@@ -272,7 +287,8 @@ def extract_window(source: BedSource, start_frame: int, *,
 def find_clean_window(source: BedSource, rng: np.random.Generator, *,
                       usable_frames: int = DEFAULT_USABLE_FRAMES,
                       warmup_frames: int = WARMUP_FRAMES,
-                      max_attempts: int = 12, k: float = None) -> BedWindow | None:
+                      max_attempts: int = 12, k: float = None,
+                      edge_guard: int = EDGE_GUARD_FRAMES) -> BedWindow | None:
     """
     Draw random windows from one recording until a clean one is found.
 
@@ -281,16 +297,25 @@ def find_clean_window(source: BedSource, rng: np.random.Generator, *,
     not dominate the synthetic set — the bed-level leakage concern of spec
     section 12.4, one level down from session splitting.
 
-    Returns None if `max_attempts` draws all trip Stage 1, which for the noisier
-    Ricy sessions is a realistic outcome.
+    Draws are confined to `[edge_guard, total - n_frames - edge_guard]`. The
+    start and stop transients of a recording live outside that range and are the
+    only place most of these files trip Stage 1 at all (module docstring).
+
+    Returns None if every attempt trips Stage 1 — a real outcome for a session
+    with a genuine event region, e.g. ricy mis6.
     """
     n_frames = warmup_frames + usable_frames
-    highest_start = source.total_frames - n_frames
-    if highest_start < 0:
+    lowest_start = edge_guard
+    highest_start = source.total_frames - n_frames - edge_guard
+    if highest_start < lowest_start:
+        # Recording too short for the guard; fall back to the full range rather
+        # than discarding it, and let screening do the work.
+        lowest_start, highest_start = 0, source.total_frames - n_frames
+    if highest_start < lowest_start:
         return None
 
     for _ in range(max_attempts):
-        start = int(rng.integers(0, highest_start + 1))
+        start = int(rng.integers(lowest_start, highest_start + 1))
         window = extract_window(source, start, usable_frames=usable_frames,
                                 warmup_frames=warmup_frames, k=k)
         if window is not None:
