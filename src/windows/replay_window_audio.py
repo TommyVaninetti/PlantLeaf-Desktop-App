@@ -967,56 +967,56 @@ class IFFTWindow(QDialog):
 
 <tr><td style='padding:4px;'><b>1. peak_SNR</b></td>
     <td>{fmt(f['peak_SNR'],decimals=1)}</td>
-    <td><i>≫ 1  (typically 10–1000+)</i></td></tr>
+    <td><i>≫ 1  (typically 7 – 39, up to ~150)</i></td></tr>
 <tr style='background-color:rgba(128,128,128,0.07);'>
     <td style='padding:4px;'><b>2. pre_SNR</b></td>
     <td>{fmt(f['pre_SNR'],decimals=3)}</td>
     <td><i>≈ 1.0  (silence before click)</i></td></tr>
 <tr><td style='padding:4px;'><b>3. post_SNR</b></td>
     <td>{fmt(f['post_SNR'],decimals=3)}</td>
-    <td><i>≈ 1.0  (return to silence)</i></td></tr>
+    <td><i>1.0 – 2.1  (median 1.3)</i></td></tr>
 <tr style='background-color:rgba(128,128,128,0.07);'>
     <td style='padding:4px;'><b>4. rise_time_ms</b></td>
     <td>{fmt(f['rise_time_ms'],' ms',4)}</td>
-    <td><i>0.025 – 0.3 ms</i></td></tr>
+    <td><i>0.025 – 0.13 ms  (up to 0.3)</i></td></tr>
 <tr><td style='padding:4px;'><b>5. fall_time_ms</b></td>
     <td>{fmt(f['fall_time_ms'],' ms',4)}</td>
-    <td><i>&gt; rise_time  (decay slower than rise)</i></td></tr>
+    <td><i>&gt; rise_time;  0.055 – 0.30 ms</i></td></tr>
 <tr style='background-color:rgba(128,128,128,0.07);'>
     <td style='padding:4px;'><b>6. asymmetry_integral</b></td>
     <td>{fmt(f['asymmetry_integral'],decimals=4)}</td>
-    <td><i>positive  (decay &gt; rise)</i></td></tr>
+    <td><i>positive;  0.07 – 0.31</i></td></tr>
 <tr><td style='padding:4px;'><b>7. ZCR_pre</b></td>
     <td>{fmt(f['ZCR_pre'],' crossings/ms',2)}</td>
-    <td><i>low  (silence before click)</i></td></tr>
+    <td><i>low;  12 – 36 crossings/ms</i></td></tr>
 <tr style='background-color:rgba(128,128,128,0.07);'>
     <td style='padding:4px;'><b>8. ZCR_click</b></td>
     <td>{fmt(f['ZCR_click'],' crossings/ms',2)}</td>
-    <td><i>oscillation rate during click</i></td></tr>
+    <td><i>28 – 72 crossings/ms</i></td></tr>
 <tr><td style='padding:4px;'><b>9. ZCR_post</b></td>
     <td>{fmt(f['ZCR_post'],' crossings/ms',2)}</td>
-    <td><i>decreasing during decay</i></td></tr>
+    <td><i>34 – 84 crossings/ms  (measured ≥ ZCR_click)</i></td></tr>
 <tr style='background-color:rgba(128,128,128,0.07);'>
     <td style='padding:4px;'><b>10. kurtosis</b></td>
     <td>{fmt(f['kurtosis'],decimals=2)}</td>
-    <td><i>15 – 50  (impulsive event)</i></td></tr>
+    <td><i>&gt; 0, typically 0.4 – 3  (noise ≈ −0.6)</i></td></tr>
 <tr><td style='padding:4px;'><b>11. centroid_shift_hz</b></td>
     <td>{fmt(f['centroid_shift_hz']/1000,' kHz',2)}</td>
-    <td><i>&gt; 2–5 kHz  (high freqs decay first)</i></td></tr>
+    <td><i>median ≈ +0.4 kHz;  wide, often negative</i></td></tr>
 <tr style='background-color:rgba(128,128,128,0.07);'>
     <td style='padding:4px;'><b>12. τ (tau_ms)</b></td>
     <td>{'N/A (no valid decay)' if f['tau_ms'] < 0 else fmt(f['tau_ms'],' ms',4)}</td>
-    <td><i>0.05 – 1.3 ms  (cavitation)</i></td></tr>
+    <td><i>0.075 – 0.47 ms  (cavitation)</i></td></tr>
 <tr><td style='padding:4px;'><b>13. R²</b></td>
     <td>{fmt(f['R2'],decimals=4)}</td>
-    <td><i>≥ 0.45  (exponential fit quality)</i></td></tr>
+    <td><i>0.27 – 0.91  (median 0.60);  Stage 2 gates ≥ 0.10</i></td></tr>
 <tr style='background-color:rgba(128,128,128,0.07);'>
     <td style='padding:4px;'><b>14. fit_coverage</b></td>
     <td>{fmt(f['fit_coverage'],decimals=3)}</td>
-    <td><i>0.7 – 1.0  (fraction of decay used)</i></td></tr>
+    <td><i>0.52 – 0.90  (median 0.69)</i></td></tr>
 <tr><td style='padding:4px;'><b>15. SPR</b></td>
     <td>{fmt(f['SPR'],decimals=2)}</td>
-    <td><i>≤ 20  (broadband, not tonal)</i></td></tr>
+    <td><i>≤ 20  (typically 5.8 – 16.4)</i></td></tr>
 <tr style='background-color:rgba(128,128,128,0.07);'>
     <td style='padding:4px;'><b>16. R_spectral</b></td>
     <td>{fmt(f['R_spectral'],decimals=3)}</td>

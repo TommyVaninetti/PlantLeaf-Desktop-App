@@ -1713,11 +1713,26 @@ def _feat_kurtosis(
     peak to end of decay. Captures the full click without surrounding silence
     (which would dilute the impulsivity measure).
 
-    Typical values:
-      Gaussian noise        ≈  0
-      Sustained vibration   :  2 – 7
-      Genuine click         : 15 – 50
-      EMI spike             : > 100
+    Typical values — measured on the 285 labelled events of Dataset_20June2026.csv:
+
+                                  p10     median    p90     max
+      hard negative (n=194)     −1.10     −0.58    1.22    13.65
+      confirmed click (n=91)    −0.60      0.45    2.98    14.22
+
+    Clicks sit above negatives, and this is the strongest of the 15 non-peak_SNR
+    features by single-feature AUC (0.764) — but both populations sit near zero.
+
+    CORRECTED August 2026. This docstring previously claimed "Gaussian noise ≈ 0,
+    sustained vibration 2–7, genuine click 15–50, EMI spike > 100". Those figures
+    contradict the window used here: 0.0 % of the 91 confirmed clicks reach 15,
+    and the maximum anywhere in the labelled set is 14.2.
+
+    The window is the reason. Excess kurtosis measures energy concentrated in
+    RARE extreme samples relative to the rest of the window. [event_start:decay_end]
+    is cropped tightly to the event, so it is uniformly energetic and scores near
+    zero. Values in the tens need a mostly-baseline window with an isolated spike —
+    a different definition from this one. The formula is correct; only the old
+    reference numbers were wrong.
 
     Returns 0.0 if the window has fewer than 4 samples or zero variance.
     """
