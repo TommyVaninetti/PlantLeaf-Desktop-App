@@ -98,6 +98,23 @@ def _ensure_matplotlib():
     _MPL_READY = True
 
 
+def _si_scale(values: np.ndarray) -> tuple[np.ndarray, str, float]:
+    """
+    Scale volts to the most readable SI unit, returning (scaled, unit, factor).
+
+    Thresholds match `data_collection_dialog_v5._render_candidate_screenshot`
+    (V above 0.5, mV above 500 uV, uV below) so the Dryad figures and the app's
+    own candidate screenshots use the same convention and can be read side by
+    side without mental unit conversion.
+    """
+    peak = float(np.max(np.abs(values))) if len(values) else 0.0
+    if peak >= 0.5:
+        return values, "V", 1.0
+    if peak >= 5e-4:
+        return values * 1e3, "mV", 1e3
+    return values * 1e6, "uV", 1e6
+
+
 def _style_axis(ax, title: str, xlabel: str = "", ylabel: str = ""):
     ax.set_facecolor(PANEL_BG)
     ax.set_title(title, color=TEXT_COLOR, fontsize=9, loc="left", pad=4)
@@ -194,24 +211,41 @@ def _panel_region_fft(ax, result: InjectionResult):
     if len(segment) < sa.MIN_SEGMENT_SAMPLES:
         ax.text(0.5, 0.5, f"region too short ({len(segment)} samples)", color=MUTED_COLOR,
                 fontsize=9, ha="center", va="center", transform=ax.transAxes)
-        _style_axis(ax, "2. Region FFT (onset -> decay end)", "frequency [kHz]", "magnitude [dB]")
+        _style_axis(ax, "2. Region FFT (onset -> decay end)", "frequency [kHz]", "amplitude")
         return
 
     # left_only=False deliberately: with an onset-anchored region the larger
     # discontinuity is at the TRAILING edge, so a symmetric taper is right.
     # Same reasoning as region_fft_dialog.py:451.
     spectrum = sa.compute_spectrum(segment, fe.FS, window="tukey", alpha=0.25)
-    db = sa.to_db(spectrum.mags)
-    ax.plot(spectrum.freqs / 1e3, db, color=SIGNAL_COLOR, linewidth=1.0, zorder=3,
+
+    # Linear amplitude in SI-scaled volts, matching the app's own candidate
+    # screenshots. Linear rather than dB because the peak's shape and relative
+    # height are what matter when labelling by eye; a dB axis flattens exactly
+    # the contrast being judged and exaggerates the noise floor.
+    mags, unit, factor = _si_scale(spectrum.mags)
+    ax.plot(spectrum.freqs / 1e3, mags, color=SIGNAL_COLOR, linewidth=1.0, zorder=3,
             label=f"region FFT (n_seg={spectrum.n_seg}, n_fft={spectrum.n_fft})")
 
     # Reference: the 512-point frame FFT the hardware actually transmitted.
+    #
+    # Scaled to the region FFT's peak rather than plotted in absolute volts. Both
+    # are amplitude spectra in volts, but they use different normalisations --
+    # compute_spectrum divides by the window sum over n_seg (~20-30 samples for a
+    # click) while the firmware divides by the full N=512 -- so the region FFT
+    # runs ~11x higher. On a shared absolute axis the reference would be squashed
+    # into the bottom tenth and its shape, which is the whole point of showing it,
+    # would be unreadable. The scale factor is printed so nothing is hidden.
+    # (The dB version peak-normalised both independently, which concealed this
+    # difference entirely.)
     fft_norm, freq_axis = render["fft_norm"], render["freq_axis"]
     mask = (freq_axis >= BAND[0]) & (freq_axis <= BAND[1])
     if np.any(mask) and np.max(fft_norm[mask]) > 0:
-        ref_db = sa.to_db(fft_norm[mask])
-        ax.plot(freq_axis[mask] / 1e3, ref_db, color=REFERENCE_COLOR, linewidth=0.9,
-                linestyle="--", alpha=0.8, zorder=2, label="transmitted 512-pt frame FFT")
+        ref = fft_norm[mask]
+        ref_gain = float(np.max(spectrum.mags)) / float(np.max(ref))
+        ax.plot(freq_axis[mask] / 1e3, ref * ref_gain * factor, color=REFERENCE_COLOR,
+                linewidth=0.9, linestyle="--", alpha=0.8, zorder=2,
+                label=f"transmitted 512-pt frame FFT (shape, x{ref_gain:.1f})")
 
     ax.axvspan(BAND[0] / 1e3, BAND[1] / 1e3, color=BAND_COLOR, alpha=0.06, zorder=0)
     for edge in BAND:
@@ -220,14 +254,14 @@ def _panel_region_fft(ax, result: InjectionResult):
     desc = sa.band_descriptors(spectrum, BAND)
     ax.axvline(desc["peak_freq_hz"] / 1e3, color=ACCENT_COLOR, linewidth=0.9, zorder=4)
     ax.set_xlim(0, fe.FS / 2 / 1e3)
-    ax.set_ylim(-90, 5)
+    ax.set_ylim(0, float(np.max(mags)) * 1.08 if len(mags) else 1.0)
 
     _style_axis(
         ax,
         "2. Region FFT (onset -> decay end)   -   "
         f"FPE {desc['peak_freq_hz'] / 1e3:.1f} kHz, centroid {desc['centroid_hz'] / 1e3:.1f} kHz, "
         f"SPR {desc['spr']:.2f}, R_spec {desc['r_spectral']:.2f}",
-        "frequency [kHz]", "magnitude [dB rel. peak]",
+        "frequency [kHz]", f"amplitude ({unit})",
     )
     ax.legend(loc="upper right", fontsize=6, framealpha=0.25, facecolor=BG,
               edgecolor=SPINE_COLOR, labelcolor=TEXT_COLOR)
@@ -321,18 +355,24 @@ def _panel_native_comparison(ax_time, ax_freq, result: InjectionResult):
                    edgecolor=SPINE_COLOR, labelcolor=TEXT_COLOR)
 
     # Spectra, both to their own Nyquist.
+    #
+    # Peak-normalised linear rather than dB. The Dryad amplitude units are
+    # arbitrary and the two rates carry different absolute scales, so only the
+    # SHAPE is comparable -- normalising each to its own peak states that
+    # honestly, and linear keeps the comparison consistent with panel 2.
     sa = load_spectral()
     for sig, fs, colour, label in ((native, cm.DRYAD_FS, NATIVE_COLOR, "500 kHz native"),
                                    (resampled, fe.FS, SIGNAL_COLOR, "200 kHz resampled")):
         spectrum = sa.compute_spectrum(sig, fs, window="tukey", alpha=0.25)
-        ax_freq.plot(spectrum.freqs / 1e3, sa.to_db(spectrum.mags), color=colour,
+        peak = float(np.max(spectrum.mags)) or 1.0
+        ax_freq.plot(spectrum.freqs / 1e3, spectrum.mags / peak, color=colour,
                      linewidth=0.9, alpha=0.9, label=label)
 
     ax_freq.axvline(fe.FS / 2 / 1e3, color=ACCENT_COLOR, linewidth=1.0, linestyle="--",
                     label="200 kHz Nyquist (100 kHz)")
     ax_freq.axvspan(BAND[0] / 1e3, BAND[1] / 1e3, color=BAND_COLOR, alpha=0.06, zorder=0)
     ax_freq.set_xlim(0, cm.DRYAD_FS / 2 / 1e3)
-    ax_freq.set_ylim(-90, 5)
+    ax_freq.set_ylim(0, 1.05)
 
     # How much of the clip's energy the 100 kHz limit actually discards.
     win = np.hanning(len(native))
@@ -346,7 +386,7 @@ def _panel_native_comparison(ax_time, ax_freq, result: InjectionResult):
         ax_freq,
         f"3b. Spectra to each Nyquist   -   {100 * frac_band:.1f} % of energy in 20-80 kHz, "
         f"{100 * frac_lost:.1f} % discarded above 100 kHz",
-        "frequency [kHz]", "magnitude [dB rel. peak]",
+        "frequency [kHz]", "normalised amplitude",
     )
     ax_freq.legend(loc="upper right", fontsize=6, framealpha=0.25, facecolor=BG,
                    edgecolor=SPINE_COLOR, labelcolor=TEXT_COLOR)
