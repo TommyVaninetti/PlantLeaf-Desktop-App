@@ -1076,6 +1076,11 @@ def _fit_decay_segment(
         mode='valid'). Suppresses high-frequency ripple without distorting the
         decay shape (kernel width << τ_min).
 
+        Applied only when decay_len ≥ len(_GAUSS_KERNEL) + MIN_FIT_SAMPLES − 1
+        (= 22): 'valid' convolution costs 12 samples, and Step D still needs
+        MIN_FIT_SAMPLES afterwards. Shorter windows are fitted unsmoothed. See
+        the inline comment for the dead zone this threshold fixes.
+
     Step D — OLS log-linear fit:
         Fit log(fit_window) vs. sample index. Closed-form formula — no BLAS.
         Returns τ_ms = −1000 / (slope × fs) and R² in log space.
@@ -1109,11 +1114,32 @@ def _fit_decay_segment(
     decay_segment = extended[decay_start : decay_end]
 
     # ── Step C: Gaussian smoothing ────────────────────────────────────────────
-    if len(decay_segment) >= len(_GAUSS_KERNEL):
+    # Smooth only when the segment can afford it. Two constraints apply, and the
+    # threshold must satisfy BOTH:
+    #   (a) the kernel needs at least len(_GAUSS_KERNEL) samples to convolve;
+    #   (b) Step D below needs at least MIN_FIT_SAMPLES samples AFTER smoothing.
+    # mode='valid' costs len(_GAUSS_KERNEL) - 1 samples, so (b) is the binding
+    # constraint and the threshold is their sum minus one.
+    #
+    # Testing only (a) — as this did until August 2026 — created a dead zone:
+    # n_fit jumped 12 -> 1 as decay_len went 12 -> 13, and did not clear
+    # MIN_FIT_SAMPLES again until decay_len reached 22, so every decay window of
+    # 13-21 samples returned tau = -1 even on a noiseless exponential. Measured
+    # across 26 real recordings that silently discarded 181 of 3311 Stage-1
+    # candidates (5.4%); since Stage 2 drops tau <= 0 before export
+    # (data_collection_dialog_v5.py), those events never reached a CSV at all.
+    #
+    # Existing exports and the trained SVM are unaffected, by branch analysis:
+    # decay_len <= 12 skipped smoothing before and skips it now; decay_len >= 22
+    # smoothed before and smooths now. Only 13-21 changes path, and every such
+    # candidate previously produced tau = -1 and was discarded.
+    if decay_len >= len(_GAUSS_KERNEL) + MIN_FIT_SAMPLES - 1:
         # mode='valid' avoids zero-padding artefacts at segment boundaries.
         fit_window = np.convolve(decay_segment, _GAUSS_KERNEL, mode='valid')
     else:
-        fit_window = decay_segment.copy()   # too short to convolve
+        # Too short to smooth and still leave a fittable window: fit the raw
+        # envelope. This is the same path decay_len 10-12 has always taken.
+        fit_window = decay_segment.copy()
 
     n_fit = len(fit_window)
 
@@ -1687,11 +1713,26 @@ def _feat_kurtosis(
     peak to end of decay. Captures the full click without surrounding silence
     (which would dilute the impulsivity measure).
 
-    Typical values:
-      Gaussian noise        ≈  0
-      Sustained vibration   :  2 – 7
-      Genuine click         : 15 – 50
-      EMI spike             : > 100
+    Typical values — measured on the 285 labelled events of Dataset_20June2026.csv:
+
+                                  p10     median    p90     max
+      hard negative (n=194)     −1.10     −0.58    1.22    13.65
+      confirmed click (n=91)    −0.60      0.45    2.98    14.22
+
+    Clicks sit above negatives, and this is the strongest of the 15 non-peak_SNR
+    features by single-feature AUC (0.764) — but both populations sit near zero.
+
+    CORRECTED August 2026. This docstring previously claimed "Gaussian noise ≈ 0,
+    sustained vibration 2–7, genuine click 15–50, EMI spike > 100". Those figures
+    contradict the window used here: 0.0 % of the 91 confirmed clicks reach 15,
+    and the maximum anywhere in the labelled set is 14.2.
+
+    The window is the reason. Excess kurtosis measures energy concentrated in
+    RARE extreme samples relative to the rest of the window. [event_start:decay_end]
+    is cropped tightly to the event, so it is uniformly energetic and scores near
+    zero. Values in the tens need a mostly-baseline window with an isolated spike —
+    a different definition from this one. The formula is correct; only the old
+    reference numbers were wrong.
 
     Returns 0.0 if the window has fewer than 4 samples or zero variance.
     """
