@@ -47,7 +47,9 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
                                QSizePolicy, QSplitter, QStyle, QVBoxLayout,
                                QWidget)
 
-from core.spectral_analysis import (DEFAULT_ALPHA, DEFAULT_WINDOW,
+from core.spectral_analysis import (band_edges, effective_bands,
+                                    v6_spectral_features as sa_v6,
+                                    DEFAULT_ALPHA, DEFAULT_WINDOW,
                                     MIN_SEGMENT_SAMPLES, WINDOWS,
                                     band_descriptors, compute_spectrum,
                                     default_nfft, to_db)
@@ -120,7 +122,9 @@ class RegionFFTDialog(QDialog):
                  seams=None,
                  presets=None,
                  reference=None,
-                 banner=None):
+                 banner=None,
+                 noise_psd=None,
+                 noise_freqs=None):
         super().__init__(parent)
 
         self.time_s = np.asarray(time_s, dtype=np.float64)
@@ -131,6 +135,21 @@ class RegionFFTDialog(QDialog):
         self.band = band
         self.reference = reference
         self._spec = None
+
+        # ── v6 noise reference (OPTIONAL — keeps the domain-agnostic contract) ──
+        # noise_psd is Buffer 3's per-bin noise PSD [V²/Hz] and noise_freqs its
+        # frequency axis. Both default to None, so a voltage caller constructs this
+        # dialog exactly as before and behaves identically — REGION_FFT_FEATURE.md
+        # §7 requires that this widget stay reusable for domains that have no such
+        # thing. Only the audio caller passes them.
+        self.noise_psd = (np.asarray(noise_psd, dtype=np.float64)
+                          if noise_psd is not None else None)
+        self.noise_freqs = (np.asarray(noise_freqs, dtype=np.float64)
+                            if noise_freqs is not None else None)
+        if (self.noise_psd is not None and self.noise_freqs is not None
+                and len(self.noise_psd) != len(self.noise_freqs)):
+            self.noise_psd = self.noise_freqs = None
+        self._v6 = None
 
         self.setWindowTitle(title)
         self.setMinimumSize(900, 640)
@@ -239,6 +258,20 @@ class RegionFFTDialog(QDialog):
 
         self.spec_curve = self.spec_plot.plot_widget.plot(
             pen={'width': 2}, name='Region')
+
+        # ── v6 overlays, only when a noise estimate was supplied ─────────────
+        # noise : Buffer 3's floor, rendered on whatever axis the region uses.
+        # excess: E[k] = max(0, P_region − P_noise) on the 12-band grid, i.e. the
+        #         quantity every v6 spectral feature is actually computed from.
+        self.noise_curve = None
+        self.excess_curve = None
+        if self.noise_psd is not None:
+            self.noise_curve = self.spec_plot.plot_widget.plot(
+                pen=pg.mkPen('#00CED1', width=1.4, style=Qt.DashLine),
+                name='B3 noise')
+            self.excess_curve = self.spec_plot.plot_widget.plot(
+                pen=pg.mkPen('#FFA726', width=2.0),
+                stepMode='center', name='E[k] (12 bands)')
         return self.spec_plot
 
     @staticmethod
@@ -487,7 +520,72 @@ class RegionFFTDialog(QDialog):
                 self.chk_ref.isChecked()
                 and spec.scaling == 'amplitude' and not use_db)
 
+        self._update_v6(spec, use_db)
         self._update_readout(spec)
+
+    def _update_v6(self, spec, use_db):
+        """
+        Draw Buffer 3's noise floor and the excess spectrum E[k], and cache the v6
+        feature values for the readout.
+
+        ⚠️ THE NOISE CURVE IS AXIS-DEPENDENT. Buffer 3 stores a power DENSITY,
+        which is what makes it independent of segment length (§3.2). To draw it
+        against a region spectrum it has to be expressed in the region's own
+        convention:
+
+            scaling='psd'        -> plot P_noise directly, no conversion
+            scaling='amplitude'  -> A_rms = sqrt(2 · P · Δf), Δf = spec.enbw_hz
+            scaling='magnitude'  -> not comparable; the curve is hidden
+
+        The amplitude form is exact — verified against measured spectra at n_seg
+        30/58/90/150/512, ratio 0.9993-1.0033. Plotting the raw PSD on an
+        amplitude axis would look plausible and mean nothing, which is the trap
+        REGION_FFT_FEATURE.md §5 warns about in capitals.
+        """
+        self._v6 = None
+        if self.noise_curve is None or self.noise_psd is None:
+            return
+
+        # Trap (a), §4.4: the region carries the analysis-band taper, Buffer 3 does
+        # not. The caller is responsible for passing an already-tapered estimate;
+        # see replay_window_audio.open_region_fft.
+        p_noise = np.interp(spec.freqs, self.noise_freqs, self.noise_psd,
+                            left=np.nan, right=np.nan)
+
+        if spec.scaling == 'psd':
+            noise_y = p_noise
+        elif spec.scaling == 'amplitude':
+            noise_y = np.sqrt(np.maximum(2.0 * p_noise * spec.enbw_hz, 0.0))
+        else:
+            noise_y = None
+
+        show = noise_y is not None and not use_db and self.chk_ref.isChecked()
+        self.noise_curve.setVisible(bool(show))
+        if show:
+            self.noise_curve.setData(spec.freqs, np.nan_to_num(noise_y, nan=0.0))
+
+        # E[k] on the band grid — always computed in PSD, which is where it is
+        # defined, regardless of what the display axis is showing.
+        try:
+            psd = compute_spectrum(
+                self.signal[self._selected_slice()[0]:self._selected_slice()[1]],
+                self.fs, window=self.combo_window.currentText(),
+                alpha=self.spin_alpha.value(),
+                n_fft=spec.n_fft, scaling='psd')
+            self._v6 = sa_v6(psd, self.noise_psd, self.noise_freqs)
+        except Exception:                                        # noqa: BLE001
+            self._v6 = None
+
+        if self.excess_curve is not None:
+            ok = (self._v6 is not None and show
+                  and spec.scaling in ('psd', 'amplitude'))
+            self.excess_curve.setVisible(bool(ok))
+            if ok:
+                edges = band_edges(self.band[0], self.band[1])
+                e = np.nan_to_num(self._v6['E_bands'], nan=0.0)
+                if spec.scaling == 'amplitude':
+                    e = np.sqrt(np.maximum(2.0 * e * spec.enbw_hz, 0.0))
+                self.excess_curve.setData(edges, e)
 
     def _update_readout(self, spec):
         d = band_descriptors(spec, self.band)
@@ -509,8 +607,37 @@ class RegionFFTDialog(QDialog):
                  f"  ·  SPR {d['spr']:.1f}"
                  f"  ·  R_spectral {d['r_spectral']:.2f}")
 
+        # ── v6 line — only when a Buffer-3 estimate was supplied ─────────────
+        line3 = ""
+        if self._v6 is not None:
+            v = self._v6
+
+            def _f(key, fmt, suffix=""):
+                x = v.get(key, float('nan'))
+                return "n/a" if x != x else format(x, fmt) + suffix
+
+            h = v.get('spectral_entropy', float('nan'))
+            n_eff = effective_bands(h)
+            bw = v.get('BW_eff_hz', float('nan'))
+            line3 = ("<br>"
+                     f"H = <b>{_f('spectral_entropy', '.3f')}</b>"
+                     f"  (N_eff {('n/a' if n_eff != n_eff else format(n_eff, '.1f'))} bands"
+                     f", BW_eff {_fmt_hz(bw) if bw == bw else 'n/a'})"
+                     f"  ·  novelty <b>{_f('shape_novelty', '.3f')}</b>"
+                     f"  ·  tilt {_f('spectral_tilt', '+.3f')} dB/kHz"
+                     f"  ·  f_50 {_fmt_hz(v.get('f_50_hz', float('nan')))}"
+                     f"  ·  IQR_f {_fmt_hz(v.get('IQR_f', float('nan')))}")
+            # §4.3: below V6_MIN_NSEG the bands stop being independent and entropy
+            # is biased optimistically toward 1. That has to be visible, not absorbed.
+            if not v.get('n_seg_valid', 1):
+                line3 += ("<br><span style='color:#FFA726;'>⚠ n_seg = "
+                          f"{v.get('n_seg', 0)} — too short for the 12-band grid "
+                          "(Δf &gt; 5 kHz): bands are correlated and H is biased "
+                          "high. Feature values here are not comparable with "
+                          "longer regions.</span>")
+
         self.readout.setText(
-            f"{line1}<br>{line2}"
+            f"{line1}<br>{line2}{line3}"
             "<br><span style='color:#888;'>Δf is the TRUE resolution "
             "(set by the region length); n_fft only interpolates.</span>")
 

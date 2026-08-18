@@ -123,6 +123,18 @@ TUKEY_TAPER_FRACTION = 0.10  # Fraction of analysis-band bins used for each
                               # Smoothly ramps the spectral edges to zero to reduce
                               # Gibbs ringing in the reconstructed time-domain signal.
 
+# v6 STALE-FLOOR DETECTOR (observation only — changes no behaviour)
+STALE_FLOOR_FRAMES = SUBWINDOW_SIZE  # Consecutive burst-gated frames after which the
+                                     # noise floor is reported as possibly frozen.
+                                     # NOT a new tunable: it IS SUBWINDOW_SIZE (75
+                                     # frames = 192 ms), the estimator's own
+                                     # sub-window granularity. Chosen because it is
+                                     # 25x MAX_RUN — the longest run Stage 1 itself
+                                     # is willing to call a click — and ~12x the
+                                     # longest consecutive-burst run measured on real
+                                     # stationary recordings (6 frames), so it cannot
+                                     # fire on ordinary data.
+
 # v6 REGION SPECTRUM (SPECTRAL_FEATURES_v6_PROPOSAL.md §5)
 REGION_NFFT = 4096   # Transform length for the onset→decay_end region spectrum.
                      # NOT a resolution: Δf is fixed by n_seg (REGION_FFT_FEATURE.md
@@ -698,6 +710,23 @@ class AdaptiveNoiseEstimatorV5:
         self._B3_ring_i  = 0
         self._B3_n       = 0
 
+        # ── Stale-floor detector (v6) — OBSERVATION ONLY ─────────────────────
+        # A gated frame never enters the buffers, so if ambient noise steps up by
+        # more than ALPHA the gate rejects EVERY subsequent frame, nothing is
+        # admitted, and the floor stays pinned at the old low value indefinitely:
+        # the gate cannot tell "louder room" from "long burst". Demonstrated in
+        # test_scripts/verify_v6_buffer3.py — a 9x step leaves 750/750 frames
+        # gated with the estimate unchanged.
+        #
+        # This counter only OBSERVES that condition. It changes no behaviour and
+        # the candidate set is bit-identical, deliberately: Stage 1 is not touched
+        # without sign-off, and the point of the detector is to measure how often
+        # this really happens before deciding on a recovery.
+        self._consecutive_bursts = 0
+        self._max_consecutive_bursts = 0
+        self._stale_floor_events = 0
+        self._stale_floor_logged = False
+
     def _median_of_local_minima(self, buffer: np.ndarray) -> float:
         """
         Compute  median(m_1, …, m_M)  where  m_j = min(sub-window j).
@@ -947,6 +976,29 @@ class AdaptiveNoiseEstimatorV5:
         else:
             is_burst = E_i > ALPHA * self._E_hat_floor
 
+        # ── Stale-floor detection (observation only, see __init__) ───────────
+        if is_burst:
+            self._consecutive_bursts += 1
+            if self._consecutive_bursts > self._max_consecutive_bursts:
+                self._max_consecutive_bursts = self._consecutive_bursts
+            # STALE_FLOOR_FRAMES is SUBWINDOW_SIZE: an existing constant, 25x
+            # MAX_RUN (the longest run Stage 1 itself calls a click) and ~12x the
+            # longest consecutive-burst run measured on stationary recordings, so
+            # it does not chatter on ordinary data.
+            if (self._consecutive_bursts == STALE_FLOOR_FRAMES
+                    and not self._stale_floor_logged):
+                self._stale_floor_events += 1
+                self._stale_floor_logged = True
+                print(f"⚠️  noise floor may be STALE: {STALE_FLOOR_FRAMES} consecutive "
+                      f"frames rejected by the burst gate at frame "
+                      f"{self._frame_count} (Ê_floor = {self._E_hat_floor:.4e} V², "
+                      f"E_i = {E_i:.4e} V², ratio {E_i / max(self._E_hat_floor, 1e-30):.1f}x "
+                      f"> ALPHA = {ALPHA}). The floor cannot rise while every frame "
+                      f"is gated; if this persists the ambient level has stepped up.")
+        else:
+            self._consecutive_bursts = 0
+            self._stale_floor_logged = False
+
         # ── Buffer update ─────────────────────────────────────────────────────
         # Write this frame into the circular buffers only if it is not a burst.
         if not is_burst:
@@ -1011,6 +1063,10 @@ class AdaptiveNoiseEstimatorV5:
         self._B3_sum[:]   = 0.0
         self._B3_ring_i   = 0
         self._B3_n        = 0
+        self._consecutive_bursts     = 0
+        self._max_consecutive_bursts = 0
+        self._stale_floor_events     = 0
+        self._stale_floor_logged     = False
 
     # ------------------------------------------------------------------
     # Read-only properties — convenient access without going through update()
@@ -1040,6 +1096,29 @@ class AdaptiveNoiseEstimatorV5:
     def buffer_fill(self) -> int:
         """Number of valid (non-burst) frames currently stored in the buffers."""
         return self._fill
+
+    @property
+    def consecutive_bursts(self) -> int:
+        """Frames rejected by the burst gate since the last accepted one."""
+        return self._consecutive_bursts
+
+    @property
+    def max_consecutive_bursts(self) -> int:
+        """Longest run of consecutive gated frames seen so far.
+
+        On stationary recordings this stays in single digits (measured 1-6). A
+        large value means the floor was frozen for that long — see
+        stale_floor_events."""
+        return self._max_consecutive_bursts
+
+    @property
+    def stale_floor_events(self) -> int:
+        """Times the gate rejected STALE_FLOOR_FRAMES frames in a row.
+
+        Non-zero means the ambient level stepped up by more than ALPHA and the
+        estimator could not follow it. Observation only — nothing in the pipeline
+        acts on this yet."""
+        return self._stale_floor_events
 
     @property
     def b3_window_frames(self) -> int:

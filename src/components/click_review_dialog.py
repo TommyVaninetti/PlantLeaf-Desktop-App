@@ -41,20 +41,44 @@ _N_COLS = 4
 # a feature footer at the bottom. Scaled down to fit a pane, that footer text is far too
 # small to read — so it is cropped away and the same numbers are shown in a real table
 # underneath instead (see _build_features_group).
-# Keep in step with the layout in data_collection_dialog_v5._render_candidate_screenshot.
-_CROP_TOP    = 40    # title strip
-_CROP_BOTTOM = 260   # feature footer
+# IMPORTED from the renderer, never duplicated. These were hand-tuned literals (40 /
+# 260) with only a comment asking future editors to keep them in step — so raising
+# the footer to fit the v6 features would have silently mis-cropped every screenshot,
+# with no error and no visible cause. Importing makes that impossible.
+from components.data_collection_dialog_v5 import (      # noqa: E402
+    SCREENSHOT_HEADER_H as _CROP_TOP,
+    SCREENSHOT_FOOTER_H as _CROP_BOTTOM,
+)
 
-# The 17 features in the order the v5 docs list them, each with a display precision.
+# Every feature the CSV may carry, each with a display precision. A name that is
+# absent from the CSV renders as "—" (see _update_features), so this list is safe
+# against both v5 (24-column) and v6 (45-column) files.
 _FEATURE_FMT = [
+    # ── v5, in the order the docs list them ──
     ('peak_SNR',     3), ('pre_SNR',    3), ('post_SNR',           3),
     ('rise_time_ms', 4), ('fall_time_ms', 4), ('asymmetry_integral', 4),
     ('ZCR_pre',      3), ('ZCR_click',  3), ('ZCR_post',           3),
     ('kurtosis',     2), ('centroid_shift_hz', 0),
     ('tau_ms',       4), ('R2',         4), ('fit_coverage',       3),
     ('SPR',          2), ('R_spectral', 3), ('FPE_hz',             0),
+    # ── v6 spectral family, computed on E[k] = max(0, P_region − P_noise) ──
+    ('spectral_entropy',       3), ('shape_novelty', 3),
+    ('spectral_tilt',          3), ('temporal_concentration', 3),
+    ('FPE_hz_region',          0), ('SPR_region',    2),
+    ('f_50_hz',                0), ('IQR_f',         0),
 ]
-_FEATURE_COLS = 3    # number of name/value pairs laid side by side
+
+# ── Validity flags — shown SEPARATELY and first ──────────────────────────────
+# These are not features, they are the columns that say whether the features above
+# mean anything: a row with fit_valid = 0 has NaN τ/R²/coverage, and one with
+# b3_frames = 0 has no v6 features at all. Mixed in among 25 numbers they would be
+# missed, and a reviewer would judge a row on values that are not measurements.
+_QUALITY_FMT = [
+    ('fit_valid',   0), ('b3_frames',  0), ('n_seg',       0),
+    ('n_seg_valid', 0), ('decay_len',  0), ('gibbs_fired', 0),
+]
+_FEATURE_COLS = 5    # name/value pairs side by side (was 3; 25 features at 3 wide
+                     # would be 9 rows and would squeeze the screenshot pane)
 
 
 def _to_float(value, default: float = float('nan')) -> float:
@@ -176,6 +200,8 @@ class ClickReviewDialog(QDialog):
             "Confirmed clicks",
             "Rejected by SVM (Stage3_SVM)",
             "Blocked by gates (Stage 2)",
+            # APPEND ONLY — _refresh_table branches on the raw index below.
+            "Needs review (v6 queue)",
         ])
         self.combo_filter.currentIndexChanged.connect(self._refresh_table)
         file_row.addWidget(self.combo_filter)
@@ -186,6 +212,8 @@ class ClickReviewDialog(QDialog):
             "P(click) — highest first",
             "P(click) — lowest first",
             "Frame order",
+            # APPEND ONLY — _refresh_table branches on the raw index below.
+            "Review queue (tier order)",
         ])
         self.combo_sort.currentIndexChanged.connect(self._refresh_table)
         file_row.addWidget(self.combo_sort)
@@ -285,9 +313,19 @@ class ClickReviewDialog(QDialog):
 
         self._feature_values = {}   # feature name → its value QLabel
 
+        # ── Validity banner — spans the grid, above everything ───────────────
+        # Plain text, red when anything is wrong. A reviewer must see "this row's
+        # numbers are not measurements" before reading the numbers, not after.
+        self.validity_lbl = QLabel("")
+        self.validity_lbl.setWordWrap(True)
+        vf = QFont(); vf.setBold(True)
+        self.validity_lbl.setFont(vf)
+        grid.addWidget(self.validity_lbl, 0, 0, 1, _FEATURE_COLS * 2)
+
+        row0 = 1
         n_rows = -(-len(_FEATURE_FMT) // _FEATURE_COLS)   # ceil
         for idx, (name, _prec) in enumerate(_FEATURE_FMT):
-            r = idx % n_rows
+            r = row0 + idx % n_rows
             c = idx // n_rows
 
             name_lbl = QLabel(f"{name}:")
@@ -301,6 +339,18 @@ class ClickReviewDialog(QDialog):
             grid.addWidget(value_lbl, r, c * 2 + 1)
             self._feature_values[name] = value_lbl
 
+        # ── Quality flags on their own row, visually separated ────────────────
+        qrow = row0 + n_rows
+        for idx, (name, _prec) in enumerate(_QUALITY_FMT):
+            name_lbl = QLabel(f"{name}:")
+            name_lbl.setFont(name_font)
+            value_lbl = QLabel("—")
+            value_lbl.setFont(value_font)
+            value_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            grid.addWidget(name_lbl,  qrow, idx * 2)
+            grid.addWidget(value_lbl, qrow, idx * 2 + 1)
+            self._feature_values[name] = value_lbl
+
         # Let the value columns take the slack, so the names stay tight against them.
         for c in range(_FEATURE_COLS):
             grid.setColumnStretch(c * 2 + 1, 1)
@@ -310,7 +360,8 @@ class ClickReviewDialog(QDialog):
 
     def _update_features(self, i: Optional[int]):
         """Refresh the feature panel for df row `i` (None → clear it)."""
-        for name, _prec in _FEATURE_FMT:
+        fmt = dict(_FEATURE_FMT + _QUALITY_FMT)
+        for name, _prec in _FEATURE_FMT + _QUALITY_FMT:
             label = self._feature_values[name]
 
             if i is None or self.df is None or name not in self.df.columns:
@@ -322,8 +373,55 @@ class ClickReviewDialog(QDialog):
                 label.setText("—")
                 continue
 
-            prec = dict(_FEATURE_FMT)[name]
-            label.setText(f"{value:.{prec}f}")
+            label.setText(f"{value:.{fmt[name]}f}")
+
+        self._update_validity(i)
+
+    def _update_validity(self, i: Optional[int]):
+        """
+        Say plainly when the numbers above are not measurements.
+
+        A row with fit_valid = 0 carries NaN for τ / R² / fit_coverage; one with
+        b3_frames = 0 has no Buffer-3 estimate so every v6 feature is NaN; one with
+        n_seg_valid = 0 has a region too short for the 12-band grid, which biases
+        entropy toward 1 (§4.3). Those rows are exactly review tier 4 — the
+        population that has never been labelled by anyone — so the warning has to
+        be impossible to miss rather than one "—" among twenty-five numbers.
+        """
+        if i is None or self.df is None:
+            self.validity_lbl.setText("")
+            return
+
+        def _flag(col, default=1.0):
+            if col not in self.df.columns:
+                return None
+            v = _to_float(self.df.at[i, col])
+            return default if v != v else v
+
+        warn = []
+        if _flag('fit_valid') == 0:
+            warn.append("FIT INVALID — τ / R² / fit_coverage are not meaningful")
+        if _flag('b3_frames') == 0:
+            warn.append("NO BUFFER-3 ESTIMATE — every v6 spectral feature is unavailable")
+        if _flag('n_seg_valid') == 0:
+            warn.append("REGION TOO SHORT — bands correlated, entropy biased high (§4.3)")
+        if _flag('gibbs_fired', 0.0) == 1:
+            warn.append("Gibbs fade fired — the noise subtraction is biased on this frame")
+
+        note = str(self.df.at[i, 'migration_note']) if 'migration_note' in self.df.columns else ''
+        tier = _flag('review_tier', float('nan'))
+
+        parts = []
+        if warn:
+            parts.append("⚠  " + "   ·   ".join(warn))
+        if tier == tier and tier:
+            parts.append(f"review tier {int(tier)}" + (f" — {note}" if note else ""))
+        elif note:
+            parts.append(note)
+
+        self.validity_lbl.setText("\n".join(parts))
+        self.validity_lbl.setStyleSheet(
+            "color: #d84343;" if warn else "color: #8a8a8a;")
 
     def _build_metrics_group(self):
         group = QGroupBox("Your labels vs. the algorithm")
@@ -393,6 +491,27 @@ class ClickReviewDialog(QDialog):
         if 'label' not in df.columns:
             df['label'] = LABEL_NONE
 
+        # Normalise the label spelling. The existing corpus is a documented mix of
+        # '1' / '1.0' / '0' / '0.0' / '' (migrate_labels_v6.py:100). A '1.0' here
+        # fails three ways at once and silently: the table cell renders blank, the
+        # row hides under "Unlabelled only", and the metrics count it as neither
+        # class — so a labelled click looks unlabelled and is labelled again.
+        def _norm_label(v):
+            s = str(v).strip().replace(',', '.')
+            if not s:
+                return LABEL_NONE
+            try:
+                f = float(s)
+            except ValueError:
+                return LABEL_NONE
+            if f == 1.0:
+                return LABEL_CLICK
+            if f == 0.0:
+                return LABEL_NOISE
+            return LABEL_NONE
+
+        df['label'] = df['label'].map(_norm_label)
+
         self.df = df
         self.csv_path = path
         self._png_index = None    # new folder → rebuild the screenshot index lazily
@@ -433,6 +552,11 @@ class ClickReviewDialog(QDialog):
             rows = [i for i in rows if self._verdict(i) == 'Stage3_SVM']
         elif mode == 4 and self._is_classified():
             rows = [i for i in rows if self._verdict(i).startswith('Stage2')]
+        elif mode == 5 and 'needs_review' in self.df.columns:
+            # The v6 review queue produced by scripts/migrate_labels_v6.py. Rows
+            # whose label migrated cleanly are already settled and are not here.
+            rows = [i for i in rows
+                    if _to_float(self.df.at[i, 'needs_review'], 0.0) == 1]
 
         # ── Sort ──
         sort_mode = self.combo_sort.currentIndex()
@@ -440,6 +564,17 @@ class ClickReviewDialog(QDialog):
             rows.sort(key=self._prob, reverse=True)
         elif sort_mode == 1:
             rows.sort(key=self._prob)
+        elif sort_mode == 3 and 'review_tier' in self.df.columns:
+            # Tier order, then click-likeness within a tier. Tier 1 (ambiguous
+            # migrations, including outright contradictions) must be adjudicated
+            # first because everything downstream inherits those decisions.
+            # Unflagged rows sort last rather than being hidden.
+            rows.sort(key=lambda i: (
+                _to_float(self.df.at[i, 'review_tier'], 99.0) or 99.0,
+                -_to_float(self.df.at[i, 'clicklike_rank'], 0.0)
+                if 'clicklike_rank' in self.df.columns else 0.0,
+                _to_float(self.df.at[i, 'frame_idx'], 0.0),
+            ))
         else:
             rows.sort(key=lambda i: _to_float(self.df.at[i, 'frame_idx'], 0.0))
 
@@ -704,7 +839,23 @@ class ClickReviewDialog(QDialog):
         session is far more expensive than a rewrite, so there is no explicit Save.
         """
         try:
-            self.df.to_csv(self.csv_path, index=False)
+            # Write to a sibling temp file and rename over the original. to_csv()
+            # truncates in place, so a crash or a full disk mid-write used to leave
+            # a half-written CSV and lose every label in it — and this runs after
+            # EVERY keystroke. os.replace is atomic on the same filesystem.
+            import os
+            import tempfile
+            fd, tmp = tempfile.mkstemp(dir=str(self.csv_path.parent),
+                                       prefix='.' + self.csv_path.name + '.',
+                                       suffix='.tmp')
+            os.close(fd)
+            try:
+                self.df.to_csv(tmp, index=False)
+                os.replace(tmp, self.csv_path)
+            except BaseException:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+                raise
         except Exception as e:
             QMessageBox.warning(
                 self, "Could not save",

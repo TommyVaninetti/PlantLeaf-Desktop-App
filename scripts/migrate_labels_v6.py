@@ -54,10 +54,19 @@ Everything else is flagged for review, never guessed. New rows carry `peak_abs`
 (exact sample arithmetic, identical for both candidates of a straddling click),
 so future migrations will not have this problem.
 
+OUTPUT
+------
+ONE FILE PER RECORDING (`<recording>_candidates.csv`), not a single merged CSV,
+because that is how labelling actually happens — you open the file for the
+recording you are reviewing. click_review_dialog also builds a table widget per
+row and rewrites the whole CSV on every keystroke, so a 200k-row merged file
+would hang it; per recording the counts stay in the thousands. A small
+`migration_report.csv` summarises the queue across all of them.
+
 Usage
 -----
     python3 scripts/migrate_labels_v6.py NEW_EXPORT_DIR [--old-dir DIR]
-                                         [--master CSV] [--out CSV]
+                                         [--master CSV] [--out DIR]
 """
 
 from __future__ import annotations
@@ -289,15 +298,15 @@ def main() -> int:
     ap.add_argument("new_export", help="directory of v6 *_candidates.csv files")
     ap.add_argument("--old-dir", default=str(_DEFAULT_OLD_DIR))
     ap.add_argument("--master", default=str(_DEFAULT_MASTER))
-    ap.add_argument("--out", default=None)
+    ap.add_argument("--out", default=None,
+                    help="output DIRECTORY (default: alongside the new export). "
+                         "One <recording>_candidates.csv is written per recording, "
+                         "plus migration_report.csv.")
     ap.add_argument("--threshold", type=float, default=0.2639)
     args = ap.parse_args()
 
     new_dir = Path(args.new_export).expanduser()
-    out_path = Path(args.out) if args.out else new_dir / "merged_v6.csv"
-    if out_path.exists():
-        print(f"NOTE: overwriting {out_path.name} (this tool's own output; "
-              f"inputs are never touched)")
+    out_path = Path(args.out) if args.out else (new_dir / "migrated")
 
     new_files = sorted(new_dir.rglob("*_candidates.csv"))
     if not new_files:
@@ -329,10 +338,41 @@ def main() -> int:
         int(r["review_tier"]) if r["review_tier"] else 99,
         float(r["clicklike_rank"]) if r["clicklike_rank"] else 0.0,
     ))
-    with open(out_path, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(new_rows)
+    # ── Write ONE FILE PER RECORDING, mirroring the export layout ────────────
+    # Not one giant merged CSV. Labelling happens per recording — you open the
+    # file for the recording you are reviewing — and click_review_dialog builds a
+    # table widget per row and rewrites the whole CSV on every keystroke, so a
+    # 200k-row file would hang it. Per recording the counts stay in the thousands,
+    # where that code is perfectly fine. It also means a mistake costs one file.
+    by_file = defaultdict(list)
+    for r in new_rows:
+        by_file[str(r.get("file", "") or "unknown").strip()].append(r)
+
+    out_dir = out_path.parent if out_path.suffix else out_path
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for stem, rows_f in sorted(by_file.items()):
+        dest = out_dir / f"{stem}_candidates.csv"
+        with open(dest, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows_f)
+        written.append((stem, dest, len(rows_f),
+                        sum(1 for r in rows_f if r["needs_review"])))
+
+    # ── One small report so the queue is still visible in one place ──────────
+    report = out_dir / "migration_report.csv"
+    with open(report, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["file", "rows", "needs_review",
+                    "tier1_ambiguous", "tier2_svm", "tier3_clicklike",
+                    "tier4_new_fit_invalid", "migrated"])
+        for stem, _dest, n_rows, n_rev in written:
+            rf = by_file[stem]
+            w.writerow([stem, n_rows, n_rev]
+                       + [sum(1 for r in rf if str(r["review_tier"]) == str(t))
+                          for t in (1, 2, 3, 4)]
+                       + [sum(1 for r in rf if r["label_source"] == "migrated")])
 
     print(f"\n{'=' * 66}")
     print(f"labels migrated automatically : {stats['migrated']}")
@@ -344,7 +384,12 @@ def main() -> int:
         n = sum(1 for r in new_rows if str(r["review_tier"]) == str(t))
         print(f"  tier {t}  {REVIEW_TIERS[t]:16s} {n:7d}")
     print(f"\n  no review needed              {sum(1 for r in new_rows if not r['review_tier']):7d}")
-    print(f"\nwrote {out_path}")
+    print(f"\nwrote {len(written)} per-recording CSV(s) to {out_dir}")
+    for stem, dest, n_rows, n_rev in written[:8]:
+        print(f"    {dest.name[:52]:52s} {n_rows:7d} rows, {n_rev:6d} to review")
+    if len(written) > 8:
+        print(f"    … and {len(written) - 8} more")
+    print(f"  summary: {report}")
     print("⚠️  tier 2 (svm_conflict) orders rows by the CURRENT model's uncertainty,")
     print("    which biases new labels toward that model's blind spots. It is tagged")
     print("    so it can be excluded at analysis time; say so in any result that")

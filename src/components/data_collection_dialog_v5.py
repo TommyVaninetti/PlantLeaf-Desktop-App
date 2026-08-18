@@ -41,9 +41,25 @@ CSV_FILENAME = 'data_collection_export.csv'
 SCREENSHOTS_FOLDER = 'screenshots'
 
 # Screenshot rendering (pure QPainter + QImage — no pyqtgraph, no OpenGL, no segfaults)
+#
+# ⚠️ THESE ARE THE SINGLE SOURCE OF TRUTH FOR THE SCREENSHOT GEOMETRY.
+# click_review_dialog crops the header and footer off before displaying the PNG,
+# and it IMPORTS these constants to do it. They used to be duplicated there as
+# hand-tuned literals with only a comment holding them in step, which meant any
+# change to the footer height silently mis-cropped every screenshot. Do not
+# re-introduce literals on the consumer side.
 SCREENSHOT_WIDTH  = 1400
-SCREENSHOT_HEIGHT = 800   # taller than 700 to give the feature footer room to breathe
+SCREENSHOT_HEIGHT = 900   # the v6 footer carries ~10 groups at 11 pt, and the
+                          # Quality group can wrap to a second line when it warns
 PANEL_HEIGHT      = 480   # plot area height within each panel
+SCREENSHOT_MARGIN = 14
+SCREENSHOT_HEADER_H = 36  # title strip, cropped by the review dialog
+SCREENSHOT_GAP    = 8
+#: Footer height, derived — the review dialog crops exactly this much off the bottom.
+SCREENSHOT_FOOTER_H = (SCREENSHOT_HEIGHT
+                       - (SCREENSHOT_HEADER_H + SCREENSHOT_MARGIN + PANEL_HEIGHT
+                          + SCREENSHOT_GAP)
+                       - SCREENSHOT_MARGIN)
 
 # K spinbox constraints
 K_MIN = 0.5
@@ -238,6 +254,14 @@ class CandidateData:
     seams_ms: list = field(default_factory=list)  # frame-join times in the window
     fft_norm: np.ndarray = field(default_factory=lambda: np.array([]))
     freq_axis: np.ndarray = field(default_factory=lambda: np.array([]))
+
+    # ── Screenshot FFT panel (v6) ────────────────────────────────────────────
+    # The region's own amplitude spectrum, and Buffer 3's noise floor expressed on
+    # the SAME amplitude axis. All three curves (frame / region / noise) share one
+    # axis in mV; see _region_display_spectrum for why that is legitimate.
+    region_freqs: np.ndarray = field(default_factory=lambda: np.array([]))
+    region_amp:   np.ndarray = field(default_factory=lambda: np.array([]))
+    noise_amp:    np.ndarray = field(default_factory=lambda: np.array([]))
 
     # Pre-computed exponential fit curve (worker thread) — avoids scipy on main
     # thread. Time axis is peak-relative ms, spanning the REAL decay window
@@ -521,6 +545,12 @@ def _process_file_for_collection(
             # dispersed-phase frames, so this should be rare — which is precisely why
             # it is worth recording rather than assuming.
             gibbs_fired = int(len(curr_sig) > 0 and curr_sig[0] == 0.0)
+
+            # The three curves the screenshot's FFT panel draws, all on one
+            # amplitude axis. Computed here because ctx / resolved / p_noise are
+            # already in hand; see _region_display_spectrum for the maths.
+            _disp_freqs, _disp_region, _disp_noise = _region_display_spectrum(
+                ctx, resolved, p_noise, curr_freq_axis, FS)
             features = compute_features_v5(
                 ctx, resolved,
                 curr_fft_norm, curr_freq_axis,
@@ -667,6 +697,9 @@ def _process_file_for_collection(
                 seams_ms=seams_ms,
                 fft_norm=curr_fft_norm,
                 freq_axis=curr_freq_axis,
+                region_freqs=_disp_freqs,
+                region_amp=_disp_region,
+                noise_amp=_disp_noise,
                 fit_t_ms=fit_t_ms_arr,
                 fit_y=fit_y_arr,
                 label='',
@@ -839,20 +872,117 @@ def _draw_vline(
         p.drawText(px + 2, r.top() + 10, label)
 
 
+def _region_display_spectrum(ctx, resolved, p_noise_psd, freq_axis, fs):
+    """
+    Build the three curves the screenshot's FFT panel draws, all on ONE amplitude
+    axis in volts: the region spectrum, and Buffer 3's noise floor.
+
+    Returns (freqs, region_amp, noise_amp); any of them empty when unavailable.
+
+    ── WHAT IS AND IS NOT COMPARABLE ON THIS AXIS ───────────────────────────────
+    Read this before trusting the picture. No single scaling makes all three curves
+    quantitatively comparable — that is structural, not an implementation choice
+    (SPECTRAL_FEATURES_v6_PROPOSAL.md §3.2): each signal class scales differently
+    with segment length N under amplitude scaling.
+
+        coherent tone spanning the window   invariant
+        stationary noise                    ∝ N^(-1/2)
+        finite transient (the click)        ∝ N^(-1)
+
+    ✅ REGION vs NOISE is quantitative, and it is the comparison that matters. The
+       noise line is converted below to the amplitude that Buffer 3's power density
+       produces WHEN MEASURED WITH THIS REGION'S OWN WINDOW, so the vertical gap
+       between the region curve and the noise line IS the per-frequency excess the
+       v6 features are computed from.
+
+    ⚠️ REGION vs FRAME is NOT quantitative. A click is a finite transient, so its
+       amplitude spectrum falls as N^(-1): the same click measured over a
+       60-sample region and over the 512-sample frame differs by ~8x in amplitude
+       for reasons that have nothing to do with the signal. The frame curve is
+       drawn as CONTEXT — where the frame's energy sits in frequency — and is
+       labelled as such in the legend. Do not read a ratio off it.
+
+    The noise conversion:
+
+        A_rms(noise) = sqrt( 2 · P_noise · Δf )        Δf = spec.enbw_hz
+
+    Derivation: amplitude A = 2|X|/Σw and psd P = 2|X|²/(fs·Σw²) give
+    A² = 2·P·fs·Σw²/(Σw)², and NENBW = n·Σw²/(Σw)², so A² = 2·P·(NENBW·fs/n) =
+    2·P·Δf. Verified against measured spectra at n_seg 30/58/90/150/512: ratio
+    0.9993-1.0033, i.e. within 0.3 % at every region length.
+
+    With that conversion the vertical gap between the region curve and the noise
+    line IS the per-frequency excess the v6 features measure, so the picture and
+    the numbers agree. Drawing the raw PSD on an mV axis instead would look
+    plausible and mean nothing.
+    """
+    empty = (np.array([]), np.array([]), np.array([]))
+    try:
+        from core.click_pipeline_v5 import (_spectral, analysis_band_taper,
+                                            _BIN_START, _BIN_END, _K_BINS,
+                                            REGION_NFFT)
+        sa = _spectral()
+
+        signal = ctx['signal']
+        i0 = max(0, int(resolved['onset']))
+        i1 = min(len(signal), int(resolved['decay_end']) + 1)
+        if i1 - i0 < sa.MIN_SEGMENT_SAMPLES:
+            return empty
+
+        spec = sa.compute_spectrum(signal[i0:i1], fs,
+                                   window=sa.DEFAULT_WINDOW, alpha=sa.DEFAULT_ALPHA,
+                                   n_fft=REGION_NFFT, scaling='amplitude')
+        freqs = spec.freqs
+        region_amp = spec.mags
+
+        noise_amp = np.array([])
+        if p_noise_psd is not None:
+            pn = np.asarray(p_noise_psd, dtype=np.float64)
+            if pn.shape == (_K_BINS,) and np.all(np.isfinite(pn)):
+                # Trap (a): B3 is untapered, the region is not. Match them first.
+                pn = pn * analysis_band_taper(_K_BINS) ** 2
+                nf = np.asarray(freq_axis, dtype=np.float64)[_BIN_START:_BIN_END + 1]
+                pn_on_region = np.interp(freqs, nf, pn, left=np.nan, right=np.nan)
+                noise_amp = np.sqrt(np.maximum(2.0 * pn_on_region * spec.enbw_hz, 0.0))
+
+        return freqs, region_amp, noise_amp
+    except Exception:                                          # noqa: BLE001
+        # A screenshot must never be the reason an export fails.
+        return empty
+
+
 def _draw_feature_footer(
     p: QPainter, c: 'CandidateData', rect: QRect,
     c_text: QColor, c_key: QColor,
 ):
     """
-    Draw all 17 features + noise info as readable multi-line text below the plots.
+    Draw every feature + noise info as readable multi-line text below the plots.
 
     Each group is one line: a bold label on the left, then values separated by │.
-    Font is large enough (9 pt) to read without squinting.
+
+    Covers the 17 v5 features, the 8 v6 features, and a Quality line carrying the
+    validity flags. The Quality line is the important one — fit_valid, b3_frames,
+    n_seg_valid and gibbs_fired are what tell a reviewer that the other numbers on
+    the page are not to be trusted, and without it a failed row looks identical to
+    a good one.
+
+    Font is 11 pt (was 9). At 9 pt the review dialog considered this footer
+    unreadable and cropped it away entirely, re-rendering the numbers itself.
     """
-    LINE_H = 22
+    LINE_H = 28          # was 22 — the 9 pt footer was unreadable once rescaled
+
+    def _num(v, fmt, bad="n/a"):
+        """NaN-safe formatting. A NaN here is a real state, not a glitch: it means
+        the quantity could not be measured, and printing 'nan' hides that."""
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            return bad
+        return bad if fv != fv else format(fv, fmt)
+
+    tau_str = f"{c.tau_ms:.4f} ms" if c.tau_ms == c.tau_ms and c.tau_ms > 0 else "N/A"
 
     # (label, [value strings]) — one line per group
-    tau_str = f"{c.tau_ms:.4f} ms" if c.tau_ms > 0 else "N/A"
     groups = [
         ("Noise",    [f"floor = {c.noise_floor * 1e3:.4f} mV",
                       f"std = {c.std_noise * 1e3:.4f} mV",
@@ -867,14 +997,40 @@ def _draw_feature_footer(
         ("ZCR",      [f"pre = {c.ZCR_pre:.3f}",
                       f"click = {c.ZCR_click:.3f}",
                       f"post = {c.ZCR_post:.3f}"]),
-        ("Spectral", [f"centroid_shift = {c.centroid_shift_hz:.0f} Hz",
+        ("Spec v5",  [f"centroid_shift = {c.centroid_shift_hz:.0f} Hz",
                       f"SPR = {c.SPR:.2f}",
                       f"R_spectral = {c.R_spectral:.3f}",
                       f"FPE = {c.FPE_hz:.0f} Hz"]),
+        # ── v6, computed on the excess spectrum E[k] = max(0, P_region − P_noise) ──
+        ("Spec v6",  [f"entropy = {_num(c.spectral_entropy, '.3f')}",
+                      f"novelty = {_num(c.shape_novelty, '.3f')}",
+                      f"tilt = {_num(c.spectral_tilt, '+.3f')} dB/kHz",
+                      f"t_conc = {_num(c.temporal_concentration, '.3f')}"]),
+        ("Location", [f"FPE_region = {_num(c.FPE_hz_region, '.0f')} Hz",
+                      f"SPR_region = {_num(c.SPR_region, '.2f')}",
+                      f"f_50 = {_num(c.f_50_hz, '.0f')} Hz",
+                      f"IQR_f = {_num(c.IQR_f, '.0f')} Hz"]),
         ("Fit",      [f"τ = {tau_str}",
-                      f"R² = {c.R2:.4f}",
-                      f"coverage = {c.fit_coverage:.3f}"]),
+                      f"R² = {_num(c.R2, '.4f')}",
+                      f"coverage = {_num(c.fit_coverage, '.3f')}",
+                      f"decay_len = {c.decay_len}"]),
     ]
+
+    # ── Quality — the group that says whether the numbers above mean anything ──
+    # fit_valid = 0 makes τ / R² / coverage meaningless; b3_frames = 0 makes every
+    # v6 feature meaningless; n_seg < 45 biases entropy toward 1 (§4.3). Without
+    # this line a failed row shows a full table of plausible-looking garbage.
+    q = []
+    q.append("fit_valid = 1" if c.fit_valid else "⚠ FIT INVALID — τ/R²/coverage not meaningful")
+    if c.b3_frames:
+        q.append(f"b3_frames = {c.b3_frames}")
+    else:
+        q.append("⚠ NO B3 ESTIMATE — v6 features unavailable")
+    q.append(f"n_seg = {c.n_seg}" if c.n_seg_valid
+             else f"⚠ n_seg = {c.n_seg} too short — bands correlated, entropy biased high")
+    if c.gibbs_fired:
+        q.append("⚠ Gibbs fade fired — subtraction biased on this frame")
+    groups.append(("Quality", q))
 
     # Verdict line — only when the candidate went through Stages 2-4. Without it a
     # PNG shows what the frame looked like but not what the algorithm made of it.
@@ -886,24 +1042,46 @@ def _draw_feature_footer(
         verdict = "CONFIRMED CLICK" if c.is_confirmed_click else f"blocked at {c.stage_blocked}"
         groups.append(("Verdict", [verdict, prob_str]))
 
-    f_key = QFont("Arial", 9, QFont.Bold)
-    f_val = QFont("Courier New", 9)
-    KEY_W = 72  # pixels reserved for group label column
+    f_key = QFont("Arial", 11, QFont.Bold)      # was 9 pt
+    f_val = QFont("Courier New", 11)            # was 9 pt
+    KEY_W = 92  # pixels reserved for group label column (wider labels at 11 pt)
+
+    # Wrap a group across several lines rather than letting it run off the panel.
+    # The Quality group in particular can carry four warnings at once, and a
+    # truncated warning is worse than none — it looks like the row is fine.
+    from PySide6.QtGui import QFontMetrics
+    SEP = "   │   "
+    avail = rect.width() - KEY_W
+    fm = QFontMetrics(f_val)
+
+    def _wrap(values):
+        lines, cur = [], []
+        for v in values:
+            trial = SEP.join(cur + [v])
+            if cur and fm.horizontalAdvance(trial) > avail:
+                lines.append(SEP.join(cur))
+                cur = [v]
+            else:
+                cur.append(v)
+        if cur:
+            lines.append(SEP.join(cur))
+        return lines
 
     y = rect.top() + 6
     for label, values in groups:
-        if y + LINE_H > rect.bottom():
-            break
-        p.setFont(f_key)
-        p.setPen(c_key)
-        p.drawText(QRect(rect.left(), y, KEY_W, LINE_H),
-                   Qt.AlignLeft | Qt.AlignVCenter, label + ":")
-        p.setFont(f_val)
-        p.setPen(c_text)
-        p.drawText(QRect(rect.left() + KEY_W, y, rect.width() - KEY_W, LINE_H),
-                   Qt.AlignLeft | Qt.AlignVCenter,
-                   "   │   ".join(values))
-        y += LINE_H
+        for n, line in enumerate(_wrap(values)):
+            if y + LINE_H > rect.bottom():
+                break
+            if n == 0:
+                p.setFont(f_key)
+                p.setPen(c_key)
+                p.drawText(QRect(rect.left(), y, KEY_W, LINE_H),
+                           Qt.AlignLeft | Qt.AlignVCenter, label + ":")
+            p.setFont(f_val)
+            p.setPen(c_text)
+            p.drawText(QRect(rect.left() + KEY_W, y, avail, LINE_H),
+                       Qt.AlignLeft | Qt.AlignVCenter, line)
+            y += LINE_H
 
 
 def _render_candidate_screenshot(
@@ -948,12 +1126,12 @@ def _render_candidate_screenshot(
 
         # ── Layout constants ──────────────────────────────────────────────────
         W, H       = SCREENSHOT_WIDTH, SCREENSHOT_HEIGHT
-        MARGIN     = 14
-        HEADER_H   = 36
+        MARGIN     = SCREENSHOT_MARGIN
+        HEADER_H   = SCREENSHOT_HEADER_H
         PLOT_H     = PANEL_HEIGHT       # height of each plot panel
-        GAP        = 8                  # gap between header/panels/footer
+        GAP        = SCREENSHOT_GAP     # gap between header/panels/footer
         FOOTER_Y   = HEADER_H + MARGIN + PLOT_H + GAP
-        FOOTER_H   = H - FOOTER_Y - MARGIN
+        FOOTER_H   = SCREENSHOT_FOOTER_H
 
         FFT_W  = int((W - 3 * MARGIN) * 0.40)
         IFFT_W = W - 3 * MARGIN - FFT_W
@@ -974,6 +1152,7 @@ def _render_candidate_screenshot(
         C_ENV    = QColor('#ef5350')   # envelope — red
         C_FIT    = QColor('#00E676')   # fit curve — green
         C_FLOOR  = QColor('#00CED1')   # noise floor line — cyan
+        C_FRAME  = QColor('#42506b')   # whole-frame FFT — muted, sits behind
         C_STD    = QColor('#9370DB')   # noise+std line — purple
         C_TEXT   = QColor('#cccccc')
         C_KEY    = QColor('#7aadcc')
@@ -1001,41 +1180,89 @@ def _render_candidate_screenshot(
                 p.setPen(QPen(C_BORDER, 1))
                 p.drawRect(panel)
 
-            # ── FFT Panel ─────────────────────────────────────────────────────
+            # ── FFT Panel — three curves, ONE amplitude axis ──────────────────
+            # Foreground: the REGION spectrum (onset→decay_end) — the click itself,
+            #             which is what every v6 feature is computed on.
+            # Dashed:     Buffer 3's noise floor, converted to the amplitude it
+            #             would have when measured with THIS region's window
+            #             (A_rms = sqrt(2·P·Δf)). Region vs noise IS quantitative:
+            #             the gap between the two is the per-frequency excess the
+            #             v6 features measure.
+            # Background: the whole-frame 512-point spectrum, de-emphasised and
+            #             labelled "context". It is NOT quantitatively comparable
+            #             to the region curve — a finite transient's amplitude
+            #             spectrum falls as N^(-1), so the same click reads ~8x
+            #             lower over 512 samples than over a 60-sample region.
+            #             It shows WHERE the frame's energy sits, nothing more.
+            #             See _region_display_spectrum.
             freq_khz = candidate.freq_axis / 1000.0
             mask     = (freq_khz >= 20) & (freq_khz <= 80)
             fq       = freq_khz[mask]
-            fft_vals = candidate.fft_norm[mask].copy()
+            frame_vals = candidate.fft_norm[mask].copy() if len(candidate.fft_norm) else np.array([])
+            frame_vals = np.where(np.isfinite(frame_vals), frame_vals, 0.0)
 
-            if len(fft_vals) == 0:
-                fft_vals = np.array([0.0])
-                fq       = np.array([20.0])
+            rq = candidate.region_freqs / 1000.0 if len(candidate.region_freqs) else np.array([])
+            rmask = (rq >= 20) & (rq <= 80) if len(rq) else np.array([], dtype=bool)
+            rq_v   = rq[rmask] if len(rq) else np.array([])
+            reg_vals = (np.where(np.isfinite(candidate.region_amp[rmask]),
+                                 candidate.region_amp[rmask], 0.0)
+                        if len(candidate.region_amp) == len(rq) and len(rq) else np.array([]))
+            noi_vals = (candidate.noise_amp[rmask]
+                        if len(candidate.noise_amp) == len(rq) and len(rq) else np.array([]))
 
-            # Replace any non-finite values before auto-scaling
-            fft_vals = np.where(np.isfinite(fft_vals), fft_vals, 0.0)
+            if len(fq) == 0:
+                fq, frame_vals = np.array([20.0, 80.0]), np.array([0.0, 0.0])
 
-            # Auto-scale to most readable SI unit (linear, not dB)
-            fft_max = float(np.max(np.abs(fft_vals))) if len(fft_vals) > 0 else 0.0
-            if fft_max >= 0.5:
-                fft_sc, fft_unit = fft_vals, 'V'
-            elif fft_max >= 5e-4:
-                fft_sc, fft_unit = fft_vals * 1e3, 'mV'
+            # One auto-scale for all three, so they stay comparable.
+            _all = [v for v in (frame_vals, reg_vals, noi_vals) if len(v)]
+            peak = max((float(np.nanmax(np.abs(v))) for v in _all
+                        if np.any(np.isfinite(v))), default=0.0)
+            if peak >= 0.5:
+                sc, fft_unit = 1.0, 'V'
+            elif peak >= 5e-4:
+                sc, fft_unit = 1e3, 'mV'
             else:
-                fft_sc, fft_unit = fft_vals * 1e6, 'µV'
+                sc, fft_unit = 1e6, 'µV'
 
             fft_y_min = 0.0
-            fft_y_max = float(np.max(fft_sc)) * 1.08 if len(fft_sc) > 0 else 1.0
+            fft_y_max = peak * sc * 1.08
             if not np.isfinite(fft_y_max) or fft_y_max <= 0:
                 fft_y_max = 1.0
 
+            _title = "Region FFT (onset→decay end)" if len(reg_vals) else "FFT Spectrum"
             _draw_axes(p, FFT_panel,
-                       float(fq[0]), float(fq[-1]), fft_y_min, fft_y_max,
-                       title="FFT Spectrum",
+                       20.0, 80.0, fft_y_min, fft_y_max,
+                       title=_title,
                        x_label="Frequency (kHz)", y_label=f"Amplitude ({fft_unit})",
                        c_grid=C_GRID, c_axis=C_AXIS, c_title=C_TITLE)
-            _draw_line(p, FFT_panel, fq, fft_sc,
-                       float(fq[0]), float(fq[-1]), fft_y_min, fft_y_max,
-                       C_FFT, lw=1)
+
+            # Background first, so the region curve sits on top of it.
+            _draw_line(p, FFT_panel, fq, frame_vals * sc,
+                       20.0, 80.0, fft_y_min, fft_y_max, C_FRAME, lw=1)
+            if len(noi_vals) and np.any(np.isfinite(noi_vals)):
+                _draw_line(p, FFT_panel, rq_v, np.nan_to_num(noi_vals) * sc,
+                           20.0, 80.0, fft_y_min, fft_y_max,
+                           C_FLOOR, lw=1, dashed=True)
+            if len(reg_vals):
+                _draw_line(p, FFT_panel, rq_v, reg_vals * sc,
+                           20.0, 80.0, fft_y_min, fft_y_max, C_FFT, lw=2)
+
+            # Legend — without it three curves in one panel are unreadable.
+            _lg = [("region", C_FFT), ("frame (context)", C_FRAME)]
+            if len(noi_vals) and np.any(np.isfinite(noi_vals)):
+                _lg.append(("B3 noise", C_FLOOR))
+            else:
+                _lg.append(("no B3 estimate", C_AXIS))
+            p.setFont(QFont("Arial", 9))
+            _lx = FFT_panel.right() - 150
+            _ly = FFT_panel.top() + 26
+            for _name, _col in _lg:
+                p.setPen(QPen(_col, 2))
+                p.drawLine(_lx, _ly + 5, _lx + 18, _ly + 5)
+                p.setPen(C_TEXT)
+                p.drawText(QRect(_lx + 24, _ly - 3, 104, 16),
+                           Qt.AlignLeft | Qt.AlignVCenter, _name)
+                _ly += 16
 
             # ── iFFT Panel ────────────────────────────────────────────────────
             # The render window is a slice of the stitched prev|curr|next context
