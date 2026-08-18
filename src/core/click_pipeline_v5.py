@@ -602,7 +602,14 @@ class AdaptiveNoiseEstimatorV5:
       B2_std   – Hilbert-envelope std of the reconstructed iFFT [V]
                  → used to compute std_noise for Stage 3 features
 
-    All three buffers share the same burst-protection gate (§4.4): if a frame's
+    Plus, OPTIONALLY (v6, off unless update() is given `mags_norm`):
+
+      B3       – per-bin noise PSD [V²/Hz], 154 bins over 20-80 kHz
+                 → used to build the excess spectrum E[k] for the v6 spectral
+                   features. See _b3_update / p_noise_psd and
+                   docs/fft_and_ifft/SPECTRAL_FEATURES_v6_PROPOSAL.md §2.
+
+    All buffers share the same burst-protection gate (§4.4): if a frame's
     FFT energy exceeds ALPHA × current Ê_floor, the frame is considered energetic
     (a burst or click candidate) and is NOT written into any buffer. This prevents
     transient events from inflating — and thus corrupting — the noise estimate.
@@ -641,6 +648,32 @@ class AdaptiveNoiseEstimatorV5:
         self._E_hat_floor = 0.0
         self._noise_floor = 0.0
         self._std_noise   = 0.0
+
+        # ── Buffer 3 (v6) — per-bin noise PSD ────────────────────────────────
+        # Only allocated/updated when update() is given mags_norm. See _b3_update.
+        self._B3_running = np.full(_K_BINS, np.inf, dtype=np.float64)
+        self._B3_stored  = np.zeros((_K_BINS, M_SUBWINDOWS), dtype=np.float64)
+        self._B3_slot    = 0       # Next sub-window slot to overwrite (round-robin)
+        self._B3_filled  = 0       # Number of valid slots (0 → M_SUBWINDOWS)
+        self._B3_count   = 0       # Accepted frames in the current sub-window
+        # ── B3 'mean' mode (the DEFAULT — see p_noise_psd) ───────────────────
+        # A ROLLING mean over the last W_NOISE accepted frames, matching B1/B2's
+        # window exactly, kept as a ring plus a running sum so the update is O(K)
+        # per frame rather than O(K·W).
+        #
+        # The window is what makes the estimator adaptive: ambient noise is not
+        # stationary over a multi-hour recording, and a cumulative mean would keep
+        # dragging in conditions from an hour ago. It is also what bounds a single
+        # intermittent event's contribution to 1/W_NOISE.
+        #
+        # Cost: 154 × 750 × 8 B ≈ 924 kB, versus 6.8 kB for the min form. That is
+        # fine here and ONLY here — Buffer 3 is offline/Python by design (§8.3
+        # Phase 1 step 3, "no firmware"). A firmware port could not afford this
+        # ring and would need the recursive-average form instead.
+        self._B3_ring    = np.zeros((W_NOISE, _K_BINS), dtype=np.float64)
+        self._B3_sum     = np.zeros(_K_BINS, dtype=np.float64)
+        self._B3_ring_i  = 0
+        self._B3_n       = 0
 
     def _median_of_local_minima(self, buffer: np.ndarray) -> float:
         """
@@ -693,7 +726,145 @@ class AdaptiveNoiseEstimatorV5:
     # Public API
     # ------------------------------------------------------------------
 
-    def update(self, E_i: float, env_mean_i: float, env_std_i: float) -> dict:
+    def _b3_update(self, mags_norm: np.ndarray, fs: float, fft_size: int):
+        """
+        Buffer 3 (v6 §2) — per-bin noise PSD, the same minimum-statistics
+        machinery as B1/B2 applied per bin instead of to a scalar.
+
+        Structure, exactly as specified: 154 running sub-window minima + a
+        154 × 10 ring of stored minima = 154 × 11 floats.
+
+            P_noise[k] = β · median( m_1[k], …, m_10[k] )        β = BETA = 1.3
+
+        Stores PSD in V²/Hz, not raw magnitude (§2.3), so it can be subtracted
+        from a region spectrum of ANY length with no correction factor: under PSD
+        scaling stationary noise is invariant to segment length, whereas under
+        amplitude scaling it falls as N^(-1/2) and the correction would have to be
+        recomputed per event and be exactly right (§3.2).
+
+        ⚠️ THIS IS NOT THE SAME ALGORITHM AS B1, ALTHOUGH §2.1 SAYS "IDENTICAL TO
+        BUFFER 1". B1 stores the raw W_NOISE = 750 values and RECOMPUTES all ten
+        sub-window minima by slicing on every frame, with sub-windows pinned to
+        ARRAY POSITIONS — so once the circular buffer wraps, the chronological
+        seam falls inside one sub-window. B3 below is the textbook Martin (2001)
+        form: a running minimum over the current sub-window, rotated into a ring
+        of ten slots every SUBWINDOW_SIZE accepted frames, so its ten minima are
+        the ten most recent CHRONOLOGICAL sub-windows.
+
+        B3 uses the specified structure because that is what the 154 × 11 memory
+        budget describes and what a firmware port would have to do — storing
+        154 × 750 floats to mirror B1 would be 924 kB, not 6.8 kB. The divergence
+        is quantified in test_scripts/verify_v6_buffer3.py rather than assumed
+        away.
+        """
+        psd = np.asarray(mags_norm, dtype=np.float64)
+        psd = psd * psd * (float(fft_size) / (2.0 * float(fs)))
+
+        # ── 'mean' mode: rolling sum over the last W_NOISE accepted frames ───
+        idx = self._B3_ring_i % W_NOISE
+        self._B3_sum -= self._B3_ring[idx]      # evict the frame leaving the window
+        self._B3_ring[idx] = psd
+        self._B3_sum += psd
+        self._B3_ring_i += 1
+        if self._B3_n < W_NOISE:
+            self._B3_n += 1
+
+        # ── 'min' mode: running sub-window minimum, rotated into ten slots ───
+        np.minimum(self._B3_running, psd, out=self._B3_running)
+        self._B3_count += 1
+
+        if self._B3_count >= SUBWINDOW_SIZE:
+            self._B3_stored[:, self._B3_slot] = self._B3_running
+            self._B3_slot = (self._B3_slot + 1) % M_SUBWINDOWS
+            if self._B3_filled < M_SUBWINDOWS:
+                self._B3_filled += 1
+            self._B3_running[:] = np.inf
+            self._B3_count = 0
+
+    def p_noise_psd(self, mode: str = 'mean') -> Optional[np.ndarray]:
+        """
+        Buffer 3's per-bin noise PSD estimate [V²/Hz], 154 bins (20-80 kHz).
+
+        mode='mean' (DEFAULT)
+            P_noise[k] = mean over the last W_NOISE burst-gated frames
+        mode='min'  (v6 §2 as written — retained for comparison, NOT the default)
+            P_noise[k] = β · median( m_1[k], …, m_10[k] ),  m_j = sub-window min
+
+        Returns None until an estimate exists — one accepted frame for 'mean', one
+        closed sub-window for 'min'. None rather than zeros: a zero floor would
+        make every bin's excess equal the region itself, silently.
+
+        ⚠️ This is the UNTAPERED estimate, built from transmitted magnitudes. The
+        caller MUST apply the squared analysis-band taper before subtracting it
+        from a region spectrum — see analysis_band_taper() and trap (a) in §4.4.
+
+        ─────────────────────────────────────────────────────────────────────────
+        WHY THE DEFAULT IS 'mean' AND NOT §2's MINIMUM STATISTICS
+        ─────────────────────────────────────────────────────────────────────────
+
+        §2.1 specifies reusing B1's machinery per bin with the "same β = 1.3 bias
+        correction, same Martin (2001) justification". Measured on synthetic noise
+        with the correct statistics (a DFT bin of Gaussian noise is complex
+        Gaussian, so |X[k]| is Rayleigh and |X[k]|² is exponential, i.e. χ²₂):
+
+            B1, scalar E_i, β = 1.3   →  estimate / true mean =  1.067   ✅
+            B3, per bin,    β = 1.3   →  estimate / true mean =  0.0122  ❌  82× low
+            B3, per bin,    'mean'    →  estimate / true mean =  0.999   ✅
+
+        MARTIN'S β IS A FUNCTION OF THE EFFECTIVE DEGREES OF FREEDOM OF THE
+        ESTIMATOR'S INPUT, NOT A UNIVERSAL CONSTANT. B1's input E_i is already a
+        mean over 154 bins, so it is a high-DOF, low-variance quantity whose
+        sub-window minimum sits just below its mean — β ≈ 1.3 genuinely corrects
+        that. B3's input is a RAW PERIODOGRAM BIN: χ²₂, DOF = 2, where
+        E[min of W=75] = μ/75. That is not a bias to be corrected, it is a
+        different quantity. β would have to be ≈ 75, at which point it is the
+        estimator rather than a correction.
+
+        Consistently, §2 opens by correctly diagnosing that a single periodogram is
+        "useless bin-by-bin" and "needs averaging over many silent frames" — and
+        then adopts machinery that takes minima, not averages. 'mean' is what that
+        text actually asked for. It measures 0.999, and it REMOVES a tunable
+        constant instead of adding one, which is the direction this project
+        requires.
+
+        WHAT 'min' WOULD HAVE COST: with P_noise 82× low, E[k] = max(0, P_region −
+        P_noise) ≈ P_region, so the subtraction does nothing and every feature
+        silently degrades into "computed on the raw region spectrum" — the exact
+        failure §5.1 exists to prevent. Measured on a real hard negative, entropy
+        was unchanged (0.9329 either way, since P_region ≫ P_noise there) but
+        shape_novelty read 0.393 with 'min' versus 0.109 with 'mean'. Only the
+        latter matches §6's predicted 0.0-0.15 for an ambient amplitude excursion;
+        'min' makes a noise burst look like a click. The variance differs too:
+        CV across bins 0.369 ('min') vs 0.021 ('mean').
+
+        NARROWBAND INTERFERERS AND THE BURST GATE. The gate is BROADBAND — it
+        tests total band energy E_i against α·Ê_floor — so a persistent narrowband
+        tone (the 40/80 kHz parking sensors and pest repellers) passes it and
+        enters the mean. That is CORRECT, not a leak: a stationary tone IS part of
+        the noise this region should be judged against, and subtracting it is
+        exactly what shape_novelty needs to avoid flagging it as novel. Only
+        INTERMITTENT narrowband events are a concern, and over the W_NOISE = 750
+        frame window a single such event contributes at most 1/750 of the estimate.
+
+        (Faithful Martin (2001) is a third option: a first-order recursive smoother
+        on the periodogram BEFORE minimum statistics, with a bias correction that
+        is a function of the smoothed estimator's equivalent DOF. More machinery
+        and more parameters than 'mean', to reach an estimate the burst gate
+        already makes available directly.)
+        """
+        if mode == 'mean':
+            if self._B3_n == 0:
+                return None
+            return self._B3_sum / float(self._B3_n)
+        if mode != 'min':
+            raise ValueError(f"unknown mode {mode!r}; expected 'mean' or 'min'")
+        if self._B3_filled == 0:
+            return None
+        return BETA * np.median(self._B3_stored[:, :self._B3_filled], axis=1)
+
+    def update(self, E_i: float, env_mean_i: float, env_std_i: float,
+               mags_norm: Optional[np.ndarray] = None,
+               fs: float = FS, fft_size: int = FFT_SIZE) -> dict:
         """
         Process one frame and return the updated noise estimates.
 
@@ -709,6 +880,23 @@ class AdaptiveNoiseEstimatorV5:
             Mean of the Hilbert envelope of the reconstructed iFFT [V].
         env_std_i : float
             Standard deviation of the Hilbert envelope [V].
+        mags_norm : np.ndarray or None, optional
+            The 154 MIC-NORMALISED analysis-band magnitudes of this frame
+            (i.e. reconstruct_frame_v5()['fft_norm'][_BIN_START:_BIN_END+1]),
+            used to update Buffer 3 (v6 §2).
+
+            OPTIONAL AND OFF BY DEFAULT. When None — which is every v5 call site —
+            Buffer 3 is not touched and this method behaves exactly as it did
+            before, bit for bit. Buffer 3 is a v6 addition and must not perturb
+            Stage 1 or Stage 2 while the v6 features are still being verified.
+
+            ⚠️ It must be the NORMALISED magnitudes (trap (b), §4.4): P_region and
+            P_noise have to be built from consistently mic-corrected data or the
+            whole feature family is corrupted silently. The correction is
+            frequency-dependent (0.55x-1.49x across the band), so it does not
+            cancel out of the subtraction.
+        fs, fft_size :
+            Only used to convert `mags_norm` to PSD. Ignored when it is None.
 
         Returns
         -------
@@ -748,6 +936,11 @@ class AdaptiveNoiseEstimatorV5:
             if self._fill < W_NOISE:               # Track how many entries are valid
                 self._fill += 1
 
+            # Buffer 3 shares this gate — no new parameters, and a click candidate
+            # cannot contaminate B3 any more than it can contaminate B1/B2 (§2.1).
+            if mags_norm is not None:
+                self._b3_update(mags_norm, fs, fft_size)
+
         # ── Estimate update ───────────────────────────────────────────────────
         # media of local minima instead of global minimum to reduce bias from outliers and non-stationary noise.
         if self._fill > 0:
@@ -786,6 +979,15 @@ class AdaptiveNoiseEstimatorV5:
         self._E_hat_floor = 0.0
         self._noise_floor = 0.0
         self._std_noise   = 0.0
+        self._B3_running[:]  = np.inf
+        self._B3_stored[:]   = 0.0
+        self._B3_slot     = 0
+        self._B3_filled   = 0
+        self._B3_count    = 0
+        self._B3_ring[:]  = 0.0
+        self._B3_sum[:]   = 0.0
+        self._B3_ring_i   = 0
+        self._B3_n        = 0
 
     # ------------------------------------------------------------------
     # Read-only properties — convenient access without going through update()
@@ -815,6 +1017,68 @@ class AdaptiveNoiseEstimatorV5:
     def buffer_fill(self) -> int:
         """Number of valid (non-burst) frames currently stored in the buffers."""
         return self._fill
+
+    @property
+    def b3_filled(self) -> int:
+        """Number of closed Buffer-3 sub-windows (0 → M_SUBWINDOWS). 0 = no estimate."""
+        return self._B3_filled
+
+
+# =============================================================================
+# v6 — the analysis-band taper, as a standalone array
+# =============================================================================
+
+def analysis_band_taper(n_bins: int = _K_BINS) -> np.ndarray:
+    """
+    The frequency-domain Tukey taper reconstruct_frame_v5 applies to the
+    analysis band, returned as a plain array.
+
+    TRAP (a) OF §4.4 — WHY THIS EXISTS.
+    P_region is computed from the RECONSTRUCTED time signal, which already carries
+    this taper (it is applied to the complex spectrum before the iFFT, Step 1d).
+    Buffer 3 is built from the TRANSMITTED magnitudes, which do not. Subtracting
+    one from the other without correction over-subtracts at the band edges, where
+    the region has been attenuated and the noise estimate has not.
+
+        Fix:  P_noise_corrected[k] = P_noise[k] · taper[k]²
+
+    squared because these are PSDs and the taper multiplies amplitude. That makes
+    the subtraction exact at every bin — measured ratio 1.000000, see
+    test_scripts/verify_psd_convention_v6.py. The alternative, restricting E[k] to
+    the 25.5-73.8 kHz plateau, throws away two of the twelve bands and blinds the
+    tilt feature to exactly the 20 kHz edge where PCB coupling lives.
+
+    NEVER invert this by dividing E[k] by taper², see below.
+
+    ⚠️ THE SPEC AND THE FFT SPEC BOTH UNDERSTATE THIS. §4.4(a) says the taper
+    "reaches −6 dB" at the band edges, and FFT_PHASE_TECHNICAL_SPECIFICATION.md
+    §7.2 states "Minimum Gain: 0.5 (−6 dB) at edges (bins 51, 204)". Both are
+    wrong, and that doc contradicts its own §7.1 pseudocode. The ramp is
+    0.5·(1 − cos(π·i/taper_len)) evaluated from i = 0, and at i = 0 that is
+    EXACTLY 0.0. Measured gains: bin 51 → 0.0000, 52 → 0.0109, 55 → 0.1654,
+    60 → 0.6545, plateau from bin 66.
+
+    Consequences, all benign but worth knowing:
+      - bin 51 (19.92 kHz) sits BELOW 20 kHz, so the 12-band grid excludes it;
+      - bin 204 (79.69 kHz) IS inside band 11 and is a dead bin — P_region and
+        taper²·P_noise are both 0 there, so the subtraction stays exact, but
+        band 11's average is diluted by one bin in thirteen;
+      - dividing E[k] by taper² to "restore" the edges would divide by zero at
+        bin 204 and amplify noise without bound next to it. Do not.
+
+    This deliberately DUPLICATES the loop at reconstruct_frame_v5 Step 1d rather
+    than refactoring it, so that Stage 1 is not touched. The duplication is held
+    consistent by an assertion in test_scripts/verify_psd_convention_v6.py that
+    compares this array against the shipped reconstruction element for element.
+    """
+    n = int(n_bins)
+    taper = np.ones(n, dtype=np.float64)
+    taper_len = max(5, round(n * TUKEY_TAPER_FRACTION))
+    for i in range(taper_len):
+        val = 0.5 * (1.0 - np.cos(np.pi * (i / taper_len)))
+        taper[i] = val
+        taper[n - 1 - i] = val
+    return taper
 
 
 # =============================================================================
@@ -1108,7 +1372,7 @@ def _fit_decay_segment(
     decay_len = decay_end - decay_start
 
     if decay_len < 1:
-        return {'tau_ms': -1.0, 'R2': 0.0, 'fit_coverage': 0.0,
+        return {'tau_ms': -1.0, 'R2': 0.0, 'fit_coverage': 0.0, 'fit_valid': 0,
                 'decay_start': decay_start, 'decay_end': decay_end}
 
     decay_segment = extended[decay_start : decay_end]
@@ -1145,7 +1409,7 @@ def _fit_decay_segment(
 
     if n_fit < MIN_FIT_SAMPLES:
         return {'tau_ms': -1.0, 'R2': 0.0,
-                'fit_coverage': n_fit / max(1, decay_len),
+                'fit_coverage': n_fit / max(1, decay_len), 'fit_valid': 0,
                 'decay_start': decay_start, 'decay_end': decay_end}
 
     # ── Step D: OLS log-linear fit ────────────────────────────────────────────
@@ -1161,7 +1425,7 @@ def _fit_decay_segment(
 
     if abs(denom) < 1e-30:
         return {'tau_ms': -1.0, 'R2': 0.0,
-                'fit_coverage': n_fit / max(1, decay_len),
+                'fit_coverage': n_fit / max(1, decay_len), 'fit_valid': 0,
                 'decay_start': decay_start, 'decay_end': decay_end}
 
     slope_m     = (n_pts * sum_xy - sum_x * sum_y) / denom
@@ -1170,8 +1434,10 @@ def _fit_decay_segment(
     # Negative slope + above numerical zero-guard → genuine exponential decay
     if slope_m < -_SLOPE_ZERO_GUARD:
         tau_ms = -1000.0 / (slope_m * fs)
+        fit_valid = 1
     else:
         tau_ms = -1.0
+        fit_valid = 0
 
     y_pred = slope_m * n_array + intercept_b
     ss_res = float(np.sum((log_env - y_pred)        ** 2))
@@ -1182,9 +1448,63 @@ def _fit_decay_segment(
         'tau_ms'      : tau_ms,
         'R2'          : R2,
         'fit_coverage': n_fit / max(1, decay_len),
+        'fit_valid'   : fit_valid,
         'decay_start' : decay_start,
         'decay_end'   : decay_end,
     }
+
+
+def fit_result_to_nan(fit: dict) -> dict:
+    """
+    Rewrite a fit result into the PHASE-2 EXPORT FORM: NaN, never a sentinel
+    (v6 §7.5.3, decision D20).
+
+        fit_valid == 0  ⇒  tau_ms, R2, fit_coverage  →  NaN
+
+    ⚠️ NOT WIRED TO ANYTHING. Nothing in the pipeline calls this yet, and that is
+    deliberate. Stage 2 still reads the sentinels, in three places:
+
+        click_pipeline_v5._stage2_reason      R2 < STAGE2_R2_MIN, tau_ms <= STAGE2_TAU_MIN
+        ml/evaluate_candidates.apply_stage2   df['R2'].lt(...) | df['tau_ms'].le(...)
+        components/data_collection_dialog_v5  R2 == 0.0 or tau_ms <= STAGE2_TAU_MIN
+
+    All three are `<` / `<=` / `== 0.0` comparisons, and EVERY comparison against
+    NaN is False. Emitting NaN from _fit_decay_segment today would therefore not
+    make those gates stricter — it would silently DISABLE them, letting every
+    unfittable candidate through to Stage 3, where the sklearn Pipeline's
+    SimpleImputer would fill the gap and return a confident-looking probability
+    computed from imputed data. That is the Phase-3 candidate-pool expansion
+    arriving by accident, in the wrong phase, unlabelled.
+
+    Switching the gates over is Phase 2 work. When it happens, each site becomes
+    a test on `fit_valid` — which is exactly equivalent to today's behaviour,
+    since tau_ms <= 0 ⟺ tau_ms == -1 ⟺ fit_valid == 0 (a converged fit has
+    slope < 0, hence tau_ms = -1000/(slope·fs) > 0 always).
+
+    WHY fit_valid EXISTS AT ALL, beyond protecting the scaler. Two sentinels are
+    in play and they fail differently:
+
+      tau_ms = -1  is LOUD. Real values are ~0.1-0.6 ms, so -1 sits far outside
+                   the range: StandardScaler inflates the std and compresses all
+                   genuine variation toward zero.
+      R2 = 0.0     is SILENT, and worse. Zero is INSIDE the valid range [0, 1],
+                   so "the fit failed" and "the fit succeeded and was terrible"
+                   are currently indistinguishable in the data. fit_valid does not
+                   merely protect the scaler; it disambiguates two physically
+                   different states that have been collapsed into one value.
+
+    One nuance for whoever does Phase 2: R2 = 0.0 is emitted from TWO different
+    situations — a degenerate window (the three early returns) and ss_tot <= 1e-30,
+    i.e. a perfectly flat log-envelope, on the normal path. Only the first is a
+    failure. fit_valid separates them correctly; a blanket "R2 == 0 → NaN" rewrite
+    would not.
+    """
+    out = dict(fit)
+    if not int(out.get('fit_valid', 0)):
+        out['tau_ms'] = float('nan')
+        out['R2'] = float('nan')
+        out['fit_coverage'] = float('nan')
+    return out
 
 
 def find_decay_window_v5(
@@ -2096,6 +2416,13 @@ def compute_features_v5(
     features['tau_ms']       = fit['tau_ms']
     features['R2']           = fit['R2']
     features['fit_coverage'] = fit['fit_coverage']
+    # v6 (§7.5.3): binary, disambiguates "the fit failed" from "the fit succeeded
+    # and was terrible" — R2 = 0 cannot, because 0 is inside R2's valid range.
+    # Carried alongside the sentinels, NOT instead of them: Stage 2 still gates on
+    # tau_ms <= 0 / R2 == 0 and must keep doing so until Phase 2. Emitted as an
+    # EXTRA dict key, so it does not disturb FEATURE_NAMES or the CSV schema —
+    # every consumer selects the 17 v5 names explicitly. See fit_result_to_nan.
+    features['fit_valid']    = fit.get('fit_valid', 0)
 
     # FFT-domain features (§8.9) — still the frame FFT (Region-FFT migration TODO)
     features.update(_feat_fft_features(fft_norm, freq_axis))
