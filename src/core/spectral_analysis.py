@@ -1033,16 +1033,30 @@ def v6_spectral_features(region_spec: Spectrum,
     # shape_novelty takes P_region, NOT E — the L2 normalisation divides amplitude
     # out, so it sees shape only, which is the entire point (§5.2).
     out['shape_novelty'] = shape_novelty(p_region_b[ok], p_noise_b[ok])
-    # ⚠️ SPEC AMBIGUITY: §5.3 writes the tilt formula over "P̃, the median power",
-    # without saying whether that is P_region or E. Computed on E here, for
-    # consistency with the quantiles (§5.5.3 is explicit that those use E) and
-    # because the artefact §5.3 targets — PCB coupling concentrated at the 20 kHz
-    # edge — is a property of the EVENT, so the ambient pedestal should be removed
-    # first. Note this makes the feature return NaN when half the low or high bands
-    # rectify to exactly zero, which is honest: the tilt is then undefined.
-    # The frame-level Stage 2 GATE version of this feature (D7) is a different
-    # measurement on a different spectrum and is not computed here.
-    out['spectral_tilt'] = spectral_tilt(e_bands[ok], centers[ok])
+    # ⚠️ COMPUTED ON P_region, NOT ON E — and that is a correction, not a slip.
+    # §5.3 writes the formula over "P̃, the median power" without saying which
+    # spectrum. An earlier pass used E[k], for symmetry with the quantiles. That is
+    # measurably wrong: max(0, ·) produces exact zeros, so the median of a half-band
+    # is 0 whenever half its bands rectify away, and the feature returns NaN.
+    # Measured NaN rate of tilt-on-E by occupied-band count:
+    #
+    #     <= 4 bands  100 %      6 bands  58 %      8 bands  5 %     >= 10 bands  0 %
+    #     overall, uniform occupancy: 48.6 %   (on P_region: 0.0 %)
+    #
+    # The missingness is therefore CORRELATED WITH NARROWBANDNESS — i.e. with
+    # spectral_entropy, the very quantity this family exists to measure. Phase 4's
+    # SimpleImputer would fill precisely the high-Q clicks of §9 with a median
+    # tilt, which is the silent-collapse failure §7.5.3 is about, reappearing.
+    #
+    # P_region always carries the noise pedestal, so it has no exact zeros and the
+    # tilt is always defined. §6's own expectation table agrees: it predicts
+    # "≈ −0.1 (= ambient offset)" for an ambient amplitude excursion, which is a
+    # statement about the REGION's spectrum — on E an ambient excursion would have
+    # no well-defined tilt at all.
+    #
+    # The frame-level Stage 2 GATE version (D7) is a different measurement on a
+    # different spectrum and is not computed here.
+    out['spectral_tilt'] = spectral_tilt(p_region_b[ok], centers[ok])
 
     out['N_eff'] = effective_bands(out['spectral_entropy'], int(np.count_nonzero(ok)))
     if np.isfinite(out['N_eff']) and len(edges) > 1:
@@ -1236,6 +1250,19 @@ def _self_test() -> int:
 
     d_med = abs(spectral_tilt(spiked, centers12) - spectral_tilt(p_lin, centers12))
     d_ols = abs(_ols_tilt(spiked) - _ols_tilt(p_lin))
+    # Regression guard for the E-vs-P_region choice: tilt must be DEFINED for a
+    # narrowband spectrum. On E[k] a spike rectifies its neighbours to zero and the
+    # half-band median is 0, so the feature would be NaN for exactly the high-Q
+    # clicks §9 asks about — and NaN correlated with narrowbandness is worse than
+    # useless once an imputer fills it.
+    spike12 = np.zeros(12)
+    spike12[7] = 1.0
+    check("tilt is NaN on a rectified single-band excess (why E is NOT used)",
+          not np.isfinite(spectral_tilt(spike12, centers12)))
+    check("...but DEFINED on P_region, which keeps its noise pedestal",
+          np.isfinite(spectral_tilt(spike12 + 1e-3, centers12)),
+          f"{spectral_tilt(spike12 + 1e-3, centers12):+.4f} dB/kHz")
+
     check("median form is far more interferer-robust than OLS on dB",
           d_med < 0.2 * d_ols,
           f"median moves {d_med:.4f} dB/kHz, OLS moves {d_ols:.4f} "

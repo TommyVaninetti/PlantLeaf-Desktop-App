@@ -144,7 +144,15 @@ def load_and_prepare(
     # locale can introduce decimal commas ("12,73") and stray whitespace, which
     # make pandas read feature columns as strings and crash on .astype(float).
     # Repair them here so training works regardless of how the CSV was produced.
-    for col in FEATURE_NAMES:
+    # v6 CSVs carry additional numeric columns; coerce them with the same
+    # Italian-locale repair, but only when present so v5 CSVs still load.
+    _V6_NUMERIC = [
+        'spectral_entropy', 'shape_novelty', 'spectral_tilt',
+        'temporal_concentration', 'FPE_hz_region', 'SPR_region', 'f_50_hz',
+        'IQR_f', 'fit_valid', 'decay_len', 'n_seg', 'n_seg_valid', 'b3_frames',
+        'gibbs_fired',
+    ]
+    for col in FEATURE_NAMES + [c for c in _V6_NUMERIC if c in df.columns]:
         if df[col].dtype == object:
             df[col] = (
                 df[col].astype(str)
@@ -170,6 +178,14 @@ def load_and_prepare(
     print(f"  Sessions         :  {df['session_id'].nunique()}")
 
     # Apply noise pre-filtering gates (label=0 rows only)
+    #
+    # NaN behaviour is unchanged from v5, deliberately. A v6 CSV writes NaN for R2
+    # where a v5 CSV wrote the 0.0 sentinel, and both fail `R2 > NOISE_FILTER_R2_MIN`
+    # — NaN because every comparison against NaN is False, 0.0 because it is below
+    # the threshold. So unfittable noise rows are excluded from the noise class
+    # exactly as before, and this filter needed no change. (That is NOT true of the
+    # Stage-2 gates, where the same NaN semantics INVERT the outcome and had to be
+    # handled explicitly — see _stage2_reason and evaluate_candidates.apply_stage2.)
     if noise_filter:
         noise_mask  = df['label'] == 0
         noise_valid = noise_mask & (df['R2'] > NOISE_FILTER_R2_MIN) & (df['SPR'] < NOISE_FILTER_SPR_MAX)

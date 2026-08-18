@@ -216,13 +216,29 @@ def apply_stage2(df: pd.DataFrame) -> pd.DataFrame:
         The SVM training distribution never included such samples for either
         class, so a prediction there is out-of-distribution and meaningless.
     """
-    # Gate 1: invalid fit — either R² below the minimum, or no decay fitted at all
-    # (τ ≤ 0, the sentinel from _fit_decay_segment). Both mean the decay window is
-    # unusable, so they share the Stage2_R2 verdict.
+    # Gate 1: invalid fit — either R² below the minimum, or no decay fitted at all.
+    # Both mean the decay window is unusable, so they share the Stage2_R2 verdict.
+    #
+    # ⚠️ NaN MUST BE FAILED EXPLICITLY. A v6 CSV carries NaN for tau_ms / R2 /
+    # fit_coverage when the fit failed (fit_valid == 0), replacing the old −1 / 0
+    # sentinels. Every pandas comparison against NaN is False, so `.lt()` and
+    # `.le()` alone would let precisely the unfittable rows PASS this gate and be
+    # scored by the SVM — where the Pipeline's imputer would fill the gap and
+    # return a confident-looking probability computed from imputed data. The
+    # sentinels used to fail these comparisons; NaN does not, so the check has to
+    # be added rather than inherited.
+    #
+    # `fit_valid` is preferred when present (it is the authoritative flag); the
+    # isna() clause covers v5 CSVs and any row where the column is absent.
     fail_r2  = df['R2'].lt(_R2_MIN) | df['tau_ms'].le(_TAU_MIN)
+    fail_r2 |= df['R2'].isna() | df['tau_ms'].isna()
+    if 'fit_valid' in df.columns:
+        fail_r2 |= (pd.to_numeric(df['fit_valid'], errors='coerce').fillna(0) == 0)
     df.loc[fail_r2 & (df['stage_blocked'] == ''), 'stage_blocked'] = 'Stage2_R2'
 
     # Gate 2: out-of-distribution spectrum — checked only if Gate 1 passed
+    # NaN SPR cannot be judged out-of-distribution, but it also cannot be trusted;
+    # it is left to Gate 1, which already fails any row with a broken feature set.
     fail_spr = df['SPR'].ge(_SPR_MAX)
     df.loc[fail_spr & (df['stage_blocked'] == ''), 'stage_blocked'] = 'Stage2_SPR'
 

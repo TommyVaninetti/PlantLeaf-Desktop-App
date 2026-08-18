@@ -1594,9 +1594,12 @@ class ReplayWindowAudio(ReplayBaseWindow):
     
     def _setup_metadata(self):
         """Setup metadati per playback"""
-        estimated_fft_rate = 390.0
+        # EXACTLY fs / fft_size — see the note in audio_load_progress.py. The old
+        # hardcoded 390.0 ran 0.16 % slow and drifted away from the exported CSVs.
         if self.data_manager.frame_duration_ms == 0:
-            self.data_manager.frame_duration_ms = 1000.0 / estimated_fft_rate
+            _fs  = self.data_manager.header_info.get('fs', 200_000) or 200_000
+            _n   = self.data_manager.header_info.get('fft_size', 512) or 512
+            self.data_manager.frame_duration_ms = 1000.0 * _n / _fs
         if self.data_manager.total_frames > 0:
             self.data_manager.total_duration_sec = (
                 self.data_manager.total_frames * self.data_manager.frame_duration_ms / 1000.0

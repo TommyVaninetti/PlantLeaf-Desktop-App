@@ -4,7 +4,7 @@
 import sys
 from pathlib import Path
 
-DEFAULT_MODEL_FILENAME = 'plantleaf_svm_v5.pkl'
+DEFAULT_MODEL_FILENAME = 'plantleaf_svm_v5_0.835.pkl'
 
 
 def default_model_path() -> Path:

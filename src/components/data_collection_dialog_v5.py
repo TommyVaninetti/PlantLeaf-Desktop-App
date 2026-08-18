@@ -54,13 +54,31 @@ K_DEFAULT = 1.5  # Default Stage 1 multiplier (from click_pipeline_v5.py)
 
 # ── CSV SCHEMA ──────────────────────────────────────────────────────────────
 
+SCHEMA_VERSION = 'v6.0'
+
+# ── v6 schema (SPECTRAL_FEATURES_v6_PROPOSAL.md Phase 2) ────────────────────
+# A SUPERSET, deliberately: it carries the v5 features that v6 proposes to remove
+# (SPR, R_spectral, centroid_shift_hz) ALONGSIDE the v6 additions. §7.4 requires
+# removals and additions to be measured as separate experiments (Run A / B / C),
+# and with a superset each run is a column subset of one export instead of three
+# separate exports and three chances for the candidate set to drift.
 CSV_COLUMNS = [
+    # ── identity & provenance ──
+    'schema_version',
+    'session_id',          # hard-required by train_svm.py; defaults to the file stem
     'file',
     'frame_idx',
+    'peak_abs',            # absolute sample index of the peak — exact integer
+                           # arithmetic, IDENTICAL for the fi / fi+1 candidates of
+                           # one straddling click. This is the safe label-migration
+                           # key; (file, frame_idx) is not unique.
+    'canonical_frame_idx', # peak_abs // FFT_SIZE — the frame that OWNS the peak
     'timestamp_s',
+    # ── noise state at detection ──
     'noise_floor_mV',
     'std_noise_mV',
     'E_hat_floor',
+    # ── v5 features (17), unchanged names and order ──
     'peak_SNR',
     'pre_SNR',
     'post_SNR',
@@ -78,6 +96,23 @@ CSV_COLUMNS = [
     'SPR',
     'R_spectral',
     'FPE_hz',
+    # ── v6 features (8) ──
+    'spectral_entropy',       # D5
+    'shape_novelty',          # D6
+    'spectral_tilt',          # D7  (on P_region — see §5.3's clarification)
+    'temporal_concentration', # D8
+    'FPE_hz_region',          # D17 — beside the frame FPE_hz, so Run C is a subset
+    'SPR_region',             # lets D16 be tested rather than assumed
+    'f_50_hz',                # D18 — CSV only, not fed to the SVM
+    'IQR_f',                  # D18 — CSV only
+    # ── validity & quality flags (6) ──
+    'fit_valid',    # 0/1 — "fit failed" vs "fit succeeded and was terrible"
+    'decay_len',    # the dead-zone coordinate; fit_coverage encodes it only indirectly
+    'n_seg',        # §4.3 requires recording it beside every feature
+    'n_seg_valid',  # n_seg >= 45; below that bands correlate and H biases toward 1
+    'b3_frames',    # frames in the Buffer-3 window; 0 ⇒ every v6 feature is NaN
+    'gibbs_fired',  # suppress_edge_artifacts tripped ⇒ biased subtraction that frame
+    # ── labels & verdicts ──
     'label',  # Empty column for manual labeling (1=click, 0=no click, empty=unknown)
     # Stage 2/3/4 verdict — written when classification is enabled, otherwise left
     # empty. Same three names, order and semantics as src/ml/evaluate_candidates.py,
@@ -88,9 +123,9 @@ CSV_COLUMNS = [
     'stage_blocked',
 ]
 
-# The 17 features compute_features_v5 produces, in the order the docs list them.
-# The SVM reads only the 16 it was trained on (model['features'] is authoritative
-# and excludes fit_coverage) — this list is what the CSV and the pipeline exchange.
+# The v5 features compute_features_v5 produces, in the order the docs list them.
+# The deployed SVM reads only the 16 it was trained on (model['features'] is
+# authoritative and excludes fit_coverage).
 FEATURE_NAMES = [
     'peak_SNR', 'pre_SNR', 'post_SNR',
     'rise_time_ms', 'fall_time_ms', 'asymmetry_integral',
@@ -100,9 +135,28 @@ FEATURE_NAMES = [
     'SPR', 'R_spectral', 'FPE_hz',
 ]
 
+# The v6 additions. Kept as a separate list so a consumer can ask for "v5 only",
+# "v6 only" or both without re-deriving the split from CSV_COLUMNS.
+FEATURE_NAMES_V6 = [
+    'spectral_entropy', 'shape_novelty', 'spectral_tilt', 'temporal_concentration',
+    'FPE_hz_region', 'SPR_region', 'f_50_hz', 'IQR_f',
+]
+
+# Emitted for every row but NOT features: provenance, validity and quality flags.
+QUALITY_COLUMNS = [
+    'fit_valid', 'decay_len', 'n_seg', 'n_seg_valid', 'b3_frames', 'gibbs_fired',
+]
+
 # Export modes for the classification section
-EXPORT_ALL       = 'all'        # every Stage 1 candidate, each with its verdict
-EXPORT_CONFIRMED = 'confirmed'  # only candidates that survived all four stages
+EXPORT_ALL        = 'all'        # every Stage 1 candidate with a valid fit, annotated
+EXPORT_CONFIRMED  = 'confirmed'  # only candidates that survived all four stages
+EXPORT_UNFILTERED = 'unfiltered' # EVERY Stage 1 candidate, including fit_valid == 0
+#: EXPORT_UNFILTERED exists because those rows have never reached a CSV in this
+#: project's history: Stage 2 dropped tau <= 0 before export, so a decay window that
+#: could not be fitted was invisible. They arrive with tau_ms / R2 / fit_coverage as
+#: NaN, which is only safe now that fit_valid disambiguates "no fit" from "bad fit"
+#: (v6 §7.5.3). Expect a lot of them and expect most to be noise — they are Stage 1
+#: candidates, which are overwhelmingly noise, and this mode applies NO fit filter.
 
 
 # ── CANDIDATE DATA STRUCTURE ────────────────────────────────────────────────
@@ -149,6 +203,30 @@ class CandidateData:
     peak_abs: int = 0
     canonical_frame_idx: int = 0
 
+    # ── v6 spectral features (SPECTRAL_FEATURES_v6_PROPOSAL.md §5) ───────────
+    # NaN, never a sentinel, when there is no Buffer-3 estimate or the region is
+    # too short to transform. A zero would make E[k] equal P_region and look like
+    # a clean detection while measuring nothing (§7.5.3).
+    spectral_entropy: float = float('nan')
+    shape_novelty: float = float('nan')
+    spectral_tilt: float = float('nan')
+    temporal_concentration: float = float('nan')
+    FPE_hz_region: float = float('nan')
+    SPR_region: float = float('nan')
+    f_50_hz: float = float('nan')
+    IQR_f: float = float('nan')
+
+    # ── validity & quality flags ─────────────────────────────────────────────
+    fit_valid: int = 0        # 0/1 — "fit failed" vs "fit succeeded and was terrible"
+    decay_len: int = 0        # decay_end − decay_start, the dead-zone coordinate
+    n_seg: int = 0            # region length; §4.3 requires it beside every feature
+    n_seg_valid: int = 0      # n_seg >= 45, else the bands correlate and H biases up
+    b3_frames: int = 0        # frames in the Buffer-3 window; 0 ⇒ v6 features are NaN
+    gibbs_fired: int = 0      # suppress_edge_artifacts tripped on this frame
+
+    # Grouping key for StratifiedGroupKFold. train_svm.py exits without it.
+    session_id: str = ''
+
     # Screenshot render window — a slice of the stitched context centred on the
     # peak (2.56 ms, widened if the click is longer). Time axis is peak-relative
     # milliseconds (peak at t = 0), so the picture is frame-grid independent.
@@ -191,16 +269,22 @@ class CandidateData:
         must see the same precision the features were computed at.
         """
         d = {name: getattr(self, name) for name in FEATURE_NAMES}
+        d.update({name: getattr(self, name) for name in FEATURE_NAMES_V6})
+        d.update({name: getattr(self, name) for name in QUALITY_COLUMNS})
         d['frame_idx'] = self.frame_idx
         d['peak_abs'] = self.peak_abs
         d['canonical_frame_idx'] = self.canonical_frame_idx
         return d
 
     def to_csv_dict(self) -> Dict:
-        """Convert to dictionary for CSV export (27 columns)."""
+        """Convert to dictionary for CSV export (the 45 v6 columns)."""
         return {
+            'schema_version': SCHEMA_VERSION,
+            'session_id': self.session_id or self.file,
             'file': self.file,
             'frame_idx': self.frame_idx,
+            'peak_abs': self.peak_abs,
+            'canonical_frame_idx': self.canonical_frame_idx,
             'timestamp_s': round(self.timestamp_s, 6),
             # mV since the iFFT amplitude-scale fix — the reconstructed signal is
             # now in true volts, so these land in the mV range. CSVs exported before
@@ -227,6 +311,23 @@ class CandidateData:
             'SPR': round(self.SPR, 3),
             'R_spectral': round(self.R_spectral, 3),
             'FPE_hz': round(self.FPE_hz, 2),
+            # ── v6 (NaN stays NaN — csv writes 'nan', pandas reads it back as NaN,
+            #     which is what SimpleImputer expects in Phase 4) ──
+            'spectral_entropy': round(self.spectral_entropy, 6),
+            'shape_novelty': round(self.shape_novelty, 6),
+            'spectral_tilt': round(self.spectral_tilt, 6),
+            'temporal_concentration': round(self.temporal_concentration, 6),
+            'FPE_hz_region': round(self.FPE_hz_region, 2),
+            'SPR_region': round(self.SPR_region, 3),
+            'f_50_hz': round(self.f_50_hz, 2),
+            'IQR_f': round(self.IQR_f, 2),
+            # ── validity & quality ──
+            'fit_valid': int(self.fit_valid),
+            'decay_len': int(self.decay_len),
+            'n_seg': int(self.n_seg),
+            'n_seg_valid': int(self.n_seg_valid),
+            'b3_frames': int(self.b3_frames),
+            'gibbs_fired': int(self.gibbs_fired),
             'label': self.label,
             # Rounded to 4 dp to match evaluate_candidates.py's output exactly.
             # None → '' via csv.DictWriter, which is how an unclassified candidate
@@ -313,6 +414,7 @@ def _process_file_for_collection(
     normalize: bool = True,
     stop_check=None,
     progress_cb=None,
+    export_mode: str = EXPORT_ALL,
 ) -> Tuple[List[CandidateData], List[Dict]]:
     """
     Process single .paudio file: find Stage 1 survivors and compute all features.
@@ -350,6 +452,8 @@ def _process_file_for_collection(
         build_click_context,
         resolve_click,
         click_event_key,
+        p_noise_at,
+        p_noise_frames_at,
         compute_features_v5,
         FS, FFT_SIZE, MAX_RUN,
         STAGE2_R2_MIN, STAGE2_TAU_MIN,
@@ -402,15 +506,46 @@ def _process_file_for_collection(
             # trace, then compute all features in one coordinate system.
             ctx      = build_click_context(prev_sig, curr_sig, next_sig)
             resolved = resolve_click(ctx, noise_floor, std_noise)
+            # v6: Buffer 3's per-bin noise PSD in effect at this frame. None when
+            # the recording was loaded without the v6 arrays (anything loaded by an
+            # older build) — compute_features_v5 then emits the v6 features as NaN
+            # and every v5 value is unchanged.
+            p_noise = p_noise_at(dm, frame_idx)
+
+            # Did suppress_edge_artifacts (reconstruct_frame_v5 Step 3) fire on this
+            # frame? When it does, the reconstruction is no longer the exact inverse
+            # transform of taper·A[k], so P_region != taper²·P_noise and the v6
+            # subtraction is biased for this event. The fade's first coefficient is
+            # 0.5·(1−cos 0) = 0 exactly, so a hard zero at sample 0 is the signature;
+            # nothing else in the chain produces one. Measured to fire on 0 of 300
+            # dispersed-phase frames, so this should be rare — which is precisely why
+            # it is worth recording rather than assuming.
+            gibbs_fired = int(len(curr_sig) > 0 and curr_sig[0] == 0.0)
             features = compute_features_v5(
                 ctx, resolved,
                 curr_fft_norm, curr_freq_axis,
                 noise_floor, std_noise, FS,
+                p_noise_psd=p_noise,
             )
             peak_abs, canonical_frame_idx = click_event_key(ctx, resolved, frame_idx)
 
-            # Calculate timestamp
-            timestamp_s = frame_idx / (FS / FFT_SIZE)
+            # Timestamp — taken from the loader's own array when it exists, so the
+            # CSV and the app's time axis are the SAME numbers by construction and
+            # cannot drift apart again.
+            #
+            # They had drifted: the app used a hardcoded `estimated_fft_rate = 390.0`
+            # (2.564103 ms/frame) while this line computed fs/fft_size
+            # (2.560000 ms/frame). 0.16 % apart, accumulating to ~+10 s at the end of
+            # a 110-minute recording, with the CSV reading short. The constant is now
+            # fixed at source; reading the array here removes the duplication that
+            # allowed the two to disagree in the first place.
+            #
+            # The fallback is the same formula as before, for a dm without the array.
+            _ts = getattr(dm, 'fft_timestamps', None)
+            if _ts is not None and frame_idx < len(_ts):
+                timestamp_s = float(_ts[frame_idx])
+            else:
+                timestamp_s = frame_idx / (FS / FFT_SIZE)
 
             env_ctx  = ctx['envelope']
             sig_ctx  = ctx['signal']
@@ -463,7 +598,18 @@ def _process_file_for_collection(
             # CSVs (~23% of the current dataset), so filtering them here would silently
             # change what future exports contain. Stage 2 is what rejects them, and it
             # says so in the CSV.
-            if features.get('R2', 0.0) == 0.0 or features.get('tau_ms', -1.0) <= STAGE2_TAU_MIN:
+            #
+            # v6: the two sentinel tests above became one flag. `fit_valid` is EXACTLY
+            # equivalent — tau_ms <= 0 ⟺ tau_ms == −1 ⟺ fit_valid == 0, since a
+            # converged fit has slope < 0 and therefore tau > 0 always (verified over
+            # 3000 random windows in test_scripts/verify_v6_buffer3.py §6). So this
+            # swap does not change which rows are exported.
+            #
+            # EXPORT_UNFILTERED skips the filter entirely. Those rows are the ones
+            # that have never reached a CSV in the project's history, and they arrive
+            # with tau_ms / R2 / fit_coverage as NaN — which is why the sentinels had
+            # to go before this mode could exist.
+            if export_mode != EXPORT_UNFILTERED and not features.get('fit_valid', 0):
                 continue
 
             ### ------- ###
@@ -495,6 +641,24 @@ def _process_file_for_collection(
                 FPE_hz=features.get('FPE_hz', 0.0),
                 peak_abs=peak_abs,
                 canonical_frame_idx=canonical_frame_idx,
+                session_id=dm.filename,
+                # ── v6 features. NaN default, so a recording loaded without the
+                #    Buffer-3 arrays yields NaN rather than a plausible-looking 0. ──
+                spectral_entropy=features.get('spectral_entropy', float('nan')),
+                shape_novelty=features.get('shape_novelty', float('nan')),
+                spectral_tilt=features.get('spectral_tilt', float('nan')),
+                temporal_concentration=features.get('temporal_concentration', float('nan')),
+                FPE_hz_region=features.get('FPE_hz_region', float('nan')),
+                SPR_region=features.get('SPR_region', float('nan')),
+                f_50_hz=features.get('f_50_hz', float('nan')),
+                IQR_f=features.get('IQR_f', float('nan')),
+                # ── validity & quality ──
+                fit_valid=int(features.get('fit_valid', 0)),
+                decay_len=int(d_end - d_start),
+                n_seg=int(features.get('n_seg', 0)),
+                n_seg_valid=int(features.get('n_seg_valid', 0)),
+                b3_frames=p_noise_frames_at(dm, frame_idx),
+                gibbs_fired=gibbs_fired,
                 render_signal=render_signal,
                 render_envelope=render_envelope,
                 render_t_ms=render_t_ms,
@@ -957,25 +1121,65 @@ def _render_candidate_screenshot(
 
 # ── CSV EXPORT ──────────────────────────────────────────────────────────────
 
+def csv_has_labels(path: Path) -> bool:
+    """
+    True if `path` is an existing candidates CSV with at least one non-empty label.
+
+    Used to refuse a destructive overwrite. Any error reading the file returns
+    True — if we cannot prove a file is unlabelled, we must not overwrite it.
+    """
+    try:
+        if not path.exists():
+            return False
+        import csv as _csv
+        with open(path, newline='') as fh:
+            for row in _csv.DictReader(fh):
+                if str(row.get('label', '') or '').strip():
+                    return True
+        return False
+    except Exception:                                          # noqa: BLE001
+        return True
+
+
 def _write_csv_for_file(
     candidates: List[CandidateData],
     output_path: Path,
+    force: bool = False,
 ) -> bool:
     """
     Write CSV file with all candidates for a single audio file.
-    
+
     Args:
         candidates: List of CandidateData objects
         output_path: Path to write CSV
-    
+        force: overwrite even if the target already carries labels
+
     Returns:
         True if successful, False otherwise
+
+    ⚠️ REFUSES TO DESTROY LABELS.
+    This function opens the target in 'w' mode, and click_review_dialog._save
+    writes labels back into this very file. So re-exporting over a directory that
+    has already been labelled silently blanks every label — no prompt, no backup,
+    no way to tell afterwards. That is a real, previously-unguarded footgun: 1944
+    manual labels across 57 candidate CSVs live in files with exactly this name
+    pattern.
+
+    An export into a labelled file is therefore refused unless `force=True`.
+    Point new exports at a fresh directory instead.
     """
     try:
         import csv
-        
+
+        if not force and csv_has_labels(output_path):
+            print(f"REFUSING to overwrite labelled CSV: {output_path}\n"
+                  f"  It contains manual labels that 'w' mode would destroy.\n"
+                  f"  Export to a fresh directory, or pass force=True if you are "
+                  f"certain.")
+            return False
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         with open(output_path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
             writer.writeheader()
@@ -1098,6 +1302,7 @@ class DataCollectionWorkerV5(QThread):
                         progress_cb=lambda done, total: self.error_occurred.emit(
                             f"  → {paudio_file.name}: {done}/{total} survivors processed…"
                         ),
+                        export_mode=self.export_mode,
                     )
 
                     ## STAGES 2-4 ##
@@ -1298,8 +1503,22 @@ class DataCollectionWorkerV5(QThread):
                 dm.E_hat_floor_arr = data['E_hat_floor_arr']
                 dm.noise_floor_arr = data['noise_floor_arr']
                 dm.std_noise_arr   = data['std_noise_arr']
+                # v6 Buffer 3. Without these three, p_noise_at() returns None for
+                # every frame and all eight v6 features export as NaN — which is
+                # exactly what happened on the first real export. .get() keeps a
+                # dict from an older worker loadable.
+                dm.p_noise_snapshots = data.get('p_noise_snapshots')
+                dm.p_noise_stride    = data.get('p_noise_stride')
+                dm.p_noise_counts    = data.get('p_noise_counts')
             else:
+                # Fallback for files the worker did not pre-compute. It builds no
+                # Buffer 3, so the v6 features are genuinely unavailable here and
+                # must stay NaN — b3_frames = 0 records that honestly rather than
+                # letting a stale estimate leak in.
                 dm.precompute_fft_means()
+                dm.p_noise_snapshots = None
+                dm.p_noise_stride    = None
+                dm.p_noise_counts    = None
 
             return dm
 
@@ -1539,12 +1758,24 @@ class DataCollectionDialogV5(QDialog):
             "Much faster: rejected candidates skip screenshot rendering."
         )
 
+        self.radio_unfiltered = QRadioButton("All + unfittable")
+        self.radio_unfiltered.setToolTip(
+            "Every Stage 1 candidate, including those whose decay window could not\n"
+            "be fitted at all (fit_valid = 0). Those rows have NEVER reached a CSV\n"
+            "before — Stage 2 dropped them ahead of export — and they arrive with\n"
+            "tau_ms / R2 / fit_coverage as NaN.\n\n"
+            "Expect many, and expect most to be noise: Stage 1 candidates are\n"
+            "overwhelmingly noise and this mode applies no fit filter at all."
+        )
+
         self.export_mode_group = QButtonGroup(self)
         self.export_mode_group.addButton(self.radio_all)
         self.export_mode_group.addButton(self.radio_confirmed)
+        self.export_mode_group.addButton(self.radio_unfiltered)
 
         mode_layout.addWidget(self.radio_all)
         mode_layout.addWidget(self.radio_confirmed)
+        mode_layout.addWidget(self.radio_unfiltered)
         mode_layout.addStretch()
         layout.addLayout(mode_layout)
 
@@ -1858,9 +2089,12 @@ class DataCollectionDialogV5(QDialog):
                 )
                 return
             svm_model = self.svm_model
-            export_mode = (
-                EXPORT_CONFIRMED if self.radio_confirmed.isChecked() else EXPORT_ALL
-            )
+            if self.radio_confirmed.isChecked():
+                export_mode = EXPORT_CONFIRMED
+            elif self.radio_unfiltered.isChecked():
+                export_mode = EXPORT_UNFILTERED
+            else:
+                export_mode = EXPORT_ALL
             if not self.chk_use_model_threshold.isChecked():
                 threshold = self.spin_threshold.value()
 
@@ -1879,7 +2113,8 @@ class DataCollectionDialogV5(QDialog):
         self._log(f"  Normalize: True (fixed)")
         if classify:
             eff_thr = threshold if threshold is not None else float(svm_model['threshold'])
-            mode_txt = ("confirmed clicks only" if export_mode == EXPORT_CONFIRMED
+            mode_txt = ("every candidate incl. unfittable" if export_mode == EXPORT_UNFILTERED
+                        else "confirmed clicks only" if export_mode == EXPORT_CONFIRMED
                         else "all candidates + stats")
             self._log(f"  Stages 2-4: {self.model_path.name}  (threshold = {eff_thr:.3f})")
             self._log(f"  Export: {mode_txt}")

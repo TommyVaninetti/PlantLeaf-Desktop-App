@@ -123,6 +123,29 @@ TUKEY_TAPER_FRACTION = 0.10  # Fraction of analysis-band bins used for each
                               # Smoothly ramps the spectral edges to zero to reduce
                               # Gibbs ringing in the reconstructed time-domain signal.
 
+# v6 REGION SPECTRUM (SPECTRAL_FEATURES_v6_PROPOSAL.md §5)
+REGION_NFFT = 4096   # Transform length for the onset→decay_end region spectrum.
+                     # NOT a resolution: Δf is fixed by n_seg (REGION_FFT_FEATURE.md
+                     # §2). Zero-padding only interpolates the DTFT.
+                     #
+                     # FIXED rather than default_nfft(n_seg) on purpose. default_nfft
+                     # scales with the segment, which would make FPE_hz_region's
+                     # readout precision depend on the event's duration — and duration
+                     # coupling is already the open question for this feature family
+                     # (§4.3's mandatory corr(feature, n_seg) check). A fixed grid gives
+                     # every event the same FPE axis.
+                     #
+                     # The value is a DISPLAY GRID, not a tuned threshold: the
+                     # distributional features (entropy, novelty, tilt, quantiles) are
+                     # computed on the 12-band grid and are invariant to it — measured
+                     # spread < 1e-3 across n_fft 512→8192 (spectral_analysis
+                     # _self_test §15). It affects only how finely FPE's argmax is
+                     # interpolated. 4096 is the smallest power of two comfortably above
+                     # the longest possible region (a prev|curr|next stitch is 1536
+                     # samples, and compute_spectrum never truncates), giving 48.8 Hz
+                     # interpolation at fs = 200 kHz.
+                     # → not specified in v6; surfaced for confirmation.
+
 # GIBBS SUPPRESSION (§7, Step 3)
 GIBBS_CHECK_SAMPLES = 15   # Samples at each frame border examined for Gibbs energy.
                             # At 200 kHz: 15 samples = 75 µs.
@@ -1019,13 +1042,62 @@ class AdaptiveNoiseEstimatorV5:
         return self._fill
 
     @property
+    def b3_window_frames(self) -> int:
+        """Accepted frames currently inside the B3 rolling mean (0 → W_NOISE)."""
+        return self._B3_n
+
+    @property
     def b3_filled(self) -> int:
         """Number of closed Buffer-3 sub-windows (0 → M_SUBWINDOWS). 0 = no estimate."""
         return self._B3_filled
 
 
 # =============================================================================
-# v6 — the analysis-band taper, as a standalone array
+# v6 — spectral_analysis bridge, and the analysis-band taper
+# =============================================================================
+
+_SPECTRAL = None
+
+
+def _spectral():
+    """
+    Lazily return the `spectral_analysis` module.
+
+    Deliberately lazy and deliberately dual-path. This module is imported two
+    different ways across the project:
+
+      * normally, as `core.click_pipeline_v5`, with `src/` on sys.path;
+      * by absolute path via importlib (test_scripts/*, scripts/*,
+        hybrid/pipeline_loader.py), where `core` is NOT an importable package.
+
+    A module-level `from core.spectral_analysis import ...` would break every
+    by-path caller; a bare `import spectral_analysis` would break the app. So try
+    the package import first and fall back to loading the sibling file directly,
+    which is the same idiom pipeline_loader.load_spectral() already uses.
+
+    The dependency direction matters and is safe: spectral_analysis imports
+    nothing from this project (only dataclasses/typing/numpy), so there is no
+    cycle, and the QThread-safety contract only forbids the REVERSE direction —
+    spectral_analysis must never import click_pipeline_v5.
+    """
+    global _SPECTRAL
+    if _SPECTRAL is None:
+        try:
+            from core import spectral_analysis as _sa      # normal app import
+        except ImportError:
+            import importlib.util
+            import os
+            _path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'spectral_analysis.py')
+            _spec = importlib.util.spec_from_file_location('spectral_analysis', _path)
+            _sa = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_sa)
+        _SPECTRAL = _sa
+    return _SPECTRAL
+
+
+# =============================================================================
+# The analysis-band taper, as a standalone array
 # =============================================================================
 
 def analysis_band_taper(n_bins: int = _K_BINS) -> np.ndarray:
@@ -2310,6 +2382,101 @@ def click_event_key(ctx: dict, resolved: dict, frame_idx: int) -> tuple:
     return int(peak_abs), int(canonical_frame_idx)
 
 
+def _feat_v6_spectral(
+    ctx:         dict,
+    resolved:    dict,
+    p_noise_psd: Optional[np.ndarray],
+    freq_axis:   np.ndarray,
+    fs:          int = FS,
+) -> dict:
+    """
+    The v6 excess-spectrum feature family (SPECTRAL_FEATURES_v6_PROPOSAL.md §5).
+
+    Builds E[m] = max(0, P_region[m] - P_noise[m]) on the 12-band grid and the
+    statistics defined on it, plus the region-spectrum versions of FPE and SPR.
+
+    Returns every key as NaN when there is no usable noise estimate or the region
+    is too short to transform. NaN, never a sentinel: a zero noise floor would
+    make E[k] equal P_region and every feature would look plausible while
+    measuring nothing (§7.5.3 is about exactly this class of silent collapse).
+
+    ⚠️ TRAP (a), §4.4 — THE TAPER IS APPLIED HERE.
+    P_region comes from the RECONSTRUCTED signal, which already carries the
+    analysis-band Tukey taper (reconstruct_frame_v5 Step 1d). Buffer 3 is built
+    from TRANSMITTED magnitudes, which do not. So P_noise is multiplied by the
+    taper SQUARED (squared because these are PSDs and the taper acts on
+    amplitude) before subtraction. Without it the subtraction over-subtracts at
+    the band edges, where the region is attenuated and the noise estimate is not.
+    The taper reaches exactly 0 at bins 51/204 — NOT −6 dB as §4.4(a) and
+    FFT_PHASE_TECHNICAL_SPECIFICATION.md §7.2 both claim — so this must never be
+    inverted by dividing E[k] by taper²: that divides by zero at the edges.
+
+    ⚠️ TRAP (b), §4.4 — 50 % MIC NORMALISATION ON BOTH SIDES.
+    p_noise_psd must have been built from fft_norm (mic-corrected), and the region
+    comes from ctx['signal'], reconstructed from the same normalised spectrum, so
+    the frequency-dependent 0.55x-1.49x gain divides out of the subtraction.
+    Feeding Buffer 3 raw magnitudes instead corrupts the whole family silently —
+    measured at −5.2 … +3.5 dB. This is "do not accidentally break it" rather
+    than new work, but it is the easiest thing here to get wrong.
+    """
+    sa = _spectral()
+    keys = ('spectral_entropy', 'shape_novelty', 'spectral_tilt',
+            'temporal_concentration', 'FPE_hz_region', 'SPR_region',
+            'f_50_hz', 'IQR_f')
+    out = {k: float('nan') for k in keys}
+    out['n_seg'] = 0
+    out['n_seg_valid'] = 0
+
+    onset     = int(resolved['onset'])
+    decay_end = int(resolved['decay_end'])
+    signal    = ctx['signal']
+    envelope  = ctx['envelope']
+
+    i0 = max(0, min(onset, len(signal)))
+    i1 = max(i0, min(decay_end + 1, len(signal)))
+    n_seg = i1 - i0
+    out['n_seg'] = int(n_seg)
+    # §4.3: below V6_MIN_NSEG the bands are correlated and entropy is biased
+    # optimistically toward 1. Recorded and flagged, never special-cased away.
+    out['n_seg_valid'] = int(n_seg >= sa.V6_MIN_NSEG)
+
+    # temporal_concentration needs only the envelope — available even with no B3.
+    if n_seg >= 2:
+        out['temporal_concentration'] = sa.temporal_concentration(envelope, (i0, i1))
+
+    if p_noise_psd is None or n_seg < sa.MIN_SEGMENT_SAMPLES:
+        return out
+
+    p_noise = np.asarray(p_noise_psd, dtype=np.float64)
+    if p_noise.shape != (_K_BINS,) or not np.all(np.isfinite(p_noise)):
+        return out
+
+    # Trap (a): taper the noise estimate onto the region's footing.
+    p_noise = p_noise * analysis_band_taper(_K_BINS) ** 2
+    noise_freqs = np.asarray(freq_axis, dtype=np.float64)[_BIN_START:_BIN_END + 1]
+
+    region_spec = sa.compute_spectrum(
+        signal[i0:i1], fs,
+        window=sa.DEFAULT_WINDOW, alpha=sa.DEFAULT_ALPHA,
+        n_fft=REGION_NFFT, scaling='psd')
+
+    f6 = sa.v6_spectral_features(region_spec, p_noise, noise_freqs,
+                                 env=envelope, region=(i0, i1))
+    for k in ('spectral_entropy', 'shape_novelty', 'spectral_tilt',
+              'temporal_concentration', 'f_50_hz', 'IQR_f'):
+        out[k] = f6[k]
+    out['FPE_hz_region'] = f6['FPE_hz']
+
+    # SPR on the region spectrum — the D16 counterpart of the frame SPR, emitted
+    # so that "SPR is subsumed by entropy" can be tested rather than assumed.
+    band = (region_spec.freqs >= sa.V6_BAND_LO_HZ) & (region_spec.freqs <= sa.V6_BAND_HI_HZ)
+    if np.any(band):
+        power = region_spec.mags[band]
+        mean_p = float(np.mean(power))
+        out['SPR_region'] = float(np.max(power) / mean_p) if mean_p > 1e-30 else float('nan')
+    return out
+
+
 def compute_features_v5(
     ctx:         dict,
     resolved:    dict,
@@ -2318,6 +2485,7 @@ def compute_features_v5(
     noise_floor: float,
     std_noise:   float,
     fs:          int = FS,
+    p_noise_psd: Optional[np.ndarray] = None,
 ) -> dict:
     """
     Compute all 17 v5 features for a single resolved click candidate.
@@ -2330,9 +2498,12 @@ def compute_features_v5(
     ZCR_post / kurtosis / centroid_shift_hz / asymmetry_integral wrong for
     borderline clicks is structurally impossible here.
 
-    The spectral features (SPR, R_spectral, FPE_hz via _feat_fft_features) still
-    use the frame's transmitted FFT — migrating them to a Region-FFT window over
-    [onset, decay_end] is a separate, deferred change.
+    The v5 spectral features (SPR, R_spectral, FPE_hz via _feat_fft_features)
+    still use the frame's transmitted FFT. The v6 family (spectral_entropy,
+    shape_novelty, ...) is computed on the REGION spectrum instead, and is emitted
+    ALONGSIDE them rather than replacing them — deciding which survives is Phase 4
+    (v6 §7.4 runs A/B/C), and keeping both makes those runs column subsets of one
+    export instead of three separate exports.
 
     Parameters
     ----------
@@ -2343,6 +2514,15 @@ def compute_features_v5(
         the ctx arrays) + peak_amp.
     fft_norm, freq_axis : np.ndarray
         Mic-normalized frame FFT magnitudes and their frequency axis [Hz].
+    p_noise_psd : np.ndarray or None, optional
+        Buffer 3's per-bin noise PSD [V²/Hz], 154 bins, UNTAPERED — i.e. exactly
+        what AdaptiveNoiseEstimatorV5.p_noise_psd() returns. The squared
+        analysis-band taper is applied HERE, not by the caller (trap (a), §4.4).
+
+        When None — every v5 call site — the eight v6 features are emitted as NaN
+        and nothing else changes. That is what keeps this signature backward
+        compatible: v6 is additive, and a caller that has no Buffer 3 yet still
+        gets a complete, correct v5 feature vector.
     noise_floor, std_noise : float
         Adaptive noise estimates [V] for the candidate frame.
     fs : int
@@ -2424,6 +2604,9 @@ def compute_features_v5(
     # every consumer selects the 17 v5 names explicitly. See fit_result_to_nan.
     features['fit_valid']    = fit.get('fit_valid', 0)
 
+    # ── v6 spectral family (§5) ───────────────────────────────────────────────
+    features.update(_feat_v6_spectral(ctx, resolved, p_noise_psd, freq_axis, fs))
+
     # FFT-domain features (§8.9) — still the frame FFT (Region-FFT migration TODO)
     features.update(_feat_fft_features(fft_norm, freq_axis))
 
@@ -2494,6 +2677,52 @@ def has_precomputed_stage1_arrays(dm) -> bool:
         getattr(dm, name, None) is not None
         for name in ('fft_means', 'E_hat_floor_arr', 'noise_floor_arr', 'std_noise_arr')
     ) and len(dm.fft_means) == dm.total_frames
+
+
+def p_noise_at(dm, frame_idx: int) -> Optional[np.ndarray]:
+    """
+    Buffer 3's per-bin noise PSD [V²/Hz] in effect at `frame_idx`, or None.
+
+    AudioLoadWorker samples B3 on a fixed stride (SUBWINDOW_SIZE) rather than
+    storing it per frame — the full history would be n × 154 × 8 B, ~3 GB on a
+    2.5 M-frame recording. This returns the snapshot at or before `frame_idx`.
+
+    The staleness that introduces is bounded and small: B3 is a rolling mean over
+    W_NOISE = 750 accepted frames, so between two snapshots at most SUBWINDOW_SIZE
+    of those 750 entries have rotated — under 10 % of the window.
+
+    Returns None when the file was loaded without the v6 arrays (any recording
+    loaded before this change, or the no-phase fallback path), when the frame
+    precedes the first closed estimate, or when the snapshot is not finite.
+    Callers must treat None as "no noise estimate" and emit NaN features — NOT as
+    a zero floor, which would make E[k] equal P_region and look like a clean
+    detection (§7.5.3's silent-collapse failure).
+    """
+    snaps = getattr(dm, 'p_noise_snapshots', None)
+    stride = getattr(dm, 'p_noise_stride', None)
+    if snaps is None or not stride:
+        return None
+    j = int(frame_idx) // int(stride)
+    if j < 0 or j >= len(snaps):
+        return None
+    row = np.asarray(snaps[j], dtype=np.float64)
+    if row.shape != (_K_BINS,) or not np.all(np.isfinite(row)):
+        return None
+    return row
+
+
+def p_noise_frames_at(dm, frame_idx: int) -> int:
+    """Accepted frames behind the Buffer-3 estimate at `frame_idx` (0 if none).
+
+    Exported as `b3_frames`, so a reviewer can distinguish a warm, full-window
+    noise estimate from one built during warm-up — the v6 features are much
+    noisier in the latter case, and that is invisible in the feature values."""
+    counts = getattr(dm, 'p_noise_counts', None)
+    stride = getattr(dm, 'p_noise_stride', None)
+    if counts is None or not stride:
+        return 0
+    j = int(frame_idx) // int(stride)
+    return int(counts[j]) if 0 <= j < len(counts) else 0
 
 
 def run_stage1_v5_precomputed(dm, k: float = K_STAGE1_DEFAULT) -> list:
@@ -2652,6 +2881,20 @@ def _stage2_reason(cand: dict) -> str:
     # that depend on decay_start / decay_end are unreliable.
     # _fit_decay_segment also returns R2=0.0 for degenerate windows
     # (too short or near-zero denominator) — those fail here too.
+    # ⚠️ NaN FIRST. A v6 candidate carries NaN for tau_ms / R2 / fit_coverage when
+    # the fit failed, replacing the old −1 / 0 sentinels. Every comparison against
+    # NaN is False, so the two gates below would silently PASS exactly the
+    # unfittable candidates — into Stage 3, where the imputer fills the gap and the
+    # SVM returns a confident-looking probability from imputed data. The sentinels
+    # failed those comparisons; NaN does not, so this test has to be explicit.
+    # `fit_valid` is authoritative when present; the isnan fallback covers callers
+    # that predate it.
+    if not int(cand.get('fit_valid', 1)):
+        return STAGE_BLOCKED_R2
+    _r2, _tau = cand.get('R2', 0.0), cand.get('tau_ms', -1.0)
+    if _r2 is None or _tau is None or (_r2 != _r2) or (_tau != _tau):   # NaN check
+        return STAGE_BLOCKED_R2
+
     if cand.get('R2', 0.0) < STAGE2_R2_MIN:
         return STAGE_BLOCKED_R2
 

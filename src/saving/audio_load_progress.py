@@ -31,6 +31,8 @@ from core.click_pipeline_v5 import (  #keep functions and constants in sync with
     _BIN_END   as V5_BIN_END,
     FS         as V5_FS,
     FFT_SIZE   as V5_FFT_SIZE,
+    _K_BINS        as V5_K_BINS,
+    SUBWINDOW_SIZE as V5_SUBWINDOW_SIZE,
 )
 
 class AudioLoadWorker(QObject):
@@ -263,8 +265,25 @@ class AudioLoadWorker(QObject):
 
                 # STEP 4: Metadata and timing calculations
                                 
-                estimated_fft_rate = 390.0
-                frame_duration_ms = 1000.0 / estimated_fft_rate
+                # Frame rate is EXACTLY fs / fft_size: the firmware emits one frame
+                # per FFT and each FFT consumes fft_size samples at fs. At the
+                # standard 200 kHz / 512 that is 390.625 fps = 2.560000 ms/frame,
+                # which is the figure FFT_PHASE_TECHNICAL_SPECIFICATION.md §4.4
+                # quotes for the wire data rate.
+                #
+                # This was previously hardcoded `estimated_fft_rate = 390.0`
+                # (2.564103 ms/frame). That is 0.16 % slow, so every displayed time
+                # ran LONG and drifted away from the exported CSVs — which have
+                # always used frame_idx x fft_size / fs. About +10 s at the end of a
+                # 110-minute recording.
+                #
+                # The header's start_time/end_time cannot arbitrate this: of the 40
+                # OFFICIALS recordings only 6 yield a physically plausible rate from
+                # them, and those 6 spread 369-392 fps. The sample-domain rate is the
+                # only defensible time base.
+                frame_duration_ms = (1000.0
+                                     * header_info.get('fft_size', V5_FFT_SIZE)
+                                     / header_info.get('fs', V5_FS))
                 total_duration_sec = (total_frames * frame_duration_ms / 1000.0)
 
             # NEW STEP 4.5: Precompute FFT means + adaptive noise  (was in main thread)
@@ -278,6 +297,25 @@ class AudioLoadWorker(QObject):
 
             n = total_frames
             fft_means_arr   = np.empty(n, dtype=np.float64)
+
+            # ── v6 Buffer 3: per-bin noise PSD history ───────────────────────
+            # B3 is a rolling mean over W_NOISE = 750 accepted frames, so it moves
+            # slowly. Storing it for EVERY frame would be n x 154 x 8 B — ~3 GB on
+            # a 2.5 M-frame recording — so it is sampled on a fixed stride instead
+            # and the consumer takes the snapshot at or before its frame.
+            #
+            # Stride = SUBWINDOW_SIZE (an existing constant, not a new one). The
+            # resulting staleness is bounded: between two snapshots at most
+            # SUBWINDOW_SIZE of W_NOISE entries rotate, i.e. <= 10 % of the window.
+            # float32 because this is a noise floor — 7 significant digits is far
+            # more than the estimate itself carries.
+            _p_stride  = V5_SUBWINDOW_SIZE
+            _n_snap    = (n + _p_stride - 1) // _p_stride
+            p_noise_snapshots = np.full((_n_snap, V5_K_BINS), np.nan, dtype=np.float32)
+            # How many accepted frames each snapshot averages. Exported as
+            # b3_frames so a reviewer can tell a warm, full-window estimate from
+            # one built during warm-up.
+            p_noise_counts    = np.zeros(_n_snap, dtype=np.int32)
             E_hat_floors    = np.empty(n, dtype=np.float64)
             noise_floors    = np.empty(n, dtype=np.float64)
             std_noises      = np.empty(n, dtype=np.float64)
@@ -321,10 +359,23 @@ class AudioLoadWorker(QObject):
                     env_mean_i = float(np.sqrt(max(E_i, 0.0)))
                     env_std_i  = 0.0
 
-                noise = estimator.update(E_i, env_mean_i, env_std_i)
+                # mags_norm feeds Buffer 3 (v6 §2). It MUST be the mic-normalised
+                # band slice — trap (b) of §4.4; raw magnitudes would corrupt every
+                # v6 feature silently. Passing it does not change any v5 output
+                # (asserted in test_scripts/verify_v6_buffer3.py §1).
+                noise = estimator.update(
+                    E_i, env_mean_i, env_std_i,
+                    mags_norm=fft_norm[V5_BIN_START : V5_BIN_END + 1],
+                    fs=fs_h, fft_size=fft_size_h)
                 E_hat_floors[i] = noise['E_hat_floor']
                 noise_floors[i] = noise['noise_floor']
                 std_noises[i]   = noise['std_noise']
+
+                if i % _p_stride == 0:
+                    _pn = estimator.p_noise_psd()
+                    if _pn is not None:
+                        p_noise_snapshots[i // _p_stride] = _pn
+                        p_noise_counts[i // _p_stride]    = estimator.b3_window_frames
 
                 # Report progress: map i/n → 60..92 %
                 if i % 500 == 0:
@@ -388,6 +439,10 @@ class AudioLoadWorker(QObject):
                 'E_hat_floor_arr'      : E_hat_floors,
                 'noise_floor_arr'      : noise_floors,
                 'std_noise_arr'        : std_noises,
+                # v6 Buffer 3 — see p_noise_at() in click_pipeline_v5
+                'p_noise_snapshots'    : p_noise_snapshots,
+                'p_noise_stride'       : _p_stride,
+                'p_noise_counts'       : p_noise_counts,
             }
 
             self.finished.emit(data_dict)

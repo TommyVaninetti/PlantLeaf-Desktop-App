@@ -227,6 +227,15 @@ class FileHandlerMixin:
         dm.E_hat_floor_arr = data['E_hat_floor_arr']  # np.float32[n_frames]
         dm.noise_floor_arr = data['noise_floor_arr']  # np.float32[n_frames]
         dm.std_noise_arr   = data['std_noise_arr']    # np.float32[n_frames]
+        # v6 Buffer 3 — per-bin noise PSD, sampled on a stride. .get() rather than
+        # [] so a dict produced by an older worker still loads.
+        # ⚠️ EVERY key the worker emits must be copied here. When these three were
+        # missing, p_noise_at() returned None for every frame and all eight v6
+        # spectral features exported as NaN — silently, because NaN is also the
+        # legitimate "no estimate yet" value. b3_frames == 0 is the tell.
+        dm.p_noise_snapshots = data.get('p_noise_snapshots')   # float32[n_snap, 154]
+        dm.p_noise_stride    = data.get('p_noise_stride')      # int
+        dm.p_noise_counts    = data.get('p_noise_counts')      # int32[n_snap]
         
         # Setup UI
         replay_window._setup_metadata()
