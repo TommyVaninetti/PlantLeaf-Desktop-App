@@ -39,6 +39,21 @@ All tuneable parameters for data collection dialog.
 
 CSV_FILENAME = 'data_collection_export.csv'
 SCREENSHOTS_FOLDER = 'screenshots'
+CSVS_FOLDER = 'CSVs'
+
+# Output layout — ONE FOLDER PER ANALYSED RECORDING, under each of the two trees:
+#
+#     <output_dir>/
+#         CSVs/<stem>/<stem>_candidates.csv
+#         screenshots/<stem>/<stem>_<frame:06d>.png
+#
+# Both used to be flat, so a session covering 20 recordings put 20 CSVs in one
+# directory and several thousand PNGs in another. The per-recording folder is what
+# makes a single file's review self-contained — which is how the labelling pass is
+# actually done, one recording at a time, rather than by opening one giant export.
+#
+# click_review_dialog reads BOTH layouts: it walks up from the CSV looking for a
+# `screenshots` tree, so exports made before this change still resolve.
 
 # Screenshot rendering (pure QPainter + QImage — no pyqtgraph, no OpenGL, no segfaults)
 #
@@ -49,8 +64,12 @@ SCREENSHOTS_FOLDER = 'screenshots'
 # change to the footer height silently mis-cropped every screenshot. Do not
 # re-introduce literals on the consumer side.
 SCREENSHOT_WIDTH  = 1400
-SCREENSHOT_HEIGHT = 900   # the v6 footer carries ~10 groups at 11 pt, and the
-                          # Quality group can wrap to a second line when it warns
+SCREENSHOT_HEIGHT = 960   # the v6 footer carries 11 groups at 11 pt, and both
+                          # Quality and Stage 1 can wrap to a second line when they
+                          # warn. At 900 the footer held 12 lines and the Verdict
+                          # group — the last one drawn — fell off the bottom with no
+                          # error; 960 gives 14. See the truncation marker in
+                          # _draw_feature_footer, which now makes that visible.
 PANEL_HEIGHT      = 480   # plot area height within each panel
 SCREENSHOT_MARGIN = 14
 SCREENSHOT_HEADER_H = 36  # title strip, cropped by the review dialog
@@ -70,7 +89,11 @@ K_DEFAULT = 1.5  # Default Stage 1 multiplier (from click_pipeline_v5.py)
 
 # ── CSV SCHEMA ──────────────────────────────────────────────────────────────
 
-SCHEMA_VERSION = 'v6.0'
+SCHEMA_VERSION = 'v6'   # The v6 schema: 51 columns, Stage 1 v5.1 peak-picking.
+                        # There is no v6.0/v6.1 split — the 45-column intermediate
+                        # never left development, so v6 means these 51 columns and
+                        # nothing else. Anything stamped 'v6.0' predates Stage 1 v5.1
+                        # and is a development artefact, not a dataset.
 
 # ── v6 schema (SPECTRAL_FEATURES_v6_PROPOSAL.md Phase 2) ────────────────────
 # A SUPERSET, deliberately: it carries the v5 features that v6 proposes to remove
@@ -88,12 +111,20 @@ CSV_COLUMNS = [
                            # arithmetic, IDENTICAL for the fi / fi+1 candidates of
                            # one straddling click. This is the safe label-migration
                            # key; (file, frame_idx) is not unique.
-    'canonical_frame_idx', # peak_abs // FFT_SIZE — the frame that OWNS the peak
+                           # `canonical_frame_idx` used to sit here and was dropped
+                           # in v6: it is exactly `peak_abs // FFT_SIZE`.
     'timestamp_s',
+    'stage1_params',       # 'v51_peakpick;k=1.50;R=2;C=10' — one column instead of
+                           # four (stage1_mode / k_used / R_used / C_used) that would
+                           # repeat the same value on every row of an export.
     # ── noise state at detection ──
     'noise_floor_mV',
     'std_noise_mV',
     'E_hat_floor',
+    'k_ratio',             # E_i / Ê_floor(i) — EXACTLY what Stage 1 thresholds on,
+                           # since E_i > k·Ê_floor ⟺ k_ratio > k. Exporting it makes
+                           # the k sweep a CSV filter instead of a corpus re-pass.
+                           # E_i itself is recoverable as k_ratio × E_hat_floor.
     # ── v5 features (17), unchanged names and order ──
     'peak_SNR',
     'pre_SNR',
@@ -112,7 +143,7 @@ CSV_COLUMNS = [
     'SPR',
     'R_spectral',
     'FPE_hz',
-    # ── v6 features (8) ──
+    # ── v6 features (9) ──
     'spectral_entropy',       # D5
     'shape_novelty',          # D6
     'spectral_tilt',          # D7  (on P_region — see §5.3's clarification)
@@ -121,15 +152,57 @@ CSV_COLUMNS = [
     'SPR_region',             # lets D16 be tested rather than assumed
     'f_50_hz',                # D18 — CSV only, not fed to the SVM
     'IQR_f',                  # D18 — CSV only
-    # ── validity & quality flags (6) ──
+    # ── harmonic_confinement (HARMONIC_CONFINEMENT_FEATURE_SPEC.md) ──
+    # FRAME domain, not region: the region window is ill-defined for sustained
+    # oscillation and too coarse to resolve a 1-2 kHz transducer linewidth.
+    'harmonic_confinement',   # log2(min(r_A, r_B)). 0 = excess spread uniformly.
+                              # Bounded above by ~3.36 BY CONSTRUCTION (all the
+                              # excess in the two bands, split 2/3 : 1/3).
+    'hc_f1_hz',               # the located fundamental. Also disambiguates WHY a
+                              # NaN happened: NaN here = no excess at all; finite
+                              # and > 40843.75 Hz = the 2nd harmonic is off the
+                              # transmitted range, so band B was clipped away.
+    'hc_r_A',                 # confinement in the fundamental band, vs its null
+    'hc_r_B',                 # ...and in the harmonic band. Kept because
+                              # harmonic_confinement is a min() and therefore
+                              # discards WHICH band was flat — the distinction §5
+                              # of the spec needs to separate a lone hum from a
+                              # true pair. Not recoverable after the fact.
+    'local_crest',            # Stage 1 v5.1 §4.3 — E_i over the median of its
+                              # ±C neighbourhood, the immediate neighbours excluded.
+                              # NaN, never −1, when that median is 0 or non-finite;
+                              # `local_crest_valid` is therefore redundant and was
+                              # never added (it is `not isnan(local_crest)`).
+    # ── validity & quality flags (5) ──
     'fit_valid',    # 0/1 — "fit failed" vs "fit succeeded and was terrible"
     'decay_len',    # the dead-zone coordinate; fit_coverage encodes it only indirectly
     'n_seg',        # §4.3 requires recording it beside every feature
-    'n_seg_valid',  # n_seg >= 45; below that bands correlate and H biases toward 1
+                    # `n_seg_valid` is not a column — it is `n_seg >= V6_MIN_NSEG`.
     'b3_frames',    # frames in the Buffer-3 window; 0 ⇒ every v6 feature is NaN
     'gibbs_fired',  # suppress_edge_artifacts tripped ⇒ biased subtraction that frame
+    # ── Stage 1 v5.1 diagnostics (5) — logged, NOT fed to the SVM (§4.4) ──
+    # run_length and run_crest are threshold- and history-dependent, so they are
+    # deliberately outside a feature set advertised as dimensionless and
+    # scale-invariant. They are here because the v5 → v5.1 delta in the paper
+    # wants them, and because they are unrecoverable after the fact.
+    'run_id',        # index of the above-threshold run this frame belongs to.
+                     # peak_rank_in_run / n_peaks_in_run were dropped: both are
+                     # groupby(run_id) one-liners.
+    'run_length',    # L — frames in that run. v5 rejected the whole run at L > 3.
+    'run_crest',     # E_i / median(E over the run) — kept for the delta analysis,
+                     # superseded as a detector statistic by local_crest (D5).
+    'pos_in_run',    # i − run_start
+    'would_pass_v5', # 0/1 — the v5 MAX_RUN verdict, evaluated inline. Filtering on
+                     # it reproduces the v5 candidate set from a v5.1 export, which
+                     # is what makes the delta computable from ONE pass (D6).
     # ── labels & verdicts ──
     'label',  # Empty column for manual labeling (1=click, 0=no click, empty=unknown)
+    'note',   # Free text, written by you in the review dialog. Exported empty and
+              # never read by the pipeline or the trainer — it exists so an
+              # observation made WHILE labelling ("double event", "probe knock",
+              # "floor stepped up here") survives to the analysis, instead of being
+              # lost or crammed into the label. Kept beside `label` so both travel
+              # together through migration.
     # Stage 2/3/4 verdict — written when classification is enabled, otherwise left
     # empty. Same three names, order and semantics as src/ml/evaluate_candidates.py,
     # so a CSV exported here and one produced by the offline CLI are interchangeable
@@ -156,11 +229,37 @@ FEATURE_NAMES = [
 FEATURE_NAMES_V6 = [
     'spectral_entropy', 'shape_novelty', 'spectral_tilt', 'temporal_concentration',
     'FPE_hz_region', 'SPR_region', 'f_50_hz', 'IQR_f',
+    # Stage 1 v5.1. In the set so it CAN be evaluated in Phase 4, not because it has
+    # earned its place — that ablation (O-3) is Phase 4 work. The deployed model is
+    # unaffected either way: model['features'] is authoritative at inference, so an
+    # extra CSV column changes nothing until a retrain picks it up. It is added now
+    # because back-filling it later costs a full re-export.
+    'local_crest',
+    # CSV-only for now. The spec (§5) is explicit that no gate is added yet and
+    # that whether this earns a place is decided from the labelled distribution —
+    # §5.3's correlation check against spectral_entropy / FPE_hz. Listing it here
+    # makes the value AVAILABLE to a future retrain without feeding the deployed
+    # model, which reads model['features'] and not this list.
+    'harmonic_confinement',
 ]
 
 # Emitted for every row but NOT features: provenance, validity and quality flags.
 QUALITY_COLUMNS = [
-    'fit_valid', 'decay_len', 'n_seg', 'n_seg_valid', 'b3_frames', 'gibbs_fired',
+    'fit_valid', 'decay_len', 'n_seg', 'b3_frames', 'gibbs_fired',
+]
+
+# Stage 1 v5.1 provenance (§4.4). Emitted for every row, never features — see the
+# note beside them in CSV_COLUMNS for why run_length / run_crest stay out.
+STAGE1_COLUMNS = [
+    'run_id', 'run_length', 'run_crest', 'pos_in_run', 'would_pass_v5',
+]
+
+# harmonic_confinement's supporting numbers. NAMED rather than left as literals
+# because every exporter has to iterate SOME list to fill them, and the last three
+# columns that belonged to no list were silently written empty by the replay
+# window for an entire schema generation.
+HARMONIC_COLUMNS = [
+    'hc_f1_hz', 'hc_r_A', 'hc_r_B',
 ]
 
 # Export modes for the classification section
@@ -231,14 +330,32 @@ class CandidateData:
     SPR_region: float = float('nan')
     f_50_hz: float = float('nan')
     IQR_f: float = float('nan')
+    local_crest: float = float('nan')   # NaN when the ±C background median is 0
+
+    # ── harmonic_confinement (frame domain) ──────────────────────────────────
+    harmonic_confinement: float = float('nan')
+    hc_f1_hz: float = float('nan')
+    hc_r_A: float = float('nan')
+    hc_r_B: float = float('nan')
 
     # ── validity & quality flags ─────────────────────────────────────────────
     fit_valid: int = 0        # 0/1 — "fit failed" vs "fit succeeded and was terrible"
     decay_len: int = 0        # decay_end − decay_start, the dead-zone coordinate
     n_seg: int = 0            # region length; §4.3 requires it beside every feature
-    n_seg_valid: int = 0      # n_seg >= 45, else the bands correlate and H biases up
     b3_frames: int = 0        # frames in the Buffer-3 window; 0 ⇒ v6 features are NaN
     gibbs_fired: int = 0      # suppress_edge_artifacts tripped on this frame
+
+    # ── Stage 1 v5.1 provenance (§4.4) ───────────────────────────────────────
+    # `stage1_params` is the whole selector configuration as one string, so a CSV
+    # can always be attributed to the rule that produced it even after the module
+    # constants move on. Everything here is diagnostic; none of it is a feature.
+    stage1_params: str = ''
+    run_id: int = -1
+    run_length: int = 0
+    run_crest: float = float('nan')
+    pos_in_run: int = 0
+    would_pass_v5: int = 0
+    k_ratio: float = float('nan')   # E_i / Ê_floor(i); > k by construction
 
     # Grouping key for StratifiedGroupKFold. train_svm.py exits without it.
     session_id: str = ''
@@ -271,6 +388,7 @@ class CandidateData:
 
     # Label (empty for Phase 2, filled manually later)
     label: str = ''
+    note: str = ''      # free text, filled in the review dialog; never a feature
 
     # Stage 2/3/4 verdict — filled by the worker when classification is enabled.
     # None/'' means the candidate was never classified (classification switched off),
@@ -301,15 +419,15 @@ class CandidateData:
         return d
 
     def to_csv_dict(self) -> Dict:
-        """Convert to dictionary for CSV export (the 45 v6 columns)."""
+        """Convert to dictionary for CSV export (the 51 v6 columns)."""
         return {
             'schema_version': SCHEMA_VERSION,
             'session_id': self.session_id or self.file,
             'file': self.file,
             'frame_idx': self.frame_idx,
             'peak_abs': self.peak_abs,
-            'canonical_frame_idx': self.canonical_frame_idx,
             'timestamp_s': round(self.timestamp_s, 6),
+            'stage1_params': self.stage1_params,
             # mV since the iFFT amplitude-scale fix — the reconstructed signal is
             # now in true volts, so these land in the mV range. CSVs exported before
             # that fix carry uV columns 256x smaller; the 17 feature columns are
@@ -318,6 +436,7 @@ class CandidateData:
             'noise_floor_mV': round(self.noise_floor * 1e3, 4),
             'std_noise_mV': round(self.std_noise * 1e3, 4),
             'E_hat_floor': round(self.E_hat_floor, 6),
+            'k_ratio': round(self.k_ratio, 4),
             'peak_SNR': round(self.peak_SNR, 3),
             'pre_SNR': round(self.pre_SNR, 3),
             'post_SNR': round(self.post_SNR, 3),
@@ -345,14 +464,25 @@ class CandidateData:
             'SPR_region': round(self.SPR_region, 3),
             'f_50_hz': round(self.f_50_hz, 2),
             'IQR_f': round(self.IQR_f, 2),
+            'local_crest': round(self.local_crest, 4),
+            'harmonic_confinement': round(self.harmonic_confinement, 4),
+            'hc_f1_hz': round(self.hc_f1_hz, 1),
+            'hc_r_A': round(self.hc_r_A, 3),
+            'hc_r_B': round(self.hc_r_B, 3),
             # ── validity & quality ──
             'fit_valid': int(self.fit_valid),
             'decay_len': int(self.decay_len),
             'n_seg': int(self.n_seg),
-            'n_seg_valid': int(self.n_seg_valid),
             'b3_frames': int(self.b3_frames),
             'gibbs_fired': int(self.gibbs_fired),
+            # ── Stage 1 v5.1 diagnostics ──
+            'run_id': int(self.run_id),
+            'run_length': int(self.run_length),
+            'run_crest': round(self.run_crest, 4),
+            'pos_in_run': int(self.pos_in_run),
+            'would_pass_v5': int(self.would_pass_v5),
             'label': self.label,
+            'note': self.note,
             # Rounded to 4 dp to match evaluate_candidates.py's output exactly.
             # None → '' via csv.DictWriter, which is how an unclassified candidate
             # and a Stage-2-blocked one (never scored) both read as blank.
@@ -479,9 +609,16 @@ def _process_file_for_collection(
         p_noise_at,
         p_noise_frames_at,
         compute_features_v5,
-        FS, FFT_SIZE, MAX_RUN,
+        FS, FFT_SIZE,
         STAGE2_R2_MIN, STAGE2_TAU_MIN,
+        STAGE1_MODE, PEAK_REFRACTORY_R, LOCAL_CREST_C,
     )
+
+    # Stamped on every row. R and C are PROVISIONAL (Stage 1 v5.1 spec §4.1, O-1):
+    # Phase 0 could not validate them, so recording the values used is the only
+    # thing that lets a later study attribute results to them.
+    stage1_params = (f'{STAGE1_MODE};k={k:.2f};'
+                     f'R={PEAK_REFRACTORY_R};C={LOCAL_CREST_C}')
 
     candidates = []
     csv_rows   = []
@@ -686,9 +823,26 @@ def _process_file_for_collection(
                 fit_valid=int(features.get('fit_valid', 0)),
                 decay_len=int(d_end - d_start),
                 n_seg=int(features.get('n_seg', 0)),
-                n_seg_valid=int(features.get('n_seg_valid', 0)),
                 b3_frames=p_noise_frames_at(dm, frame_idx),
                 gibbs_fired=gibbs_fired,
+                # ── Stage 1 v5.1 (§4.3, §4.4) ──
+                # local_crest and the run diagnostics are produced by
+                # _stage1_select and ride along on the survivor dict; they cannot
+                # be recomputed here, because that would need the whole per-frame
+                # energy series and would be a second implementation of the rule.
+                local_crest=float(survivor.get('local_crest', float('nan'))),
+                harmonic_confinement=features.get('harmonic_confinement', float('nan')),
+                hc_f1_hz=features.get('hc_f1_hz', float('nan')),
+                hc_r_A=features.get('hc_r_A', float('nan')),
+                hc_r_B=features.get('hc_r_B', float('nan')),
+                stage1_params=stage1_params,
+                run_id=int(survivor.get('run_id', -1)),
+                run_length=int(survivor.get('run_length', 0)),
+                run_crest=float(survivor.get('run_crest', float('nan'))),
+                pos_in_run=int(survivor.get('pos_in_run', 0)),
+                would_pass_v5=int(survivor.get('would_pass_v5', 0)),
+                k_ratio=(float(survivor['E_i']) / float(survivor['E_hat_floor'])
+                         if survivor.get('E_hat_floor', 0.0) > 0 else float('nan')),
                 render_signal=render_signal,
                 render_envelope=render_envelope,
                 render_t_ms=render_t_ms,
@@ -1010,6 +1164,11 @@ def _draw_feature_footer(
                       f"SPR_region = {_num(c.SPR_region, '.2f')}",
                       f"f_50 = {_num(c.f_50_hz, '.0f')} Hz",
                       f"IQR_f = {_num(c.IQR_f, '.0f')} Hz"]),
+        # Frame-domain, unlike every other v6 line above — see its spec §1.
+        ("Harmonic", [f"confinement = {_num(c.harmonic_confinement, '+.2f')}",
+                      f"f₁ = {_num(c.hc_f1_hz, '.0f')} Hz",
+                      f"r_A = {_num(c.hc_r_A, '.2f')}",
+                      f"r_B = {_num(c.hc_r_B, '.2f')}"]),
         ("Fit",      [f"τ = {tau_str}",
                       f"R² = {_num(c.R2, '.4f')}",
                       f"coverage = {_num(c.fit_coverage, '.3f')}",
@@ -1026,11 +1185,25 @@ def _draw_feature_footer(
         q.append(f"b3_frames = {c.b3_frames}")
     else:
         q.append("⚠ NO B3 ESTIMATE — v6 features unavailable")
-    q.append(f"n_seg = {c.n_seg}" if c.n_seg_valid
+    # Derived, not stored: v6 dropped the redundant n_seg_valid column.
+    from core.spectral_analysis import V6_MIN_NSEG
+    q.append(f"n_seg = {c.n_seg}" if c.n_seg >= V6_MIN_NSEG
              else f"⚠ n_seg = {c.n_seg} too short — bands correlated, entropy biased high")
     if c.gibbs_fired:
         q.append("⚠ Gibbs fade fired — subtraction biased on this frame")
     groups.append(("Quality", q))
+
+    # ── Stage 1 v5.1 — why this frame is on the page at all ──────────────────
+    # would_pass_v5 = 0 marks a candidate v5 would have DELETED for sitting in a
+    # run longer than MAX_RUN. Those rows have never been labelled by anyone, so
+    # a reviewer has to be able to see it on the picture rather than infer it.
+    s1 = [f"local_crest = {_num(c.local_crest, '.2f')}",
+          f"k_ratio = {_num(c.k_ratio, '.2f')}",
+          f"run L = {c.run_length} (pos {c.pos_in_run})",
+          f"run_crest = {_num(c.run_crest, '.2f')}"]
+    if not c.would_pass_v5:
+        s1.append("NEW under v5.1 — v5 deleted this run (L > MAX_RUN)")
+    groups.append(("Stage 1", s1))
 
     # Verdict line — only when the candidate went through Stages 2-4. Without it a
     # PNG shows what the frame looked like but not what the algorithm made of it.
@@ -1067,21 +1240,37 @@ def _draw_feature_footer(
             lines.append(SEP.join(cur))
         return lines
 
+    # Flattened first, so an overflow can be REPORTED rather than silently
+    # dropping whatever happened to be drawn last. It once ate the Verdict group
+    # and the only symptom was a missing line on a 1400 px PNG.
+    flat = [(label, n, line)
+            for label, values in groups
+            for n, line in enumerate(_wrap(values))]
+    n_fit = max(0, (rect.height() - 6) // LINE_H)
+    truncated = len(flat) - n_fit
+    if truncated > 0:
+        flat = flat[:max(0, n_fit - 1)]
+
     y = rect.top() + 6
-    for label, values in groups:
-        for n, line in enumerate(_wrap(values)):
-            if y + LINE_H > rect.bottom():
-                break
-            if n == 0:
-                p.setFont(f_key)
-                p.setPen(c_key)
-                p.drawText(QRect(rect.left(), y, KEY_W, LINE_H),
-                           Qt.AlignLeft | Qt.AlignVCenter, label + ":")
-            p.setFont(f_val)
-            p.setPen(c_text)
-            p.drawText(QRect(rect.left() + KEY_W, y, avail, LINE_H),
-                       Qt.AlignLeft | Qt.AlignVCenter, line)
-            y += LINE_H
+    for label, n, line in flat:
+        if n == 0:
+            p.setFont(f_key)
+            p.setPen(c_key)
+            p.drawText(QRect(rect.left(), y, KEY_W, LINE_H),
+                       Qt.AlignLeft | Qt.AlignVCenter, label + ":")
+        p.setFont(f_val)
+        p.setPen(c_text)
+        p.drawText(QRect(rect.left() + KEY_W, y, avail, LINE_H),
+                   Qt.AlignLeft | Qt.AlignVCenter, line)
+        y += LINE_H
+
+    if truncated > 0:
+        p.setFont(f_key)
+        p.setPen(QColor(200, 60, 60))
+        p.drawText(QRect(rect.left(), y, rect.width(), LINE_H),
+                   Qt.AlignLeft | Qt.AlignVCenter,
+                   f"⚠ {truncated + 1} more footer line(s) did not fit — "
+                   f"raise SCREENSHOT_HEIGHT")
 
 
 def _render_candidate_screenshot(
@@ -1440,7 +1629,12 @@ class DataCollectionWorkerV5(QThread):
     """
     
     # Signals
-    progress_updated = Signal(int, int, int, int)  # (file_idx, total_files, candidates_found, total_candidates)
+    #: (file_idx, total_files, done_in_file, n_in_file, total_candidates)
+    #: `done_in_file` / `n_in_file` are what let the bar advance DURING the
+    #: screenshot phase. It previously carried the file's candidate count and the
+    #: running total, so the handler had no within-file fraction and pinned the bar
+    #: to the midpoint of the file's share for that entire phase.
+    progress_updated = Signal(int, int, int, int, int)
     load_progress    = Signal(int, int, int)        # (file_idx, total_files, pct_0_100) — fired during file loading
     candidate_ready  = Signal(object)              # (CandidateData, str) — rendered on main thread
     file_complete    = Signal(str, int, str)       # (filename, candidate_count, csv_path)
@@ -1501,8 +1695,12 @@ class DataCollectionWorkerV5(QThread):
 
 
             self.output_dir.mkdir(parents=True, exist_ok=True)
-            screenshots_dir = self.output_dir / SCREENSHOTS_FOLDER
-            screenshots_dir.mkdir(parents=True, exist_ok=True)
+            # The per-recording sub-folders are created inside the loop, once the
+            # stem is known; only the two roots are made here.
+            screenshots_root = self.output_dir / SCREENSHOTS_FOLDER
+            screenshots_root.mkdir(parents=True, exist_ok=True)
+            csvs_root = self.output_dir / CSVS_FOLDER
+            csvs_root.mkdir(parents=True, exist_ok=True)
 
             for file_idx, paudio_file in enumerate(self.file_list):
                 if self._stop_requested:
@@ -1545,8 +1743,9 @@ class DataCollectionWorkerV5(QThread):
                     ## CSV ##
                     # Write CSV immediately — pure file I/O, safe in background thread.
                     # Does NOT depend on screenshots, so we don't need to wait for rendering.
-                    csv_filename = f"{paudio_file.stem}_candidates.csv"
-                    csv_path = self.output_dir / csv_filename
+                    csv_dir = csvs_root / paudio_file.stem
+                    csv_dir.mkdir(parents=True, exist_ok=True)
+                    csv_path = csv_dir / f"{paudio_file.stem}_candidates.csv"
                     _write_csv_for_file(candidates, csv_path)
                     self.file_complete.emit(paudio_file.name, len(candidates), str(csv_path))
 
@@ -1561,7 +1760,10 @@ class DataCollectionWorkerV5(QThread):
                     # click. Its CSV row is still exported (census intact); the
                     # review dialog just shows it without a screenshot.
                     from core.click_pipeline_v5 import STAGE_BLOCKED_DEDUP
-                    for candidate in candidates:
+                    shots_dir = screenshots_root / paudio_file.stem
+                    shots_dir.mkdir(parents=True, exist_ok=True)
+                    n_in_file = len(candidates)
+                    for done_in_file, candidate in enumerate(candidates, start=1):
                         if self._stop_requested:
                             return
 
@@ -1573,14 +1775,15 @@ class DataCollectionWorkerV5(QThread):
                         # the screenshot up). For a confirmed click the kept
                         # candidate owns the peak, so frame_idx == canonical anyway.
                         screenshot_filename = f"{paudio_file.stem}_{candidate.frame_idx:06d}.png"
-                        screenshot_path = screenshots_dir / screenshot_filename
+                        screenshot_path = shots_dir / screenshot_filename
 
                         # Hand off to main thread — never create widgets here
                         self.candidate_ready.emit((candidate, str(screenshot_path)))
 
                         total_candidates += 1
                         self.progress_updated.emit(
-                            file_idx, len(self.file_list), len(candidates), total_candidates
+                            file_idx, len(self.file_list),
+                            done_in_file, n_in_file, total_candidates
                         )
 
                 except Exception as e:
@@ -2428,20 +2631,27 @@ class DataCollectionDialogV5(QDialog):
             self._log("Cancelled.")
         self._reset_ui()
     
-    def _on_progress_updated(self, file_idx: int, total_files: int, candidates_found: int, total_candidates: int):
-        """Update progress bar and label during candidate processing phase."""
-        # Each file occupies an equal share of 0-100 %. Within that share,
-        # the first half was used for loading (via _on_load_progress) and the
-        # second half for candidate processing.  Here we move to the midpoint
-        # so the bar never jumps backwards.
-        if total_files > 0:
-            file_share = 100.0 / total_files
-            pct = int(file_idx * file_share + file_share * 0.5)
-        else:
-            pct = 0
-        self.progress_bar.setValue(pct)
+    def _on_progress_updated(self, file_idx: int, total_files: int,
+                             done_in_file: int, n_in_file: int,
+                             total_candidates: int):
+        """
+        Update progress bar and label during the screenshot phase.
+
+        Each file owns an equal share of 0-100 %: loading fills the first half of
+        that share, screenshot rendering the second. This used to set the share's
+        MIDPOINT on every emit regardless of how many candidates had been rendered,
+        so on a single file the bar sat at 50 % for the whole phase and then jumped
+        to 100 — which is what made the number read as half the real progress.
+        """
+        if total_files <= 0:
+            return
+        file_share = 100.0 / total_files
+        frac = (done_in_file / n_in_file) if n_in_file > 0 else 1.0
+        pct = int(file_idx * file_share + file_share * (0.5 + 0.5 * frac))
+        self.progress_bar.setValue(min(100, pct))
         self.label_progress.setText(
-            f"Processing file {file_idx + 1}/{total_files}  |  Candidates so far: {total_candidates}"
+            f"Rendering file {file_idx + 1}/{total_files}: "
+            f"{done_in_file}/{n_in_file}  |  Candidates so far: {total_candidates}"
         )
 
     def _on_load_progress(self, file_idx: int, total_files: int, pct_in_file: int):
@@ -2450,8 +2660,13 @@ class DataCollectionDialogV5(QDialog):
 
         AudioLoadWorker reports 0-100 % internally as it reads and processes
         the .paudio file. We scale that into each file's share of the total
-        progress bar (first half of that share, 0-50 %), so the bar moves
+        progress bar (first half of that share), so the bar moves
         smoothly during what would otherwise be a frozen UI.
+
+        The bar therefore reads HALF of pct_in_file while a single file loads, and
+        that is correct rather than the bug it resembles: loading is half the work
+        and _on_progress_updated fills the rest. The label names the phase so the
+        two numbers cannot be mistaken for one another.
         """
         if total_files > 0:
             file_share = 100.0 / total_files
@@ -2462,7 +2677,7 @@ class DataCollectionDialogV5(QDialog):
        # print(f"Load progress for file {file_idx + 1}/{total_files}: {pct_in_file}% → overall {pct}%")
         self.progress_bar.setValue(pct)
         self.label_progress.setText(
-            f"Loading file {file_idx + 1}/{total_files}: {pct_in_file}%"
+            f"Loading file {file_idx + 1}/{total_files}: {pct_in_file}% loaded "
         )
 
     def _on_screenshot_saved(self, filepath: str):

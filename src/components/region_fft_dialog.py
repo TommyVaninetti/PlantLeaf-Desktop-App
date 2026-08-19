@@ -626,7 +626,17 @@ class RegionFFTDialog(QDialog):
                      f"  ·  novelty <b>{_f('shape_novelty', '.3f')}</b>"
                      f"  ·  tilt {_f('spectral_tilt', '+.3f')} dB/kHz"
                      f"  ·  f_50 {_fmt_hz(v.get('f_50_hz', float('nan')))}"
-                     f"  ·  IQR_f {_fmt_hz(v.get('IQR_f', float('nan')))}")
+                     f"  ·  IQR_f {_fmt_hz(v.get('IQR_f', float('nan')))}"
+                     # The rest of the v6 set, so this dialog shows the same
+                     # numbers the CSV carries rather than a subset of them.
+                     # `local_crest` is deliberately absent: it is a property of
+                     # the frame's NEIGHBOURHOOD in the energy series, not of the
+                     # region, and cannot be computed from a region in isolation.
+                     "<br>"
+                     f"t_conc <b>{_f('temporal_concentration', '.3f')}</b>"
+                     f"  ·  FPE_region {_fmt_hz(v.get('FPE_hz_region', float('nan')))}"
+                     f"  ·  SPR_region {_f('SPR_region', '.2f')}"
+                     f"  ·  n_seg {v.get('n_seg', 0)}")
             # §4.3: below V6_MIN_NSEG the bands stop being independent and entropy
             # is biased optimistically toward 1. That has to be visible, not absorbed.
             if not v.get('n_seg_valid', 1):

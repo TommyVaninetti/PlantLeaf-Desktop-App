@@ -451,10 +451,31 @@ V6_N_BANDS = 12
 V6_TILT_SPLIT_HZ = 50_000.0
 
 #: Below this segment length the bands are no longer independent (§4.3):
-#:     Δf = NENBW(Tukey α=0.25) · fs / n_seg ≤ 5 kHz,  NENBW ≈ 1.104
-#: ⇒ n_seg ≥ 1.104 · 200000 / 5000 ≈ 45 samples (0.225 ms).
-#: Entropy is biased optimistically (toward 1) below it. Do NOT special-case such
-#: events away — record n_seg alongside every feature and flag them.
+#:     Δf = NENBW(Tukey α=0.25) · fs / n_seg ≤ 5 kHz   (one band width)
+#:
+#: VERIFIED against _tukey() itself rather than the spec's round number, because
+#: NENBW depends on n and the spec quoted a single value (≈1.104, elsewhere ≈1.12)
+#: for all of them. Measured on this module's own taper:
+#:
+#:     n_seg    NENBW    Δf
+#:        40   1.1102   5.551 kHz   correlated
+#:        44   1.1198   5.090 kHz   correlated
+#:        45   1.1169   4.964 kHz   independent  <- the threshold, and it is exact
+#:        58   1.1194   3.860 kHz   independent
+#:
+#: 45 is the smallest n_seg meeting the criterion, so the constant is right — but
+#: it is right by 0.7 %, not by a wide margin, and it is a CONVENTION (Δf ≤ exactly
+#: one band) rather than a physical edge. Nothing changes character at n_seg = 44.
+#:
+#: Note scipy.signal.windows.tukey uses a slightly different convention and puts
+#: the threshold at 46; do not "check" this constant against scipy and conclude the
+#: code is off by one. verify_short_region_bias_v6.py pins the values above.
+#:
+#: Entropy is biased optimistically (toward 1) below it — a spectrum smeared across
+#: correlated bands looks flatter than it is, and flat is maximum entropy. Do NOT
+#: special-case such events away: record n_seg alongside every feature and flag them.
+#: NOT YET VALIDATED against labels — spec §4.3 asks for corr(spectral_entropy,
+#: n_seg) on the labelled set, which needs Phase 3.
 V6_MIN_NSEG = 45
 
 
@@ -1353,6 +1374,100 @@ def _self_test() -> int:
     except Exception as e:                                # noqa: BLE001
         check("empty / all-zero v6 inputs handled", False, repr(e))
 
+    # ── harmonic_confinement (HARMONIC_CONFINEMENT_FEATURE_SPEC.md) ──────────
+    print("\n11. harmonic_confinement")
+    K0, NB, NF = 51, 154, 512
+    DF = fs / NF
+
+    def _hc(P, N_):
+        return harmonic_confinement(P, N_, fs=fs, n_frame=NF, k0=K0)
+
+    def _bin(f):
+        return int(round(f / DF)) - K0
+
+    # parabolic interpolation, on a synthetic peak whose true location is known
+    y = np.array([0.0, 1.0, 4.0, 3.0, 0.0])
+    off = parabolic_peak_offset(y, 2)
+    check("parabolic offset lands between the neighbours", -0.5 <= off <= 0.5,
+          f"{off:+.4f}")
+    check("symmetric peak has zero offset",
+          abs(parabolic_peak_offset(np.array([0., 1., 2., 1., 0.]), 2)) < 1e-12)
+    check("edge index returns 0.0, never an IndexError",
+          parabolic_peak_offset(y, 0) == 0.0 and parabolic_peak_offset(y, 4) == 0.0)
+    check("collinear points return 0.0, not a division blow-up",
+          parabolic_peak_offset(np.array([1., 1., 1.]), 1) == 0.0)
+
+    noise = np.full(NB, 1e-9)
+
+    # (a) uniform excess -> r = 1 in both bands -> the feature is exactly 0
+    flat = noise + 1e-6
+    r = _hc(flat, noise)
+    check("uniform excess gives harmonic_confinement == 0 (the null)",
+          abs(r['harmonic_confinement']) < 1e-9,
+          f"hc={r['harmonic_confinement']:.3e} r_A={r['r_A']:.4f} r_B={r['r_B']:.4f}")
+
+    # (b) a 40 kHz + 80 kHz pair -> both bands confined -> hc >> 0
+    pair = noise.copy()
+    pair[_bin(40_000)] += 1e-4
+    pair[_bin(79_300)] += 1e-4          # inside the clipped band B
+    r = _hc(pair, noise)
+    # CEILING, worth knowing before reading any histogram: with ALL the excess in
+    # the two bands, min(r_A, r_B) is maximised by splitting it 2/3 A : 1/3 B,
+    # giving r = 154/15 = 10.27 and hc = 3.36. hc is bounded above by ~3.4 BY
+    # CONSTRUCTION, not by the data. An even split scores lower still (~2.9).
+    check("a 40/80 kHz harmonic pair scores high",
+          r['harmonic_confinement'] > 2.5,
+          f"hc={r['harmonic_confinement']:.2f} r_A={r['r_A']:.1f} r_B={r['r_B']:.1f} "
+          f"(construction ceiling is 3.36)")
+
+    # (c) THE POINT OF min(): a lone 40 kHz hum must NOT score like a pair.
+    # Given a realistic floor of broadband excess, so band B is small but non-zero.
+    rng_hc = np.random.default_rng(4)
+    base = noise + 2e-8 * rng_hc.random(NB)
+    hum = base.copy()
+    hum[_bin(40_000)] += 1e-4
+    r_hum = _hc(hum, noise)
+    check("a LONE 40 kHz tone stays near the null — this is why min(), not mean",
+          r_hum['harmonic_confinement'] < 0.5 < r['harmonic_confinement'],
+          f"lone hc={r_hum['harmonic_confinement']:+.2f} vs pair {r['harmonic_confinement']:+.2f}")
+    check("...and it is band B that stays flat, not band A",
+          r_hum['r_A'] > 5.0 and r_hum['r_B'] < 2.0,
+          f"r_A={r_hum['r_A']:.1f} r_B={r_hum['r_B']:.2f}")
+
+    # (c2) The degenerate version of the same case: band B holds EXACTLY zero
+    # excess, so min(r) == 0 and log2 is -inf. That is a real measurement — the
+    # strongest possible evidence AGAINST a harmonic pair — not a failure to
+    # measure, but -inf would poison any downstream scaler or mean. It is reported
+    # as NaN with r_A / r_B intact, so the case stays fully recoverable.
+    hum0 = noise.copy()
+    hum0[_bin(40_000)] += 1e-4
+    r_h0 = _hc(hum0, noise)
+    check("exactly-zero excess in band B -> NaN, never -inf",
+          np.isnan(r_h0['harmonic_confinement']),
+          f"r_A={r_h0['r_A']:.1f} r_B={r_h0['r_B']:.3f}")
+    check("...and r_A / r_B still distinguish it from a genuinely undefined row",
+          np.isfinite(r_h0['r_A']) and r_h0['r_B'] == 0.0)
+
+    # (d) the fundamental is found off-grid: 40 kHz is bin 102.4, never on-bin
+    check("f1 is located near the true tone", abs(r['f1_hz'] - 40_000) < DF,
+          f"f1={r['f1_hz']:.1f} Hz (bin grid is {DF:.3f} Hz)")
+
+    # (e) guards
+    check("all-zero excess returns NaN, not inf",
+          np.isnan(_hc(noise, noise)['harmonic_confinement']))
+    check("mismatched lengths return NaN rather than broadcasting",
+          np.isnan(harmonic_confinement(np.ones(10), np.ones(154))['harmonic_confinement']))
+
+    # (f) the top-edge limit is REAL and must be reported, not hidden
+    hi = noise.copy()
+    hi[_bin(42_000)] += 1e-4
+    r_hi = _hc(hi, noise)
+    check(f"f1 above {HC_F1_MAX_OBSERVABLE_HZ:.0f} Hz -> NaN (2nd harmonic not transmitted)",
+          np.isnan(r_hi['harmonic_confinement']) and r_hi['f1_hz'] > HC_F1_MAX_OBSERVABLE_HZ,
+          f"f1={r_hi['f1_hz']:.0f} Hz")
+    check("...and f1_hz is still reported, so the NaN's CAUSE is recoverable",
+          np.isfinite(r_hi['f1_hz']))
+
     print(f"\n{'ALL PASSED' if not fails else 'FAILED: ' + ', '.join(fails)}\n")
     return 0 if not fails else 1
 
@@ -1366,6 +1481,183 @@ def _raises(fn, exc) -> bool:
     except Exception:                                     # noqa: BLE001
         return False
     return False
+
+
+# =============================================================================
+# harmonic_confinement  (HARMONIC_CONFINEMENT_FEATURE_SPEC.md)
+# =============================================================================
+
+#: Search window for the fundamental (spec §2.2). Fixed 40 kHz is a prior, not a
+#: certainty: device tolerance is ±1 kHz and the resonance drifts with temperature.
+HC_F1_SEARCH_HZ    = (36_000.0, 44_000.0)
+
+#: Half-width of both test bands (spec §2.3). From the transducer linewidth
+#: f0/Q with Q ~ 20-40 => 1-2 kHz, NOT fitted to this dataset.
+HC_BAND_HALFWIDTH_HZ = 2_000.0
+
+#: Highest transmitted bin centre: bin 204 x 390.625 Hz. The second harmonic of a
+#: 40 kHz fundamental sits at 80 kHz, which is PAST this — only its lower skirt is
+#: ever observable, so band B is clipped here and is at most ~5 bins wide.
+HC_BAND_HI_EDGE_HZ = 79_687.5
+
+#: Above this fundamental, band B is clipped away ENTIRELY and the feature is
+#: undefined: 2*f1 - halfwidth > HC_BAND_HI_EDGE_HZ. Derived, not chosen.
+HC_F1_MAX_OBSERVABLE_HZ = (HC_BAND_HI_EDGE_HZ + HC_BAND_HALFWIDTH_HZ) / 2.0
+
+
+def parabolic_peak_offset(y: np.ndarray, i: int) -> float:
+    """
+    Sub-bin offset of a peak at integer index `i`, by three-point parabola.
+
+        delta = 0.5 * (y[i-1] - y[i+1]) / (y[i-1] - 2*y[i] + y[i+1])
+
+    Returns a value in [-0.5, +0.5]; 0.0 at an array edge or when the three
+    points are collinear (zero denominator), which is the honest answer rather
+    than a division blow-up.
+
+    ⚠️ THIS IS NEW CODE, NOT A REUSED HELPER, AND THE SPEC SAYS OTHERWISE.
+    HARMONIC_CONFINEMENT_FEATURE_SPEC.md §2.2/§3 both say to reuse "whatever
+    sub-bin parabolic interpolation helper already backs FPE_hz on E[k]". No such
+    helper exists: FPE_hz on the region excess spectrum is a plain argmax
+    (v6_spectral_features, the `out['FPE_hz']` line), with no sub-bin refinement.
+    So §2.2's argument — "parabolic interpolation is required here for the same
+    reason it is required for FPE_hz" — rests on a premise that is not true of the
+    code. The interpolation is still worth doing HERE, because this feature
+    locates a narrow tone against a 390.625 Hz grid and then derives two bands
+    from it, so a half-bin error moves both band edges. Retrofitting it into
+    FPE_hz would change an existing feature's values and is deliberately NOT done.
+
+    Interpolation is on the values as given (linear PSD), not on a log transform.
+    A log parabola is the better estimator for a Gaussian-windowed peak; the
+    frames here are rectangular-windowed, and the spec fixes neither, so the
+    simpler choice is taken and stated rather than left implicit.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    if i <= 0 or i >= len(y) - 1:
+        return 0.0
+    a, b, c = y[i - 1], y[i], y[i + 1]
+    denom = a - 2.0 * b + c
+    if denom == 0.0 or not np.isfinite(denom):
+        return 0.0
+    d = 0.5 * (a - c) / denom
+    if not np.isfinite(d):
+        return 0.0
+    return float(np.clip(d, -0.5, 0.5))
+
+
+def _bins_in_range(lo_hz: float, hi_hz: float, k0: int, n_bins: int,
+                   df: float) -> np.ndarray:
+    """Indices into the band array whose bin CENTRE lies in [lo_hz, hi_hz]."""
+    if not (np.isfinite(lo_hz) and np.isfinite(hi_hz)) or hi_hz < lo_hz:
+        return np.empty(0, dtype=int)
+    j = np.arange(n_bins)
+    f = (j + k0) * df
+    return j[(f >= lo_hz) & (f <= hi_hz)]
+
+
+def harmonic_confinement(P_frame: np.ndarray,
+                         P_noise: np.ndarray,
+                         fs: float = 200_000.0,
+                         n_frame: int = 512,
+                         k0: int = 51,
+                         f1_search: tuple = HC_F1_SEARCH_HZ,
+                         band_halfwidth: float = HC_BAND_HALFWIDTH_HZ,
+                         band_hi_edge: float = HC_BAND_HI_EDGE_HZ) -> dict:
+    """
+    Is this frame's NEW energy confined to a harmonic pair (f1, 2*f1)?
+
+    Targets persistent artificial ultrasonic sources — ranging sensors, alarms —
+    whose fundamental sits near 40 kHz with a second harmonic near 80 kHz.
+
+    Returns {'f1_hz', 'r_A', 'r_B', 'harmonic_confinement'}; every value NaN when
+    the feature is undefined.
+
+    WHY THE EXCESS SPECTRUM AND NOT THE RAW ONE
+    Buffer 3 correctly absorbs a STATIONARY tone into P_noise[k]. In a
+    tone-contaminated session essentially every frame — genuine clicks included —
+    carries the tone in its raw spectrum, so a raw-spectrum test would reject real
+    clicks precisely in the sessions where the interferer lives. The only
+    discriminating question is whether this frame's *excess* sits at the harmonic
+    pair or is spread across the band.
+
+    WHY min(r_A, r_B) AND NOT mean OR sum
+    It encodes "both bands at once" without an AND-gate. A lone 40 kHz hum with
+    nothing at 80 kHz gives a large r_A but r_B ~ 1, so min stays near 1 and the
+    feature stays near 0. It rises only when both are confined together — the
+    harmonic-pair structure specifically. Generic narrowbandness is already
+    spectral_entropy's job.
+
+    WHY log2
+    The null is exactly 0 whatever n_A / n_B happen to be after the top-edge clip.
+
+    ⚠️ FRAME DOMAIN, AND NO TAPER CORRECTION — both deliberate.
+    P_frame must be built from the TRANSMITTED, mic-normalised magnitudes
+    (`fft_norm[51:205]`), which is exactly what Buffer 3 is fed. Both sides are
+    then untapered and on the same 154-bin grid, so this is a same-units
+    subtraction with no conversion step. Do NOT apply analysis_band_taper() here:
+    that correction exists for the REGION spectrum, which comes from the
+    reconstructed signal and therefore carries the taper. Applying it here would
+    introduce the very correction factor the frame domain was chosen to avoid.
+    """
+    P_frame = np.asarray(P_frame, dtype=np.float64)
+    P_noise = np.asarray(P_noise, dtype=np.float64)
+    out = {'f1_hz': float('nan'), 'r_A': float('nan'),
+           'r_B': float('nan'), 'harmonic_confinement': float('nan')}
+    if P_frame.shape != P_noise.shape or P_frame.size == 0:
+        return out
+
+    n_bins = P_frame.size
+    df = float(fs) / float(n_frame)
+
+    E = np.maximum(0.0, P_frame - P_noise)
+    E_total = float(E.sum())
+    # Spec §2.6: guard explicitly rather than let a near-zero denominator produce
+    # inf/NaN silently downstream.
+    if not np.isfinite(E_total) or E_total <= 0.0:
+        return out
+
+    # ── locate the fundamental, sub-bin ──────────────────────────────────────
+    lo = int(np.ceil(f1_search[0] / df)) - k0
+    hi = int(np.floor(f1_search[1] / df)) - k0
+    lo = max(0, min(lo, n_bins - 1))
+    hi = max(0, min(hi, n_bins - 1))
+    if hi < lo:
+        return out
+    i_max = int(np.argmax(E[lo:hi + 1])) + lo
+    f1_hz = (i_max + parabolic_peak_offset(E, i_max) + k0) * df
+    out['f1_hz'] = float(f1_hz)
+
+    # ── band A: the fundamental ──────────────────────────────────────────────
+    idx_A = _bins_in_range(f1_hz - band_halfwidth, f1_hz + band_halfwidth,
+                           k0, n_bins, df)
+    # ── band B: the second harmonic, clipped at the top of the transmitted range
+    idx_B = _bins_in_range(max(2.0 * f1_hz - band_halfwidth, k0 * df),
+                           min(2.0 * f1_hz + band_halfwidth, band_hi_edge),
+                           k0, n_bins, df)
+    n_A, n_B = len(idx_A), len(idx_B)
+    if n_A == 0 or n_B == 0:
+        # n_B == 0 whenever f1 > HC_F1_MAX_OBSERVABLE_HZ: the harmonic is entirely
+        # outside the transmitted range, so there is nothing to measure. NaN is the
+        # honest result — see the note on that constant.
+        return out
+
+    q_A = float(E[idx_A].sum()) / E_total
+    q_B = float(E[idx_B].sum()) / E_total
+    # Each band is normalised by ITS OWN null — the share a uniform excess would
+    # put there — so r = 1 means "no more concentrated than uniform", for a
+    # genuine broadband click as much as for a flat ambient excursion.
+    r_A = q_A / (n_A / n_bins)
+    r_B = q_B / (n_B / n_bins)
+    out['r_A'], out['r_B'] = float(r_A), float(r_B)
+
+    m = min(r_A, r_B)
+    out['harmonic_confinement'] = float(np.log2(m)) if m > 0.0 else float('-inf')
+    if not np.isfinite(out['harmonic_confinement']):
+        # m == 0 means one band holds NO excess at all: maximally UNconfined.
+        # -inf would poison any downstream mean/scaler, so it is reported as NaN
+        # and the row is distinguishable via r_A / r_B, which are still exported.
+        out['harmonic_confinement'] = float('nan')
+    return out
 
 
 if __name__ == '__main__':

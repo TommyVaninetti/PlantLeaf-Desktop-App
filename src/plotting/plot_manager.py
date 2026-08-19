@@ -45,18 +45,73 @@ import pyqtgraph as pg
 import numpy as np
 from PySide6.QtGui import QFont
 
+class TimeAxisItem(pg.AxisItem):
+    """
+    A bottom axis that prints recording position as H:MM:SS.ss instead of seconds.
+
+    pyqtgraph applies SI prefixes to any axis given a unit, so an axis in seconds
+    labels a 110-minute recording in **kiloseconds** ("2 ks", "4 ks"). That is
+    correct SI and useless for finding a click: it cannot be compared against the
+    playback clock, the click table, or a screenshot filename, all of which are
+    H:MM:SS.ss.
+
+    Resolution is chosen from the tick SPACING, not fixed, because the same axis
+    class serves both the overview (tick every few minutes — seconds are noise)
+    and the iFFT tab (tick every few milliseconds — a frame is 2.56 ms and two
+    decimals would collapse adjacent ticks to the same string).
+    """
+
+    def tickStrings(self, values, scale, spacing):
+        if spacing >= 60.0:
+            dec = 0
+        elif spacing >= 1.0:
+            dec = 0
+        elif spacing >= 0.01:
+            dec = 2
+        else:
+            dec = 3
+
+        out = []
+        for v in values:
+            try:
+                total = float(v)
+            except (TypeError, ValueError):
+                out.append(""); continue
+            sign = "-" if total < 0 else ""
+            total = abs(total)
+            hours, rem = divmod(total, 3600.0)
+            minutes, secs = divmod(rem, 60.0)
+            # Guard the 59.995 -> "60.00" carry that would print 0:01:60.00
+            if round(secs, dec) >= 60.0:
+                secs = 0.0
+                minutes += 1
+                if minutes >= 60:
+                    minutes = 0
+                    hours += 1
+            width = 2 if dec == 0 else dec + 3
+            out.append(f"{sign}{int(hours)}:{int(minutes):02d}:{secs:0{width}.{dec}f}")
+        return out
+
+
 class BasePlotWidget(QWidget):
     def __init__(self, x_label: str, y_label: str,
                  x_range: tuple, y_range: tuple,
                  x_min=None, x_max=None, y_min=None, y_max=None,
                  unit_x=None, unit_y=None,
-                 parent=None):
+                 parent=None, x_axis_item=None):
         super().__init__(parent)
 
-        self.plot_widget = pg.PlotWidget()
+        # A custom bottom axis has to be handed to the PlotWidget at construction;
+        # pyqtgraph does not support swapping it afterwards.
+        self.plot_widget = (pg.PlotWidget(axisItems={'bottom': x_axis_item})
+                            if x_axis_item is not None else pg.PlotWidget())
 
         # Impostazioni di stile
         self.set_x_label(x_label, unit_x)
+        if x_axis_item is not None:
+            # setLabel with units turns SI prefixing back on, which is the whole
+            # thing the custom axis exists to defeat.
+            x_axis_item.enableAutoSIPrefix(False)
         self.set_y_label(y_label, unit_y)
         self.set_x_range(*x_range)
         self.set_y_range(*y_range)

@@ -38,7 +38,7 @@ from PySide6.QtGui import QAction, QFont, QColor
 from PySide6 import QtCore
 
 from core.replay_base_window import ReplayBaseWindow
-from plotting.plot_manager import BasePlotWidget
+from plotting.plot_manager import BasePlotWidget, TimeAxisItem
 from core.audio_trim_export import AudioTrimExporter
 from core.click_pipeline_v5 import (
     reconstruct_frame_v5,
@@ -348,11 +348,15 @@ class IFFTWindow(QDialog):
         y_peak *= 1.25   # margine
 
         # Crea il widget del grafico con il range corretto e auto-range per l'asse Y
+        # unit_x is deliberately None: a seconds unit makes pyqtgraph print
+        # kiloseconds on a long recording. TimeAxisItem prints H:MM:SS.ss instead,
+        # matching the playback clock and the click table.
         self.plot_widget = BasePlotWidget(
-            x_label="Time", y_label="Amplitude",
+            x_label="Time (h:mm:ss)", y_label="Amplitude",
             x_range=(x_min_val, x_max_val), y_range=(-y_peak, y_peak),
             x_min=x_min_val, x_max=x_max_val, y_min=-1.7, y_max=1.7,
-            unit_x="s", unit_y="V", parent=self
+            unit_x=None, unit_y="V", parent=self,
+            x_axis_item=TimeAxisItem(orientation='bottom')
         )
         
         # ✅ COLORE DAL TEMA (accent color)
@@ -1891,10 +1895,11 @@ class ReplayWindowAudio(ReplayBaseWindow):
         time_layout.addWidget(self.time_info_label)
         
         self.plot_widget_time = BasePlotWidget(
-            x_label="Time", y_label="Mean FFT Energy",
+            x_label="Time (h:mm:ss)", y_label="Mean FFT Energy",
             x_range=(0, 20), y_range=(0.00000005, 0.0000002),
             x_min=0, x_max=None, y_min=0, y_max=1e-4,
-            unit_x="s", unit_y="V²", parent=self
+            unit_x=None, unit_y="V²", parent=self,
+            x_axis_item=TimeAxisItem(orientation='bottom')
         )
         
         self.time_curve = self.plot_widget_time.plot_widget.plot(
@@ -2585,34 +2590,76 @@ class ReplayWindowAudio(ReplayBaseWindow):
 
         try:
             import csv
-            from components.data_collection_dialog_v5 import CSV_COLUMNS, FEATURE_NAMES
+            from components.data_collection_dialog_v5 import (
+                CSV_COLUMNS, CandidateData, FEATURE_NAMES, FEATURE_NAMES_V6,
+                QUALITY_COLUMNS, STAGE1_COLUMNS, HARMONIC_COLUMNS,
+            )
+            from core.click_pipeline_v5 import (
+                STAGE1_MODE, PEAK_REFRACTORY_R, LOCAL_CREST_C,
+            )
+
+            k_used = self.PeakThresholdSpinBox.value()
+            stage1_params = (f'{STAGE1_MODE};k={k_used:.2f};'
+                             f'R={PEAK_REFRACTORY_R};C={LOCAL_CREST_C}')
+
+            # Build a real CandidateData and let IT write the row.
+            #
+            # This exporter used to assemble the dict by hand, listing the columns it
+            # knew about. The header came from CSV_COLUMNS, so when the schema grew
+            # from 24 to 52 the header grew with it and the hand-written body did not:
+            # the v6 features, the quality flags and the Stage 1 diagnostics were
+            # emitted as ~24 permanently empty columns, silently. Going through
+            # to_csv_dict() means there is ONE row writer for both exporters — same
+            # columns, same per-column rounding, same NaN handling — and a column
+            # added later cannot be forgotten here.
+            def _f(det, name, default=float('nan')):
+                v = det.get(name, default)
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return default
+
+            def _i(det, name, default=0):
+                try:
+                    return int(det.get(name, default))
+                except (TypeError, ValueError):
+                    return default
 
             with open(path, 'w', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
                 writer.writeheader()
 
                 for det in rows:
-                    row = {
-                        'file': stem,
-                        'frame_idx': det.get('frame_idx', ''),
-                        'timestamp_s': round(det.get('timestamp_s', 0.0), 6),
-                        'noise_floor_mV': round(det.get('noise_floor', 0.0) * 1e3, 4),
-                        'std_noise_mV': round(det.get('std_noise', 0.0) * 1e3, 4),
-                        'E_hat_floor': round(det.get('E_hat_floor', 0.0), 6),
-                        'label': '',
-                        'svm_probability': (
-                            round(det['svm_probability'], 4)
-                            if det.get('svm_probability') is not None else ''
-                        ),
-                        'svm_prediction': (
-                            det['svm_prediction']
-                            if det.get('svm_prediction') is not None else ''
-                        ),
-                        'stage_blocked': det.get('stage_blocked', ''),
-                    }
-                    for name in FEATURE_NAMES:
-                        row[name] = det.get(name, '')
-                    writer.writerow(row)
+                    e_i, e_fl = det.get('E_i'), det.get('E_hat_floor')
+                    k_ratio = (float(e_i) / float(e_fl)
+                               if e_i is not None and e_fl else float('nan'))
+
+                    cd = CandidateData(
+                        file=stem,
+                        frame_idx=_i(det, 'frame_idx'),
+                        timestamp_s=_f(det, 'timestamp_s', 0.0),
+                        noise_floor=_f(det, 'noise_floor', 0.0),
+                        std_noise=_f(det, 'std_noise', 0.0),
+                        E_hat_floor=_f(det, 'E_hat_floor', 0.0),
+                        **{n: _f(det, n) for n in FEATURE_NAMES},
+                        **{n: _f(det, n) for n in FEATURE_NAMES_V6},
+                        **{n: _f(det, n) for n in HARMONIC_COLUMNS},
+                        **{n: _i(det, n) for n in QUALITY_COLUMNS},
+                        peak_abs=_i(det, 'peak_abs'),
+                        canonical_frame_idx=_i(det, 'canonical_frame_idx'),
+                        session_id=stem,
+                        stage1_params=stage1_params,
+                        k_ratio=k_ratio,
+                        run_id=_i(det, 'run_id', -1),
+                        run_length=_i(det, 'run_length'),
+                        run_crest=_f(det, 'run_crest'),
+                        pos_in_run=_i(det, 'pos_in_run'),
+                        would_pass_v5=_i(det, 'would_pass_v5'),
+                        svm_probability=det.get('svm_probability'),
+                        svm_prediction=det.get('svm_prediction'),
+                        stage_blocked=det.get('stage_blocked', ''),
+                    )
+                    writer.writerow(cd.to_csv_dict())
 
             QMessageBox.information(
                 self, "Exported", f"{len(rows)} row(s) written to:\n{path}"

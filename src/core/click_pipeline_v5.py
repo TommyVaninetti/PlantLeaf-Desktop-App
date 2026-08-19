@@ -107,10 +107,64 @@ _BIN_END       = int(BIN_END_HZ   / _BIN_FREQ)  # Last  bin index (inclusive)
 _K_BINS        = _BIN_END - _BIN_START + 1      # Number of analysis bins (= 154)
 
 # STAGE 1 (§5)
-MAX_RUN          = 3    # Maximum run length of consecutive above-threshold frames.
-                        # Runs longer than this are discarded as sustained noise.
-                        # A genuine cavitation click lasts ≤ 0.5 ms ≈ 1–2 frames;
-                        # a run of 4+ frames (≥10.24 ms) is virtually always noise.
+MAX_RUN          = 3    # ⚠️ SUPERSEDED as a rejection rule by STAGE1_MODE_V51.
+                        # Retained ONLY to (a) drive the legacy v5_runlength mode
+                        # and (b) compute `would_pass_v5`, the per-candidate flag
+                        # that makes the v5 → v5.1 delta computable from a single
+                        # export instead of by diffing two runs (D6).
+                        # Historical meaning: runs longer than this were discarded
+                        # wholesale as sustained noise.
+# ── Stage 1 v5.1 — local peak picking (STAGE1_PEAKPICK_v5.1_SPEC.md) ────────
+# Replaces run-length REJECTION with local peak SELECTION. The v5 rule discarded
+# an entire run of >MAX_RUN above-threshold frames as "sustained noise", which
+# deletes any click that happened to land inside one: the physical argument
+# ("a click cannot span 4+ frames") is about the CLICK, but the filter applied it
+# to the RUN — a property of the acoustic neighbourhood the click landed in.
+# A click is not made less impulsive by something else being audible 30 ms away.
+#
+# Measured on this corpus: the filter drops 45-53 % of above-threshold frames in
+# mechanical-stimulus recordings and 0 % in empty-room ones. A filter removing
+# noise would fire on the noise-only sessions too.
+STAGE1_MODE_V5   = 'v5_runlength'    # legacy: keep runs of length <= MAX_RUN, whole
+STAGE1_MODE_V51  = 'v51_peakpick'    # v5.1: keep local maxima, reject nothing
+STAGE1_MODE      = STAGE1_MODE_V51   # D6 — both modes must remain selectable
+
+PEAK_REFRACTORY_R = 1   # Local-maximum half-window, in frames (±2.56 ms).
+                        # Minimum separation at which two events are resolved as
+                        # distinct candidates. Bounds the candidate rate at one per
+                        # R+1 frames (~195/s at 390.6 fps) without any rejection.
+                        #
+                        # ⚠️ SET BY MEASUREMENT, not by the spec's proposed value.
+                        # The spec proposed R = 2 and §7.1 named the failure mode to
+                        # watch for: peak-picking can suppress a confirmed click that
+                        # is not a local maximum within ±R because a louder frame
+                        # sits beside it. It prescribed dropping to R = 1 if that
+                        # happened. It happened. AC-1 over all 91 confirmed clicks
+                        # in 19 recordings:
+                        #
+                        #     R = 2 : 87 / 91   FAILS
+                        #     R = 1 : 91 / 91   PASSES
+                        #
+                        # All four losses at R = 2 are the same mechanism, and it is
+                        # NOT the one the run-length filter had: the ±R window reaches
+                        # ACROSS run boundaries, because consecutive runs are separated
+                        # by at least one sub-threshold frame. Each lost click was an
+                        # isolated L = 1 run with a louder, unrelated event exactly two
+                        # frames (5.12 ms) away, so R = 2 merged two distinct events
+                        # into one. R = 1 cannot reach past the single gap frame that
+                        # separates two runs, which is why it resolves them.
+                        #
+                        # Still PROVISIONAL upward: nothing here shows R = 1 is optimal,
+                        # only that R = 2 costs confirmed clicks. Logged per candidate
+                        # in `stage1_params` so any later study can attribute results
+                        # to the value that produced them.
+
+LOCAL_CREST_C     = 10  # Local-background half-window for local_crest (±25.6 ms).
+                        # Long enough to sample background either side of a 1-2
+                        # frame event, short enough that the adaptive floor has not
+                        # meaningfully drifted.
+                        # ⚠️ PROVISIONAL, same status as PEAK_REFRACTORY_R.
+
 K_STAGE1_DEFAULT = 1.5  # Default Stage 1 threshold multiplier k.
                         # A frame is a candidate if E_i > k × Ê_floor.
                         # 1.5 casts a wide net for data collection.
@@ -129,8 +183,10 @@ STALE_FLOOR_FRAMES = SUBWINDOW_SIZE  # Consecutive burst-gated frames after whic
                                      # NOT a new tunable: it IS SUBWINDOW_SIZE (75
                                      # frames = 192 ms), the estimator's own
                                      # sub-window granularity. Chosen because it is
-                                     # 25x MAX_RUN — the longest run Stage 1 itself
-                                     # is willing to call a click — and ~12x the
+                                     # 25x MAX_RUN — the longest run the v5 Stage 1
+                                     # was willing to call a click; v5.1 no longer
+                                     # caps run length, but the SIZING argument is
+                                     # unaffected — and ~12x the
                                      # longest consecutive-burst run measured on real
                                      # stationary recordings (6 frames), so it cannot
                                      # fire on ordinary data.
@@ -982,7 +1038,7 @@ class AdaptiveNoiseEstimatorV5:
             if self._consecutive_bursts > self._max_consecutive_bursts:
                 self._max_consecutive_bursts = self._consecutive_bursts
             # STALE_FLOOR_FRAMES is SUBWINDOW_SIZE: an existing constant, 25x
-            # MAX_RUN (the longest run Stage 1 itself calls a click) and ~12x the
+            # MAX_RUN (the longest run the v5 Stage 1 called a click) and ~12x the
             # longest consecutive-burst run measured on stationary recordings, so
             # it does not chatter on ordinary data.
             if (self._consecutive_bursts == STALE_FLOOR_FRAMES
@@ -1274,6 +1330,134 @@ def compute_fft_energy(fft_magnitudes: np.ndarray) -> float:
 # STAGE 1 — Adaptive energy threshold + run-length filter
 # =============================================================================
 
+def _local_crest(E: np.ndarray, i: int, C: int = LOCAL_CREST_C) -> float:
+    """
+    local_crest(i) = E_i / median( E_j : j in [i-C, i+C] \ {i-1, i, i+1} )
+
+    How far this frame stands above its own local background — the physics the
+    run-length filter was reaching for, expressed without any of its pathologies.
+    A click is a spike against a comparatively flat background; sustained
+    mechanical noise is flat and gives ~1.
+
+    The three central frames are excluded from the background median so the event
+    itself — and any frame-boundary straddle of it — cannot inflate its own
+    reference level.
+
+    Deliberately INDEPENDENT of k and of Ê_floor. A run-based crest would inherit
+    both the threshold dependence (run length is a function of k) and the buffer
+    history dependence (the burst gate makes runs grow or self-terminate) that
+    make run length unusable as a feature — spec D5.
+
+    Returns NaN when the background median is 0 or non-finite. The spec asked for
+    a -1 sentinel; NaN is used instead to match the rest of the v6 quality-flag
+    policy (§7.5.3) — a magic in-band number silently becomes data, and the
+    imputer cannot tell it from a measurement. The spec's intent, "do not silently
+    substitute a value", is preserved.
+    """
+    lo = max(0, i - C)
+    hi = min(len(E), i + C + 1)
+    if hi - lo < 4:
+        return float('nan')
+    idx = [j for j in range(lo, hi) if j < i - 1 or j > i + 1]
+    if not idx:
+        return float('nan')
+    bg = float(np.median(E[idx]))
+    if not np.isfinite(bg) or bg <= 0.0:
+        return float('nan')
+    return float(E[i] / bg)
+
+
+def _stage1_select(E, flagged_idx, k, mode=None, R=None, C=None):
+    """
+    Turn above-threshold frames into Stage 1 candidates. THE ONLY implementation.
+
+    Both entry points (run_stage1_v5 and run_stage1_v5_precomputed) call this, and
+    so does scripts/v6/v6_diag_deadzone.py. That is not tidiness: the run-length
+    filter used to be written out three times, and this project has already been
+    bitten by two Stage-1 paths disagreeing (the raw-vs-mic-corrected E_i fix,
+    which produced 2762 vs 3879 candidates on one recording depending on which
+    path ran). One rule, one place.
+
+    Parameters
+    ----------
+    E : np.ndarray
+        Per-frame in-band FFT energy for the WHOLE recording [V²].
+    flagged_idx : sequence[int]
+        Frames satisfying E_i > k · Ê_floor(i), ascending.
+    mode : 'v51_peakpick' | 'v5_runlength'
+
+    Returns
+    -------
+    list of dict, one per candidate, carrying the §4.4 diagnostics:
+        frame_idx, run_id, run_length, run_crest, pos_in_run, local_crest,
+        would_pass_v5, group_size (legacy alias of run_length)
+
+    v5.1 rule (§4.2) — a candidate is a strict-left / non-strict-right local
+    maximum over ±R:
+
+        E_i >  E_j   for j in [i-R, i-1]
+        E_i >= E_j   for j in [i+1, i+R]
+
+    evaluated against the full energy series, not only the flagged frames: a
+    sub-threshold neighbour is by definition below a flagged frame, so including
+    it costs nothing and keeps the peak test independent of k. The asymmetry
+    resolves plateaus deterministically to the FIRST frame, guaranteeing exactly
+    one candidate per plateau.
+
+    NOTHING IS REJECTED for being in a long run. A 141 ms sustained noise burst
+    yields peaks rather than 55 candidates or zero.
+    """
+    mode = STAGE1_MODE if mode is None else mode
+    R = PEAK_REFRACTORY_R if R is None else R
+    C = LOCAL_CREST_C if C is None else C
+    E = np.asarray(E, dtype=np.float64)
+    flagged = list(flagged_idx)
+    if not flagged:
+        return []
+
+    # ── Group flagged frames into runs of consecutive indices ────────────────
+    runs, cur = [], [flagged[0]]
+    for j in range(1, len(flagged)):
+        if flagged[j] == flagged[j - 1] + 1:
+            cur.append(flagged[j])
+        else:
+            runs.append(cur)
+            cur = [flagged[j]]
+    runs.append(cur)
+
+    out = []
+    for run_id, run in enumerate(runs):
+        L = len(run)
+        med = float(np.median(E[run])) if L else 0.0
+        # would_pass_v5: exactly the v5 rule, evaluated inline so the v5 → v5.1
+        # delta is readable from ONE export rather than by diffing two runs (D6).
+        passes_v5 = (L <= MAX_RUN)
+
+        if mode == STAGE1_MODE_V5:
+            keep = list(run) if passes_v5 else []
+        else:
+            keep = []
+            for i in run:
+                if all(E[i] > E[j] for j in range(max(0, i - R), i)) and \
+                   all(E[i] >= E[j] for j in range(i + 1, min(len(E), i + R + 1))):
+                    keep.append(i)
+
+        for i in keep:
+            out.append({
+                'frame_idx'    : int(i),
+                'run_id'       : int(run_id),
+                'run_length'   : int(L),
+                'run_crest'    : float(E[i] / med) if med > 0 else float('nan'),
+                'pos_in_run'   : int(i - run[0]),
+                'local_crest'  : _local_crest(E, i, C),
+                'would_pass_v5': int(passes_v5),
+                # Legacy alias — run_length under its old name. No consumer outside
+                # this module, kept so nothing silently breaks.
+                'group_size'   : int(L),
+            })
+    return out
+
+
 def run_stage1_v5(dm, k: float = K_STAGE1_DEFAULT) -> list:
     """
     Stage 1 of the v5 click detection pipeline (§5).
@@ -1287,8 +1471,11 @@ def run_stage1_v5(dm, k: float = K_STAGE1_DEFAULT) -> list:
       3. Update the noise estimator (burst protection applied internally).
       4. Check Stage 1 criterion: E_i  >  k × Ê_floor(i).
 
-    Then apply the run-length filter: discard any run of consecutive
-    above-threshold frames longer than MAX_RUN (sustained noise, not a click).
+    Then select candidates via _stage1_select. Under the shipped
+    STAGE1_MODE_V51 that is local peak picking, which discards NOTHING for run
+    length: a long run yields its peaks rather than being deleted whole. The
+    v5 run-length filter (discard any run longer than MAX_RUN) survives only
+    under STAGE1_MODE_V5, for the frozen-reference comparison.
 
     Parameters
     ----------
@@ -1310,13 +1497,21 @@ def run_stage1_v5(dm, k: float = K_STAGE1_DEFAULT) -> list:
         'E_hat_floor' : float – Ê_floor at detection time [V²]
         'noise_floor' : float – noise_floor at detection time [V]  (for Stage 3)
         'std_noise'   : float – std_noise at detection time [V]    (for Stage 3)
-        'group_size'  : int   – run length this candidate belongs to (1 ≤ n ≤ MAX_RUN)
+        'group_size'  : int   – run length this candidate belongs to. NO LONGER
+                                bounded by MAX_RUN: under v5.1 a candidate may sit
+                                in a run of any length. Legacy alias of
+                                'run_length'; _stage1_select also returns run_id,
+                                run_crest, pos_in_run, local_crest and
+                                would_pass_v5 (§4.4).
     """
     fs       = dm.header_info.get('fs',       FS)
     fft_size = dm.header_info.get('fft_size', FFT_SIZE)
 
     estimator      = AdaptiveNoiseEstimatorV5()
-    above_threshold = []   # accumulates ALL above-threshold frames before run filter
+    above_threshold = []   # accumulates ALL above-threshold frames before selection
+    # Full per-frame energy series: the v5.1 local-maximum test compares against
+    # neighbours regardless of whether they cleared the threshold (§4.2).
+    E_series = np.zeros(dm.total_frames, dtype=np.float64)
 
     for frame_idx in range(dm.total_frames):
         fft_mags = dm.fft_data[frame_idx]
@@ -1370,6 +1565,8 @@ def run_stage1_v5(dm, k: float = K_STAGE1_DEFAULT) -> list:
 
         # GUARD: skip check if we have no floor estimate yet (very first frame
         # before any warm-up data, E_hat_floor == 0).
+        E_series[frame_idx] = E_i
+
         if E_hat_floor > 0 and E_i > k * E_hat_floor:
             above_threshold.append({
                 'frame_idx'   : frame_idx,
@@ -1382,29 +1579,11 @@ def run_stage1_v5(dm, k: float = K_STAGE1_DEFAULT) -> list:
     if not above_threshold:
         return []
 
-    # ── 4. Run-length filter ──────────────────────────────────────────────────
-    # Group consecutive above-threshold frames into runs.
-    # Two frames are consecutive if their frame indices differ by exactly 1.
-    runs    = []
-    current = [above_threshold[0]]
-
-    for i in range(1, len(above_threshold)):
-        if above_threshold[i]['frame_idx'] == above_threshold[i - 1]['frame_idx'] + 1:
-            current.append(above_threshold[i])   # extend current run
-        else:
-            runs.append(current)                  # close run, start new one
-            current = [above_threshold[i]]
-    runs.append(current)                          # close last run
-
-    # Keep only runs that are short enough to be click candidates.
-    # Tag each surviving frame with its run length for downstream use.
-    survivors = []
-    for run in runs:
-        if len(run) <= MAX_RUN:
-            for candidate in run:
-                survivors.append({**candidate, 'group_size': len(run)})
-
-    return survivors
+    # ── 4. Candidate selection (Stage 1 v5.1) ────────────────────────────────
+    # Delegated to _stage1_select — the ONLY implementation of this rule.
+    by_frame = {c['frame_idx']: c for c in above_threshold}
+    picks = _stage1_select(E_series, sorted(by_frame), k=k)
+    return [{**by_frame[p['frame_idx']], **p} for p in picks]
 
 
 # =============================================================================
@@ -2461,6 +2640,59 @@ def click_event_key(ctx: dict, resolved: dict, frame_idx: int) -> tuple:
     return int(peak_abs), int(canonical_frame_idx)
 
 
+def _feat_harmonic_confinement(
+    fft_norm:    np.ndarray,
+    p_noise_psd: Optional[np.ndarray],
+    fs:          int = FS,
+    fft_size:    int = FFT_SIZE,
+) -> dict:
+    """
+    harmonic_confinement and its parts (HARMONIC_CONFINEMENT_FEATURE_SPEC.md).
+
+    FRAME domain, deliberately, and the reasons are structural rather than a
+    fallback (spec §1):
+
+      * The region window is defined by rise/fall logic that assumes the event
+        returns to the noise floor. A sustained oscillation satisfies neither
+        condition as intended — on the motivating frame `fall_time_ms` is
+        0.0150 ms because the envelope dipped below LEVEL for four samples
+        mid-cycle, not because anything ended. The region is then a few samples
+        wide and effectively arbitrary for exactly the noise class this feature
+        is aimed at.
+      * Region resolution (~3.8 kHz) is coarser than the 1-2 kHz transducer
+        linewidth the signature lives in; it would be smeared away before it
+        could be tested.
+      * Buffer 3 is itself estimated at frame resolution over these 154 bins, so
+        staying here makes P_frame - P_noise a same-grid, same-units subtraction
+        with NO rebinning and NO taper term — avoiding the class of conversion
+        factor that produced the (N/2)^2 = 65536 PSD bug and the 256x iFFT bug.
+
+    ⚠️ NO TAPER CORRECTION HERE, and that is the opposite of _feat_v6_spectral.
+    `fft_norm` is the TRANSMITTED, mic-normalised magnitude spectrum, which is
+    exactly what Buffer 3 is fed (see AdaptiveNoiseEstimatorV5.update). Both
+    sides are untapered, so applying analysis_band_taper() — correct for the
+    region, which comes from the reconstructed signal — would be wrong here.
+
+    Returns all-NaN when Buffer 3 has no estimate yet, rather than substituting a
+    zero floor, which would make the excess equal the frame and report a
+    confident number measuring nothing.
+    """
+    sa = _spectral()
+    out = {'harmonic_confinement': float('nan'), 'hc_f1_hz': float('nan'),
+           'hc_r_A': float('nan'), 'hc_r_B': float('nan')}
+    if p_noise_psd is None:
+        return out
+    band = np.asarray(fft_norm, dtype=np.float64)[_BIN_START:_BIN_END + 1]
+    noise = np.asarray(p_noise_psd, dtype=np.float64)
+    if band.size != noise.size:
+        return out
+    p_frame = sa.psd_from_amplitude(band, fs, fft_size)
+    r = sa.harmonic_confinement(p_frame, noise, fs=fs, n_frame=fft_size,
+                                k0=_BIN_START)
+    return {'harmonic_confinement': r['harmonic_confinement'],
+            'hc_f1_hz': r['f1_hz'], 'hc_r_A': r['r_A'], 'hc_r_B': r['r_B']}
+
+
 def _feat_v6_spectral(
     ctx:         dict,
     resolved:    dict,
@@ -2686,6 +2918,11 @@ def compute_features_v5(
     # ── v6 spectral family (§5) ───────────────────────────────────────────────
     features.update(_feat_v6_spectral(ctx, resolved, p_noise_psd, freq_axis, fs))
 
+    # ── harmonic_confinement — FRAME domain, not region (its spec §1) ─────────
+    # Independent of decay_start/decay_end, the fit and Gibbs suppression, so it
+    # is computable on every candidate including fit_valid == 0 rows.
+    features.update(_feat_harmonic_confinement(fft_norm, p_noise_psd, fs, FFT_SIZE))
+
     # FFT-domain features (§8.9) — still the frame FFT (Region-FFT migration TODO)
     features.update(_feat_fft_features(fft_norm, freq_axis))
 
@@ -2857,23 +3094,12 @@ def run_stage1_v5_precomputed(dm, k: float = K_STAGE1_DEFAULT) -> list:
         for i in indices
     ]
 
-    # Run-length filter: a run longer than MAX_RUN is sustained noise, not a click.
-    runs, current = [], [above_threshold[0]]
-    for j in range(1, len(above_threshold)):
-        if above_threshold[j]['frame_idx'] == above_threshold[j - 1]['frame_idx'] + 1:
-            current.append(above_threshold[j])
-        else:
-            runs.append(current)
-            current = [above_threshold[j]]
-    runs.append(current)
-
-    candidates = []
-    for run in runs:
-        if len(run) <= MAX_RUN:
-            for entry in run:
-                candidates.append({**entry, 'group_size': len(run)})
-
-    return candidates
+    # Candidate selection (Stage 1 v5.1) — delegated to _stage1_select, which is
+    # the same code the slow path runs. `fft_means` is already the full per-frame
+    # energy series, which is exactly what the local-maximum test needs.
+    by_frame = {c['frame_idx']: c for c in above_threshold}
+    picks = _stage1_select(fft_means, sorted(by_frame), k=k)
+    return [{**by_frame[p['frame_idx']], **p} for p in picks]
 
 
 # =============================================================================

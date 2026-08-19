@@ -336,6 +336,7 @@ def replay(cp, mags, phases, header, k: float):
     estimator = cp.AdaptiveNoiseEstimatorV5()
     freq_axis = None
     above = []
+    E_series_chunks = []   # full per-frame energy, needed by the v5.1 peak test
 
     CHUNK = 8_000
     for c0 in range(0, n_frames, CHUNK):
@@ -347,6 +348,7 @@ def replay(cp, mags, phases, header, k: float):
         mu_all = np.mean(env_c, axis=1)
         sd_all = np.std(env_c, axis=1)
         del norm_c, env_c
+        E_series_chunks.append(np.asarray(E_all, dtype=np.float64).copy())
 
         for j in range(c1 - c0):
             E_i = float(E_all[j])
@@ -360,20 +362,18 @@ def replay(cp, mags, phases, header, k: float):
                     "std_noise": noise["std_noise"],
                 })
 
+    E_all_frames = (np.concatenate(E_series_chunks) if E_series_chunks
+                    else np.zeros(0))
     if not above:
         return 0, []
 
-    # Run-length filter, identical to run_stage1_v5 step 4.
-    runs, current = [], [above[0]]
-    for j in range(1, len(above)):
-        if above[j]["frame_idx"] == above[j - 1]["frame_idx"] + 1:
-            current.append(above[j])
-        else:
-            runs.append(current)
-            current = [above[j]]
-    runs.append(current)
-
-    candidates = [c for run in runs if len(run) <= cp.MAX_RUN for c in run]
+    # Candidate selection — delegated to the pipeline's OWN _stage1_select, the
+    # same function run_stage1_v5 and run_stage1_v5_precomputed call. This script
+    # used to carry a third hand-written copy of the run-length filter; once Stage 1
+    # became v5.1 that copy would silently have kept measuring the old algorithm.
+    by_frame = {c["frame_idx"]: c for c in above}
+    picks = cp._stage1_select(E_all_frames, sorted(by_frame), k=k)
+    candidates = [{**by_frame[p["frame_idx"]], **p} for p in picks]
 
     lo = len(cp._GAUSS_KERNEL)                                  # 13
     hi = len(cp._GAUSS_KERNEL) + cp.MIN_FIT_SAMPLES - 1         # 22 (exclusive)

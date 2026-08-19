@@ -146,11 +146,22 @@ def load_and_prepare(
     # Repair them here so training works regardless of how the CSV was produced.
     # v6 CSVs carry additional numeric columns; coerce them with the same
     # Italian-locale repair, but only when present so v5 CSVs still load.
+    # `n_seg_valid` is kept for development-era CSVs; the v6 schema has no such
+    # column (it is n_seg >= V6_MIN_NSEG). Every entry is guarded by
+    # `if c in df.columns` below, so listing both is harmless.
     _V6_NUMERIC = [
         'spectral_entropy', 'shape_novelty', 'spectral_tilt',
         'temporal_concentration', 'FPE_hz_region', 'SPR_region', 'f_50_hz',
         'IQR_f', 'fit_valid', 'decay_len', 'n_seg', 'n_seg_valid', 'b3_frames',
         'gibbs_fired',
+        # ── Stage 1 v5.1 ──
+        # local_crest is the one that matters: it is a MODEL feature, so an
+        # Italian-locale comma here would make it load as object dtype and crash
+        # .astype(float) exactly like the v5 features this repair exists for.
+        'local_crest', 'k_ratio',
+        'run_id', 'run_length', 'run_crest', 'pos_in_run', 'would_pass_v5',
+        # ── harmonic_confinement ──
+        'harmonic_confinement', 'hc_f1_hz', 'hc_r_A', 'hc_r_B',
     ]
     for col in FEATURE_NAMES + [c for c in _V6_NUMERIC if c in df.columns]:
         if df[col].dtype == object:
