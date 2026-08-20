@@ -680,9 +680,18 @@ class ClickReviewDialog(QDialog):
             # migrations, including outright contradictions) must be adjudicated
             # first because everything downstream inherits those decisions.
             # Unflagged rows sort last rather than being hidden.
+            #
+            # ⚠️ ASCENDING on clicklike_rank, and the sign matters. The rank is a
+            # Euclidean z-distance to the positive centroid, so SMALLER = MORE
+            # click-like (migrate_labels_v6.positive_envelope). This read
+            # `-_to_float(...)`, which put the LEAST click-like rows first — in the
+            # one queue whose whole purpose is to surface the most promising
+            # unlabelled rows. The migration writer sorts ascending
+            # (migrate_labels_v6.py, the new_rows.sort near the end); the two must
+            # agree, and verify_review_layout.py now asserts that they do.
             rows.sort(key=lambda i: (
                 _to_float(self.df.at[i, 'review_tier'], 99.0) or 99.0,
-                -_to_float(self.df.at[i, 'clicklike_rank'], 0.0)
+                _to_float(self.df.at[i, 'clicklike_rank'], 0.0)
                 if 'clicklike_rank' in self.df.columns else 0.0,
                 _to_float(self.df.at[i, 'frame_idx'], 0.0),
             ))
