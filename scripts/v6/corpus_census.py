@@ -44,12 +44,26 @@ WHAT IT REPORTS, per recording
 because fit_valid == 0 is ~76 % of the census. Both are reported so the export
 mode is chosen with the number in hand rather than at the dialog.
 
-COST
-----
-The file load dominates; once a recording is in memory the per-candidate work is
-cheap (candidates are sparse). Expect minutes per large recording. The run is
-RESUMABLE — rows are appended as each recording finishes, and a re-run skips
-whatever is already in the output CSV, so an interrupted pass costs one file.
+COST — AND WHY YOU PROBABLY WANT --from-export
+----------------------------------------------
+Measured on a 2.57 M-frame recording (1 h 50 m of audio):
+
+    load = 515.6 s        process = 0.7 s
+
+The `.paudio` load is **99.9 %** of the cost, and it is the *same* load the Data
+Collection export performs. So:
+
+  * If you have NOT exported yet and want the numbers before committing to one,
+    run the default mode. Budget ~9 minutes per hour-scale recording. It is
+    RESUMABLE — rows append as each recording finishes and a re-run skips what is
+    already in the output — so an interrupted pass costs one file.
+
+  * If you HAVE exported, use `--from-export` instead. It reads the exported CSVs
+    and is instant. Re-loading the .paudio files to count rows you already have on
+    disk is pure waste, and at corpus scale that is hours.
+
+`--stage1-only` exists but saves almost nothing, for the same reason: it skips the
+0.7 s, not the 515 s.
 """
 
 from __future__ import annotations
@@ -143,7 +157,14 @@ def _find_paudio(roots) -> list:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("roots", nargs="+", help="directories to search for .paudio")
+    ap.add_argument("roots", nargs="+",
+                    help="directories to search for .paudio — or, with "
+                         "--from-export, the export root(s) holding CSVs/<stem>/")
+    ap.add_argument("--from-export", action="store_true",
+                    help="count from ALREADY EXPORTED CSVs instead of loading the "
+                         ".paudio files. Instant. Use this whenever the export "
+                         "exists — the default mode re-does the export's own load, "
+                         "which is 99.9%% of its runtime.")
     ap.add_argument("-o", "--output", type=Path, default=Path("corpus_census.csv"))
     ap.add_argument("--old-dir", type=Path,
                     default=Path.home() / "PlantLeaf_dev/Analisi/v5/Dataset",
@@ -165,6 +186,14 @@ def main() -> int:
 
     k = args.k if args.k is not None else K_STAGE1_DEFAULT
     old = _load_old_labels(args.old_dir)
+
+    if args.from_export:
+        # Before _find_paudio: the export roots hold CSVs, not recordings, and
+        # scanning them would warn about missing .paudio that were never expected.
+        _census_from_export(args.roots, args.output, old)
+        _summarise(args.output)
+        return 0
+
     files = _find_paudio(args.roots)
     if args.limit:
         files = files[:args.limit]
@@ -243,6 +272,57 @@ def main() -> int:
     return 0
 
 
+def _census_from_export(roots, out_path: Path, old: dict) -> None:
+    """
+    Count from exported *_candidates.csv instead of re-loading the recordings.
+
+    The export already did the expensive work and wrote the answer to disk. This
+    reads `fit_valid` to split EXPORT_ALL from EXPORT_UNFILTERED — an export made
+    in EXPORT_ALL mode has fit_valid == 1 on every row, so the two columns come
+    out equal, which is correct rather than a bug.
+    """
+    seen: dict = {}
+    for root in roots:
+        for f in Path(root).rglob("*_candidates.csv"):
+            stem = f.stem.replace("_candidates", "")
+            try:
+                with open(f, encoding="utf-8-sig") as fh:
+                    rows = list(csv.DictReader(fh))
+            except OSError:
+                continue
+            if not rows:
+                continue
+            n_all = sum(1 for r in rows if (r.get("fit_valid") or "").strip() in ("1", "1.0"))
+            lab = Counter((r.get("label") or "").strip() for r in rows)
+            o = old.get(stem)
+            seen[stem] = {
+                "file": stem, "group": (o[3] if o else f.parent.parent.name),
+                "path": str(f),
+                "total_frames": "", "duration_s": "",
+                "n_unfiltered": len(rows),
+                "n_export_all": n_all or len(rows),
+                "n_confirmed": sum(1 for r in rows
+                                   if (r.get("stage_blocked") or "").strip() == ""
+                                   and (r.get("svm_prediction") or "").strip() != ""),
+                "png_mb": round((n_all or len(rows)) * PNG_KB / 1024.0, 1),
+                "old_rows": (o[0] if o else 0),
+                "old_clicks": (o[1] if o else 0),
+                "old_noise": (o[2] if o else 0),
+                "load_s": 0, "process_s": 0,
+                # Labels ALREADY made in this export, which is what you want to see
+                # while a labelling pass is in flight.
+                "note": (f"labelled {lab.get('1',0)} click / {lab.get('0',0)} noise"
+                         if (lab.get('1', 0) or lab.get('0', 0)) else ""),
+            }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=COLUMNS)
+        w.writeheader()
+        for stem in sorted(seen):
+            w.writerow(seen[stem])
+    print(f"read {len(seen)} exported recording(s) -> {out_path}")
+
+
 def _summarise(path: Path) -> None:
     """The three numbers the subset decision actually turns on."""
     with open(path, newline="") as fh:
@@ -262,16 +342,19 @@ def _summarise(path: Path) -> None:
     print(f"{len(rows)} recordings   {tot:,} rows at EXPORT_ALL   "
           f"{tot * PNG_KB / 1024 / 1024:.1f} GB of screenshots")
     print("=" * 72)
-    print("\nbiggest 12 — these are the ones to SAMPLE rather than sweep:")
-    print(f"  {'rows':>7} {'clicks':>7}  recording")
+    n_top = min(12, len(rows))
+    print(f"\nbiggest {n_top} — these are the ones to SAMPLE rather than sweep:")
+    print(f"  {'EXPORT_ALL':>10} {'unfiltered':>10} {'old clicks':>10}  recording")
     cum = 0
-    for r in rows[:12]:
+    for r in rows[:n_top]:
         cum += _i(r, "n_export_all")
-        print(f"  {_i(r,'n_export_all'):>7} {_i(r,'old_clicks'):>7}  {r['file'][:50]}")
-    print(f"\n  those 12 are {100*cum/max(1,tot):.0f} % of the whole census")
-    rest = tot - cum
-    print(f"  the remaining {len(rows)-12} recordings total {rest:,} rows "
-          f"({rest * PNG_KB / 1024:.0f} MB) — the exhaustive-pass candidates")
+        print(f"  {_i(r,'n_export_all'):>10} {_i(r,'n_unfiltered'):>10} "
+              f"{_i(r,'old_clicks'):>10}  {r['file'][:46]}")
+    print(f"\n  those {n_top} are {100*cum/max(1,tot):.0f} % of the whole census")
+    rest_n, rest = len(rows) - n_top, tot - cum
+    if rest_n > 0:
+        print(f"  the remaining {rest_n} recordings total {rest:,} rows "
+              f"({rest * PNG_KB / 1024:.0f} MB) — the exhaustive-pass candidates")
 
 
 if __name__ == "__main__":
