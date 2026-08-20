@@ -397,6 +397,17 @@ def print_summary(df: pd.DataFrame, model: dict) -> None:
     labeled['label']          = labeled['label'].astype(int)
     labeled['pipeline_click'] = (labeled['stage_blocked'] == '').astype(int)
 
+    # label = 2 is AMBIGUOUS — judged by the reviewer, but with no true class, so
+    # it belongs in none of the four cells. It was already absent from all of them
+    # (each test names 0 or 1 explicitly) but was still counted in n_labeled, which
+    # made the printed "N labeled rows" disagree with TP+FP+FN+TN for no visible
+    # reason. Split out and reported instead.
+    n_ambiguous = int((labeled['label'] == 2).sum())
+    labeled = labeled[labeled['label'].isin((0, 1))].copy()
+    if labeled.empty:
+        print(f"\n  {n_ambiguous} labeled row(s), all ambiguous — no metrics to compute.")
+        return
+
     tp = int(((labeled['label'] == 1) & (labeled['pipeline_click'] == 1)).sum())
     fp = int(((labeled['label'] == 0) & (labeled['pipeline_click'] == 1)).sum())
     fn = int(((labeled['label'] == 1) & (labeled['pipeline_click'] == 0)).sum())
@@ -407,7 +418,8 @@ def print_summary(df: pd.DataFrame, model: dict) -> None:
     precision   = tp / (tp + fp) if (tp + fp) > 0 else float('nan')
     specificity = tn / (tn + fp) if (tn + fp) > 0 else float('nan')
 
-    print(f"\n  Comparison with manual labels  ({n_labeled} labeled rows):")
+    print(f"\n  Comparison with manual labels  ({n_labeled} labeled rows"
+          + (f", {n_ambiguous} ambiguous and excluded" if n_ambiguous else "") + "):")
     print(f"  Confusion:  TP={tp}  FP={fp}  FN={fn}  TN={tn}")
     print(f"  Recall      : {recall:.3f}   ({tp}/{tp+fn} clicks detected)")
     print(f"  Precision   : {precision:.3f}")

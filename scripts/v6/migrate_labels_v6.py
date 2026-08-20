@@ -107,7 +107,13 @@ def _f(row, key, default=float("nan")):
 
 
 def _label_of(row):
-    """Normalise the '1.0' / '0.0' / '0' / '' label mix into 1, 0 or None."""
+    """Normalise the '1.0' / '0.0' / '0' / '2' / '' label mix into 1, 0, 2 or None.
+
+    2 is AMBIGUOUS — the reviewer looked and could not decide. It is carried
+    through rather than dropped: returning None for it would make an ambiguous
+    row indistinguishable from an unlabelled one, and the migration would then
+    treat a deliberate judgement as a gap to be filled.
+    """
     raw = str(row.get("label", "") or "").strip().replace(",", ".")
     if not raw:
         return None
@@ -115,7 +121,7 @@ def _label_of(row):
         v = float(raw)
     except ValueError:
         return None
-    return int(v) if v in (0.0, 1.0) else None
+    return int(v) if v in (0.0, 1.0, 2.0) else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

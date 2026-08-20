@@ -49,6 +49,7 @@ Options:
     --recall-target FLOAT   Target recall for threshold optimisation (default: 0.90)
     --output PATH           Output model path (default: plantleaf_svm_v5.pkl)
     --no-noise-filter       Skip R²>0.1 and SPR<100 pre-filter for noise samples
+    --ambiguous MODE        label=2 rows: exclude (default) | click | noise
     --predict-output PATH   Write the input CSV + svm_probability + svm_prediction
                             columns to PATH (all rows, including unlabeled ones)
     --exclude-features F [F ...]  Features to drop from the training vector.
@@ -126,11 +127,18 @@ def load_and_prepare(
     csv_path:       Path,
     set_b_sessions: list[str],
     noise_filter:   bool,
+    ambiguous:      str = 'exclude',
 ) -> tuple[pd.DataFrame, pd.DataFrame | None]:
     """
     Load the labeled CSV, apply noise pre-filtering, and split Set A / Set B.
 
     Returns (df_a, df_b) where df_b is None if set_b_sessions is empty.
+
+    `ambiguous` decides what happens to label = 2 rows (the reviewer's "could be
+    either"): 'exclude' (default), 'click' or 'noise'. The two non-default values
+    exist for a sensitivity check — if recall moves a lot between them, the
+    ambiguous set is carrying real signal and deserves a weighting scheme rather
+    than a hard assignment.
     """
     df = pd.read_csv(csv_path)
 
@@ -181,11 +189,40 @@ def load_and_prepare(
     df = df[df['label'].notna()]
     df['label'] = df['label'].astype(int)
 
+    # ── label = 2 is AMBIGUOUS: judged, but not a class ──────────────────────
+    # The reviewer marks a row 2 when it could be a click and could be noise.
+    # Forcing such rows into a class injects label noise into BOTH, and at ~100
+    # positives a handful of wrongly-forced ones is a large fraction of the
+    # positive class.
+    #
+    # ⚠️ This MUST be explicit. Left alone, a 2 survives notna(), casts to int,
+    # is counted in neither tally above, escapes the label==0 noise pre-filter,
+    # and then reaches the estimator as a THIRD CLASS — silently turning a binary
+    # problem into a 3-class one and making every reported metric meaningless.
+    n_ambig = int((df['label'] == 2).sum())
+    if ambiguous == 'click':
+        df.loc[df['label'] == 2, 'label'] = 1
+    elif ambiguous == 'noise':
+        df.loc[df['label'] == 2, 'label'] = 0
+    else:                                    # 'exclude' (default)
+        df = df[df['label'] != 2].copy()
+    # Anything that is neither 0 nor 1 by now is a corrupt cell, not a decision.
+    stray = df[~df['label'].isin((0, 1))]
+    if len(stray):
+        print(f"  ⚠️  dropping {len(stray)} row(s) with a label outside 0/1/2: "
+              f"{sorted(stray['label'].unique())[:5]}")
+        df = df[df['label'].isin((0, 1))].copy()
+
     n_clicks = (df['label'] == 1).sum()
     n_noise  = (df['label'] == 0).sum()
     print(f"Labeled rows loaded:  {len(df)}")
     print(f"  label=1 (clicks) :  {n_clicks}")
     print(f"  label=0 (noise)  :  {n_noise}")
+    if n_ambig:
+        _what = {'exclude': 'EXCLUDED from training',
+                 'click':   'counted as CLICKS  (--ambiguous click)',
+                 'noise':   'counted as NOISE   (--ambiguous noise)'}[ambiguous]
+        print(f"  label=2 (ambiguous): {n_ambig}  → {_what}")
     print(f"  Sessions         :  {df['session_id'].nunique()}")
 
     # Apply noise pre-filtering gates (label=0 rows only)
@@ -537,6 +574,14 @@ def main() -> None:
                         help='Target recall for threshold optimisation (default: 0.90)')
     parser.add_argument('--output',        type=Path,       default=Path('plantleaf_svm_v5.pkl'),
                         help='Output model path — must be a .pkl file (default: plantleaf_svm_v5.pkl)')
+    parser.add_argument('--ambiguous', choices=('exclude', 'click', 'noise'),
+                        default='exclude',
+                        help="What to do with label=2 rows (the reviewer's "
+                             "'could be either'). 'exclude' (default) keeps them out "
+                             "of training; 'click'/'noise' fold them into that class. "
+                             "The latter two are a SENSITIVITY CHECK: if recall moves "
+                             "much between the three, the ambiguous set carries real "
+                             "signal and wants a weighting scheme, not a hard call.")
     parser.add_argument('--no-noise-filter', action='store_true',
                         help='Skip R²>0.1 and SPR<100 noise pre-filter')
     parser.add_argument('--predict-output',  type=Path,       default=None,

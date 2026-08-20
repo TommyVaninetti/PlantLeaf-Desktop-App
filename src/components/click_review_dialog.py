@@ -136,7 +136,20 @@ def _to_float(value, default: float = float('nan')) -> float:
 # Label values as they appear in the CSV
 LABEL_CLICK = '1'
 LABEL_NOISE = '0'
+LABEL_AMBIG = '2'   # genuinely uncertain: could be a click, could be noise
 LABEL_NONE  = ''
+
+#: The three values that mean "you have judged this row". AMBIGUOUS IS A LABEL,
+#: not a missing one — it must never show up under "Unlabelled only", and it must
+#: never be counted as click or noise.
+#:
+#: It exists because forcing a binary call on an uncertain event injects label
+#: noise into BOTH classes, and at ~100 positives a handful of wrongly-forced
+#: ones is a large fraction of the positive class. Recording the uncertainty
+#: keeps the decision reversible: it can be excluded, down-weighted, or treated
+#: as either class in a sensitivity check, and that is decided at training time
+#: rather than being baked in by the labeller.
+LABELS_DECIDED = (LABEL_CLICK, LABEL_NOISE, LABEL_AMBIG)
 
 # Row tint per verdict — a blocked candidate should be recognisable without reading.
 _VERDICT_TINT = {
@@ -245,6 +258,7 @@ class ClickReviewDialog(QDialog):
             "Blocked by gates (Stage 2)",
             # APPEND ONLY — _refresh_table branches on the raw index below.
             "Needs review (v6 queue)",
+            "Ambiguous only",
         ])
         self.combo_filter.currentIndexChanged.connect(self._refresh_table)
         file_row.addWidget(self.combo_filter)
@@ -348,7 +362,7 @@ class ClickReviewDialog(QDialog):
         # ── Bottom bar ──
         bottom = QHBoxLayout()
         hint = QLabel(
-            "Keys:  1 = click   0 = noise   Backspace = clear   "
+            "Keys:  1 = click   0 = noise   2 = ambiguous   Backspace = clear   "
             "Space / ↓ = next   ↑ = previous   N = note"
         )
         hint.setStyleSheet("QLabel { color: gray; font-style: italic; }")
@@ -613,6 +627,13 @@ class ClickReviewDialog(QDialog):
                 return LABEL_CLICK
             if f == 0.0:
                 return LABEL_NOISE
+            if f == 2.0:
+                return LABEL_AMBIG
+            # ⚠️ Anything else becomes UNLABELLED, which is destructive: reopening
+            # the file would erase the judgement. That is exactly what would have
+            # happened to every '2' before it was added above — the feature would
+            # have quietly deleted its own data on the next load. Any future label
+            # value must be added here FIRST.
             return LABEL_NONE
 
         df['label'] = df['label'].map(_norm_label)
@@ -668,6 +689,11 @@ class ClickReviewDialog(QDialog):
             # whose label migrated cleanly are already settled and are not here.
             rows = [i for i in rows
                     if _to_float(self.df.at[i, 'needs_review'], 0.0) == 1]
+        elif mode == 6:
+            # Your own uncertainty, collected in one place — so a second pass can
+            # revisit them together once you have seen the whole recording and know
+            # what its clicks actually look like.
+            rows = [i for i in rows if self.df.at[i, 'label'] == LABEL_AMBIG]
 
         # ── Sort ──
         sort_mode = self.combo_sort.currentIndex()
@@ -715,7 +741,7 @@ class ClickReviewDialog(QDialog):
                 f"{ts:.3f}" if ts == ts else '—',   # NaN-safe
                 f"{prob:.3f}" if prob >= 0 else '—',
                 ('CLICK' if verdict == '' else verdict) if self._is_classified() else '—',
-                {LABEL_CLICK: 'click', LABEL_NOISE: 'noise'}.get(
+                {LABEL_CLICK: 'click', LABEL_NOISE: 'noise', LABEL_AMBIG: 'ambiguous'}.get(
                     self.df.at[i, 'label'], ''),
             ]
 
@@ -995,6 +1021,10 @@ class ClickReviewDialog(QDialog):
             self._set_label(LABEL_CLICK, advance=True)
         elif key == Qt.Key_0:
             self._set_label(LABEL_NOISE, advance=True)
+        elif key == Qt.Key_2:
+            # Ambiguous. Advances like 1/0 because it IS a decision — the whole
+            # point is that you can move on without inventing certainty.
+            self._set_label(LABEL_AMBIG, advance=True)
         elif key in (Qt.Key_Backspace, Qt.Key_Delete):
             self._set_label(LABEL_NONE, advance=False)
         elif key == Qt.Key_Space:
@@ -1019,7 +1049,7 @@ class ClickReviewDialog(QDialog):
 
         # Reflect it in the table without rebuilding (which would move the cursor).
         r = self.table.currentRow()
-        text = {LABEL_CLICK: 'click', LABEL_NOISE: 'noise'}.get(value, '')
+        text = {LABEL_CLICK: 'click', LABEL_NOISE: 'noise', LABEL_AMBIG: 'ambiguous'}.get(value, '')
         self.table.item(r, _COL_LABEL).setText(text)
 
         self._save()
@@ -1104,19 +1134,26 @@ class ClickReviewDialog(QDialog):
         total = len(self.df)
         n_click = int((self.df['label'] == LABEL_CLICK).sum())
         n_noise = int((self.df['label'] == LABEL_NOISE).sum())
-        labelled = n_click + n_noise
+        n_ambig = int((self.df['label'] == LABEL_AMBIG).sum())
+        # Ambiguous counts as PROGRESS (you have judged the row) but as neither
+        # class. Counting it as unlabelled would make the bar never finish; counting
+        # it as a class would be the binary forcing the label exists to avoid.
+        labelled = n_click + n_noise + n_ambig
 
         # Your own tally, from the label column alone. It must never depend on the
         # verdict column: these are your labels, and they are just as real on a CSV
         # exported without Stages 2-4 as on one exported with them.
         self.label_progress.setText(
             f"{labelled} / {total} labelled   —   {n_click} click, {n_noise} noise"
+            + (f", {n_ambig} ambiguous" if n_ambig else "")
         )
 
         if not self._is_classified():
             # No verdicts to compare against, but the counts above are still yours to see.
             self.label_confusion.setText(
-                f"You marked {n_click} click / {n_noise} noise of {total} candidates.\n"
+                f"You marked {n_click} click / {n_noise} noise"
+                + (f" / {n_ambig} ambiguous" if n_ambig else "")
+                + f" of {total} candidates.\n"
                 f"No algorithm verdicts in this CSV — re-export with 'Run Stages 2-4' "
                 f"enabled to compare them."
             )
@@ -1124,10 +1161,14 @@ class ClickReviewDialog(QDialog):
             return
 
         # Confusion of the user's labels against the pipeline's confirmed clicks.
+        # AMBIGUOUS IS EXCLUDED, explicitly: it has no true class, so it belongs in
+        # none of the four cells and would corrupt recall/precision if forced into
+        # one. It was already excluded by falling through both branches below, but
+        # silently — stated here so a future edit cannot "fix" it into a class.
         tp = fp = fn = tn = 0
         for i in range(total):
             lab = self.df.at[i, 'label']
-            if lab == LABEL_NONE:
+            if lab in (LABEL_NONE, LABEL_AMBIG):
                 continue
             predicted_click = self._verdict(i) == ''
             if lab == LABEL_CLICK:
@@ -1139,6 +1180,7 @@ class ClickReviewDialog(QDialog):
 
         self.label_confusion.setText(
             f"TP={tp}   FP={fp}   FN={fn}   TN={tn}"
+            + (f"      ({n_ambig} ambiguous, excluded)" if n_ambig else "")
         )
 
         if tp + fn == 0 and tp + fp == 0:

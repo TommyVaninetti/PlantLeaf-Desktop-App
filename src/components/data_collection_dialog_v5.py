@@ -196,7 +196,14 @@ CSV_COLUMNS = [
                      # it reproduces the v5 candidate set from a v5.1 export, which
                      # is what makes the delta computable from ONE pass (D6).
     # ── labels & verdicts ──
-    'label',  # Empty column for manual labeling (1=click, 0=no click, empty=unknown)
+    'label',  # Manual labelling, written by click_review_dialog:
+              #   1 = click   0 = noise   2 = AMBIGUOUS   '' = not yet judged
+              # 2 means the reviewer looked and could not decide. It is a
+              # DECISION, not a missing value: it counts as progress, never as a
+              # class, and every consumer must handle it explicitly —
+              # train_svm.py --ambiguous, and evaluate_candidates.print_summary,
+              # both exclude it by default. Left implicit it reaches the SVM as a
+              # third class and silently invalidates every metric.
     'note',   # Free text, written by you in the review dialog. Exported empty and
               # never read by the pipeline or the trainer — it exists so an
               # observation made WHILE labelling ("double event", "probe knock",
