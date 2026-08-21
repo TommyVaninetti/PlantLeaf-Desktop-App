@@ -96,9 +96,8 @@ import joblib
 # numpy, so loading it standalone is safe.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'core')) #KEEP IT THIS WAY, IT'S NEEDED TO IMPORT WITH NO GUI COMPONENTS
 from click_pipeline_v5 import (   # noqa: E402
-    STAGE2_R2_MIN       as _R2_MIN,        # Minimum R² for a valid exponential fit (Stage 2)
-    STAGE2_TAU_MIN      as _TAU_MIN,       # τ must be > 0, else no decay was fitted (Stage 2)
-    STAGE2_SPR_MAX      as _SPR_MAX,       # Max SPR before a candidate is out-of-distribution (Stage 2)
+    _stage2_reason,                        # THE Stage 2 rule — called, never copied
+    STAGE_OK,
     DEDUP_WINDOW_FRAMES as _DEDUP_FRAMES,  # Frame-index proximity window for deduplication (Stage 4)
 )
 
@@ -202,49 +201,36 @@ def load_csvs(paths: list[Path]) -> pd.DataFrame:
 
 # ── Stage 2 — valid-fit and OOD gate ─────────────────────────────────────────
 
-def apply_stage2(df: pd.DataFrame) -> pd.DataFrame:
+def apply_stage2(df: pd.DataFrame, tier: str = None) -> pd.DataFrame:
     """
     Tag rows that fail Stage 2 with 'stage_blocked'.
 
-    Gate 1 — R² ≥ _R2_MIN:
-        Rows with R² < 0.10 have an invalid exponential fit. τ, decay_start,
-        decay_end, and all features that depend on the decay window are
-        unreliable artefacts of the fallback placement, not real signal shape.
+    ⚠️ THIS FUNCTION NO LONGER IMPLEMENTS THE RULE — it calls `_stage2_reason`,
+    the same function the in-app pipeline uses, once per row.
 
-    Gate 2 — SPR < _SPR_MAX:
-        Rows with SPR ≥ 100 are extremely tonal (single dominant component).
-        The SVM training distribution never included such samples for either
-        class, so a prediction there is out-of-distribution and meaningless.
+    It used to keep its own vectorised copy of the gate logic. The thresholds
+    were imported so the *values* could not drift, but the LOGIC was duplicated,
+    and this project has already been burned by two implementations of one rule
+    disagreeing (the raw-vs-mic-corrected Stage 1 fix, which produced 2762 vs
+    3879 candidates on the same recording depending on which path ran). With the
+    v6 rule growing from two gates to five, a second copy was a matter of time.
+
+    Row-wise Python is slower than the vectorised form, but these are candidate
+    CSVs — tens of thousands of rows, a few seconds — and one implementation that
+    is right beats two that are tested to agree.
     """
-    # Gate 1: invalid fit — either R² below the minimum, or no decay fitted at all.
-    # Both mean the decay window is unusable, so they share the Stage2_R2 verdict.
-    #
-    # ⚠️ NaN MUST BE FAILED EXPLICITLY. A v6 CSV carries NaN for tau_ms / R2 /
-    # fit_coverage when the fit failed (fit_valid == 0), replacing the old −1 / 0
-    # sentinels. Every pandas comparison against NaN is False, so `.lt()` and
-    # `.le()` alone would let precisely the unfittable rows PASS this gate and be
-    # scored by the SVM — where the Pipeline's imputer would fill the gap and
-    # return a confident-looking probability computed from imputed data. The
-    # sentinels used to fail these comparisons; NaN does not, so the check has to
-    # be added rather than inherited.
-    #
-    # `fit_valid` is preferred when present (it is the authoritative flag); the
-    # isna() clause covers v5 CSVs and any row where the column is absent.
-    fail_r2  = df['R2'].lt(_R2_MIN) | df['tau_ms'].le(_TAU_MIN)
-    fail_r2 |= df['R2'].isna() | df['tau_ms'].isna()
-    if 'fit_valid' in df.columns:
-        fail_r2 |= (pd.to_numeric(df['fit_valid'], errors='coerce').fillna(0) == 0)
-    df.loc[fail_r2 & (df['stage_blocked'] == ''), 'stage_blocked'] = 'Stage2_R2'
+    reasons = df.apply(lambda r: _stage2_reason(r.to_dict(), tier), axis=1)
+    fresh = df['stage_blocked'] == ''
+    df.loc[fresh, 'stage_blocked'] = reasons[fresh]
 
-    # Gate 2: out-of-distribution spectrum — checked only if Gate 1 passed
-    # NaN SPR cannot be judged out-of-distribution, but it also cannot be trusted;
-    # it is left to Gate 1, which already fails any row with a broken feature set.
-    fail_spr = df['SPR'].ge(_SPR_MAX)
-    df.loc[fail_spr & (df['stage_blocked'] == ''), 'stage_blocked'] = 'Stage2_SPR'
-
-    n2 = (df['stage_blocked'].isin(['Stage2_R2', 'Stage2_SPR'])).sum()
-    print(f"  Stage 2: {n2} rejected  "
-          f"(R²: {fail_r2.sum()}, SPR: {(fail_spr & ~fail_r2).sum()})")
+    blocked = reasons[fresh]
+    n2 = int((blocked != STAGE_OK).sum())
+    if n2:
+        counts = blocked[blocked != STAGE_OK].value_counts().to_dict()
+        detail = ', '.join(f"{k.replace('Stage2_','')}: {v}" for k, v in counts.items())
+        print(f"  Stage 2: {n2} rejected  ({detail})")
+    else:
+        print("  Stage 2: 0 rejected")
 
     return df
 

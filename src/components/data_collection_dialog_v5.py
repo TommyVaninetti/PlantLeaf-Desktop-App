@@ -114,7 +114,12 @@ CSV_COLUMNS = [
                            # `canonical_frame_idx` used to sit here and was dropped
                            # in v6: it is exactly `peak_abs // FFT_SIZE`.
     'timestamp_s',
-    'stage1_params',       # 'v51_peakpick;k=1.50;R=2;C=10' — one column instead of
+    'stage2_tier',         # 'conservative' | 'aggressive' — which Stage 2 rule ran.
+                           # Same reasoning as stage1_params: two exports made with
+                           # different tiers are otherwise indistinguishable after
+                           # the fact, and the aggressive one has a measured 2.1 %
+                           # recall cost, so it must never be invisible.
+    'stage1_params',       # 'v51_peakpick;k=1.50;R=1;C=10' — one column instead of
                            # four (stage1_mode / k_used / R_used / C_used) that would
                            # repeat the same value on every row of an export.
     # ── noise state at detection ──
@@ -378,6 +383,7 @@ class CandidateData:
     # can always be attributed to the rule that produced it even after the module
     # constants move on. Everything here is diagnostic; none of it is a feature.
     stage1_params: str = ''
+    stage2_tier: str = ''
     run_id: int = -1
     run_length: int = 0
     run_crest: float = float('nan')
@@ -456,6 +462,7 @@ class CandidateData:
             'peak_abs': self.peak_abs,
             'timestamp_s': round(self.timestamp_s, 6),
             'stage1_params': self.stage1_params,
+            'stage2_tier': self.stage2_tier,
             # mV since the iFFT amplitude-scale fix — the reconstructed signal is
             # now in true volts, so these land in the mV range. CSVs exported before
             # that fix carry uV columns 256x smaller; the 17 feature columns are
@@ -607,6 +614,7 @@ def _process_file_for_collection(
     stop_check=None,
     progress_cb=None,
     export_mode: str = EXPORT_ALL,
+    stage2_tier: str = None,
 ) -> Tuple[List[CandidateData], List[Dict]]:
     """
     Process single .paudio file: find Stage 1 survivors and compute all features.
@@ -649,7 +657,7 @@ def _process_file_for_collection(
         compute_features_v5,
         FS, FFT_SIZE,
         STAGE2_R2_MIN, STAGE2_TAU_MIN,
-        STAGE1_MODE, PEAK_REFRACTORY_R, LOCAL_CREST_C,
+        STAGE1_MODE, PEAK_REFRACTORY_R, LOCAL_CREST_C, STAGE2_TIER,
     )
 
     # Stamped on every row. R and C are PROVISIONAL (Stage 1 v5.1 spec §4.1, O-1):
@@ -657,6 +665,10 @@ def _process_file_for_collection(
     # thing that lets a later study attribute results to them.
     stage1_params = (f'{STAGE1_MODE};k={k:.2f};'
                      f'R={PEAK_REFRACTORY_R};C={LOCAL_CREST_C}')
+    # The Stage 2 tier is stamped even when Stages 2-4 do not run, because the
+    # question a reader asks later is "which rule COULD have rejected this row",
+    # and a blank there is indistinguishable from "the default happened to apply".
+    stage2_tier_used = stage2_tier or STAGE2_TIER
 
     candidates = []
     csv_rows   = []
@@ -874,6 +886,7 @@ def _process_file_for_collection(
                 hc_r_A=features.get('hc_r_A', float('nan')),
                 hc_r_B=features.get('hc_r_B', float('nan')),
                 stage1_params=stage1_params,
+                stage2_tier=stage2_tier_used,
                 run_id=int(survivor.get('run_id', -1)),
                 run_length=int(survivor.get('run_length', 0)),
                 run_crest=float(survivor.get('run_crest', float('nan'))),
@@ -1688,6 +1701,7 @@ class DataCollectionWorkerV5(QThread):
         svm_model: dict = None,
         export_mode: str = EXPORT_ALL,
         threshold: float = None,
+        stage2_tier: str = None,
     ):
         """
         Initialize worker thread.
@@ -1714,6 +1728,9 @@ class DataCollectionWorkerV5(QThread):
         self.normalize_mode = normalize_mode
         self.svm_model = svm_model
         self.export_mode = export_mode
+        # None → the module default (conservative). Never defaulted to aggressive:
+        # that tier has a measured 2.1 % click cost.
+        self.stage2_tier = stage2_tier
         self.threshold = threshold
         self._stop_requested = False
         # Holds the active AudioLoadWorker so request_stop() can cancel it mid-load.
@@ -1766,6 +1783,7 @@ class DataCollectionWorkerV5(QThread):
                             f"  → {paudio_file.name}: {done}/{total} survivors processed…"
                         ),
                         export_mode=self.export_mode,
+                        stage2_tier=self.stage2_tier,
                     )
 
                     ## STAGES 2-4 ##
@@ -1856,6 +1874,7 @@ class DataCollectionWorkerV5(QThread):
             [c.to_feature_dict() for c in candidates],
             self.svm_model,
             threshold=self.threshold,
+            stage2_tier=self.stage2_tier,
         )
 
         # run_stages234_annotated preserves input order, so zip is a safe pairing.
@@ -2244,6 +2263,22 @@ class DataCollectionDialogV5(QDialog):
         mode_layout.addWidget(self.radio_all)
         mode_layout.addWidget(self.radio_confirmed)
         mode_layout.addWidget(self.radio_unfiltered)
+
+        # Stage 2 tier. Off by default and never chosen implicitly, because unlike
+        # every other control here it has a MEASURED recall cost.
+        self.check_stage2_aggressive = QCheckBox("Aggressive Stage 2")
+        self.check_stage2_aggressive.setToolTip(
+            "Raises the Stage 2 peak_SNR floor from 4.5 to 5.0.\n\n"
+            "Measured on 32 exhaustively-labelled recordings:\n"
+            "   conservative (default) : 0.0 % of clicks lost, 83.6 % of noise removed\n"
+            "   aggressive             : 2.1 % of clicks lost, 87.0 % of noise removed\n\n"
+            "For sessions whose candidate rate makes review impossible — outdoor\n"
+            "recordings have been measured at 344,000 candidates/hour. It is a real\n"
+            "recall cost, not a free win, so leave it off unless the volume forces it.\n\n"
+            "The tier used is written into each row's stage2_tier column, so an\n"
+            "export can always be attributed to the rule that produced it."
+        )
+        mode_layout.addWidget(self.check_stage2_aggressive)
         mode_layout.addStretch()
         layout.addLayout(mode_layout)
 
@@ -2600,6 +2635,8 @@ class DataCollectionDialogV5(QDialog):
             svm_model=svm_model,
             export_mode=export_mode,
             threshold=threshold,
+            stage2_tier=(STAGE2_TIER_AGGRESSIVE
+                         if self.check_stage2_aggressive.isChecked() else None),
         )
         
         # QueuedConnection → slot always executes on the main thread.

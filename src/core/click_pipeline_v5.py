@@ -310,6 +310,63 @@ STAGE2_TAU_MIN = 0.0    # τ must be strictly positive. _fit_decay_segment retur
                         # feature is meaningless. Rejected under the same verdict as the
                         # R² gate (STAGE_BLOCKED_R2) — both mean "invalid fit".
 
+# ── STAGE 2 v6 — gates on features that exist whether or not the fit converged ──
+#
+# WHY THE FIT GATE IS GONE (it used to be Stage 2's main effect):
+# Measured on 32 exhaustively-labelled recordings (189 clicks / 99 ambiguous /
+# 5786 noise), the old fit gate cost
+#
+#     12.2 % of confirmed clicks  (23 of 189)   and  32.3 % of ambiguous
+#
+# for 91.4 % of noise. It was rejecting real clicks whose exponential decay fit
+# failed to converge — 8-9 % of clicks have fit_valid == 0. A failed fit is
+# EVIDENCE, not disqualification, so fit_valid / R2 / tau_ms are now FEATURES and
+# Stage 3 decides what they are worth. The gates below reach 83.1 % of noise for
+# ZERO clicks and ZERO ambiguous, which is better on both axes.
+#
+# ⚠️ Every threshold here is set strictly OUTSIDE the labelled click
+# distribution, and each is justified by a measured cost, not by inspection.
+# Regenerate with scripts/v6/feature_distributions.py before changing any of them.
+# A Stage 2 reject is HARD — no probability, invisible to the SVM — so a gate
+# placed where the click distribution is merely thin costs recall irrecoverably.
+#
+# ⚠️ NaN ALWAYS PASSES every gate below. A row whose feature could not be
+# measured cannot be judged by it: harmonic_confinement is NaN on ~23 % of rows
+# BY DESIGN (second harmonic outside the transmitted band), and every v6 feature
+# is NaN when b3_frames == 0. This is the opposite of the Stage-2 fit gate's old
+# NaN handling, where NaN had to be failed explicitly — there, NaN meant "the
+# quantity being gated on is broken"; here it means "not applicable".
+
+STAGE2_PEAK_SNR_MIN = 4.5   # Lowest labelled click sits at peak_SNR 4.640.
+                            # Measured: 0.0 % clicks, 0.0 % ambiguous, 76.8 % noise.
+                            # 5.0 would reach 82.5 % but costs 2.1 % of clicks —
+                            # that is the aggressive tier, not this one.
+
+STAGE2_N_SEG_MIN = 10       # Region length in samples. Lowest labelled click is 10.
+                            # Measured: 0.0 % / 0.0 % / 45.2 %. 12 already costs
+                            # 0.5 % of clicks.
+
+STAGE2_LOCAL_CREST_MIN = 1.2  # E_i over its own ±C background median. Lowest
+                            # labelled click is 1.265.
+                            # Measured: 0.0 % / 0.0 % / 33.6 %.
+
+STAGE2_HC_MAX = 1.6         # harmonic_confinement = log2(min(r_A, r_B)) on the
+                            # frame excess spectrum. Highest labelled click is
+                            # 1.545, and the feature is bounded above by ~3.36 by
+                            # construction. Targets the 40.2 kHz interferer
+                            # measured across the indoor `teca` sessions.
+                            # Measured: 0.0 % / 0.0 % / 3.2 % indoor, 16.9 % corpus.
+
+#: Aggressive tier — opt-in per session, for recordings whose candidate rate makes
+#: review impossible (measured up to 344,773/hour outdoors). It buys 86.5 % of
+#: noise for 2.1 % of clicks and 2.0 % of ambiguous. That cost is REAL and stated
+#: here so it can never be enabled without seeing it.
+STAGE2_TIER2_PEAK_SNR_MIN = 5.0
+
+STAGE2_TIER_CONSERVATIVE = 'conservative'   # default: measured zero click loss
+STAGE2_TIER_AGGRESSIVE   = 'aggressive'     # opt-in: 2.1 % click loss, stated
+STAGE2_TIER = STAGE2_TIER_CONSERVATIVE
+
 STAGE2_SPR_MAX = 100.0  # Maximum acceptable Spectral Peak Ratio.
                          # SPR = max(power) / mean(power) over the 20–80 kHz band.
                          # SPR ≥ 100 means the spectrum is dominated by a single
@@ -357,8 +414,15 @@ CLICK_PEAK_SEARCH_SAMPLES = FFT_SIZE  # After locating the click onset, the true
 # stay identical to the ones src/ml/evaluate_candidates.py writes, otherwise the
 # in-app export and the offline CLI would disagree on the same recording.
 STAGE_OK            = ''              # survived all four stages — a confirmed click
-STAGE_BLOCKED_R2    = 'Stage2_R2'     # R² < STAGE2_R2_MIN   — invalid decay fit
+STAGE_BLOCKED_R2    = 'Stage2_R2'     # RETIRED as a gate in v6 — kept because it
+                                      # appears in every CSV exported before this
+                                      # change and click_review_dialog filters on
+                                      # it. Nothing emits it any more.
 STAGE_BLOCKED_SPR   = 'Stage2_SPR'    # SPR ≥ STAGE2_SPR_MAX — out-of-distribution
+STAGE_BLOCKED_SNR   = 'Stage2_SNR'    # peak_SNR below the lowest labelled click
+STAGE_BLOCKED_NSEG  = 'Stage2_nseg'   # region too short to be an event
+STAGE_BLOCKED_CREST = 'Stage2_crest'  # no local prominence over its own background
+STAGE_BLOCKED_HARM  = 'Stage2_harm'   # energy confined to a 40/80 kHz harmonic pair
 STAGE_BLOCKED_SVM   = 'Stage3_SVM'    # SVM scored it below the decision threshold
 STAGE_BLOCKED_DEDUP = 'Stage4_dedup'  # duplicate of a higher-confidence detection
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3106,7 +3170,7 @@ def run_stage1_v5_precomputed(dm, k: float = K_STAGE1_DEFAULT) -> list:
 # STAGE 2 — Valid-fit gate and single tone rejection  (§11)
 # =============================================================================
 
-def run_stage2_v5(candidates: list) -> tuple:
+def run_stage2_v5(candidates: list, tier: str = None) -> tuple:
     """
     Stage 2 of the v5 click detection pipeline: valid-fit and OOD gate  (§11).
 
@@ -3139,15 +3203,19 @@ def run_stage2_v5(candidates: list) -> tuple:
         observed in the training click set was ≈ 34, making this a generous
         safety margin rather than a tight discriminant.
 
-    All other features (peak_SNR, FPE_hz, ZCR, kurtosis, …) are left entirely
-    to the SVM. They vary continuously and the SVM boundary in those dimensions
-    was learned from labelled data.
+    ⚠️ THIS DOCSTRING'S GATE LIST IS OUT OF DATE ABOVE — see _stage2_reason,
+    which is the single source of truth. In v6 the fit gate was REMOVED (it cost
+    12.2 % of confirmed clicks) and replaced by gates on peak_SNR, n_seg,
+    local_crest and harmonic_confinement. SPR < 100 is retained as
+    out-of-distribution insurance only.
 
     Parameters
     ----------
     candidates : list of dict
-        Stage 1 survivors with features already attached (i.e. each dict
-        contains 'R2' and 'SPR' keys produced by compute_features_v5).
+        Stage 1 survivors with features already attached by compute_features_v5.
+    tier : str, optional
+        'conservative' (default, measured zero click loss) or 'aggressive'.
+        Passed straight through to _stage2_reason.
 
     Returns
     -------
@@ -3159,7 +3227,7 @@ def run_stage2_v5(candidates: list) -> tuple:
     n_rejected = 0
 
     for cand in candidates:
-        if _stage2_reason(cand) == STAGE_OK:
+        if _stage2_reason(cand, tier) == STAGE_OK:
             survivors.append(cand)
         else:
             n_rejected += 1
@@ -3167,53 +3235,107 @@ def run_stage2_v5(candidates: list) -> tuple:
     return survivors, n_rejected
 
 
-def _stage2_reason(cand: dict) -> str:
+def _stage2_reason(cand: dict, tier: str = None) -> str:
     """
     Which Stage 2 gate rejects this candidate, if any.
 
-    The single source of truth for the Stage 2 rule. run_stage2_v5 uses it to
-    drop rejects; run_stages234_annotated uses it to *label* them. Keeping both
-    on one implementation is what guarantees the survivor-only path and the
-    annotated path can never disagree about the same candidate.
+    THE single source of truth for the Stage 2 rule. run_stage2_v5 uses it to
+    drop rejects, run_stages234_annotated uses it to *label* them, and
+    src/ml/evaluate_candidates.py calls it row-wise rather than keeping a second
+    copy — this project has been bitten before by two implementations of one rule
+    drifting apart.
 
-    Returns
-    -------
-    str
-        STAGE_OK ('') if every gate passes, otherwise STAGE_BLOCKED_R2 or
-        STAGE_BLOCKED_SPR — the first gate that rejects it, the fit gates first.
+    Returns STAGE_OK ('') or the first gate that rejects, most-diagnostic first.
+
+    ── WHAT CHANGED IN v6, AND WHY ──────────────────────────────────────────
+    The fit gate is GONE. It used to reject any candidate whose exponential decay
+    fit failed (fit_valid == 0, NaN R2/tau, R2 < 0.10, tau <= 0), on the argument
+    that every decay-window feature was then unreliable. Measured against 32
+    exhaustively-labelled recordings, that gate cost:
+
+        12.2 % of confirmed clicks (23 of 189)  and  32.3 % of ambiguous rows
+
+    Those clicks were hard-rejected before Stage 3 and never reached the SVM at
+    all. A decay fit failing is evidence about a candidate, not grounds for
+    discarding it — so fit_valid, R2 and tau_ms are now FEATURES, and Stage 3
+    weighs them.
+
+    ⚠️ CONSEQUENCE, and it is not free: rows with NaN tau_ms / R2 now reach
+    Stage 3, where the Pipeline's SimpleImputer fills them and the SVM returns a
+    confident-looking probability computed partly from imputed values. That is
+    the exact hazard the old NaN handling here guarded against. The mitigation is
+    that fit_valid is a feature, so the model can condition on "this row's decay
+    features are imputed" — but it only works if fit_valid is actually in
+    model['features']. See the Stage 3 brief.
+
+    ── THE REPLACEMENT ──────────────────────────────────────────────────────
+    Gates on quantities that exist whether or not the fit converged. Every
+    threshold sits strictly outside the labelled click distribution and carries a
+    measured cost (regenerate with scripts/v6/feature_distributions.py):
+
+        gate                          clicks  ambiguous   noise
+        peak_SNR    >= 4.5              0.0 %     0.0 %   76.8 %
+        n_seg       >= 10               0.0 %     0.0 %   45.2 %
+        local_crest >= 1.2              0.0 %     0.0 %   33.6 %
+        harmonic_confinement <= 1.6     0.0 %     0.0 %    3.2 % (16.9 % corpus)
+        ------------------------------------------------------------------
+        all four combined               0.0 %     0.0 %   83.1 %
+        the OLD fit gate, for scale    12.2 %    32.3 %   91.4 %
+
+    ⚠️ NaN PASSES every gate. A row whose feature could not be measured cannot be
+    judged by it — harmonic_confinement is NaN on ~23 % of rows by design, and
+    every v6 feature is NaN when b3_frames == 0. Note this is the OPPOSITE of the
+    retired fit gate, where NaN had to be failed explicitly: there NaN meant "the
+    thing being gated on is broken", here it means "not applicable".
+
+    Parameters
+    ----------
+    tier : 'conservative' (default) | 'aggressive'
+        Aggressive raises the peak_SNR floor to 5.0, buying 86.5 % of noise for a
+        MEASURED 2.1 % of clicks and 2.0 % of ambiguous. For sessions whose
+        candidate rate makes review impossible — up to 344,773/hour outdoors.
     """
-    # Gate 1a: R² < 0.10 → decay fit is invalid; downstream features
-    # that depend on decay_start / decay_end are unreliable.
-    # _fit_decay_segment also returns R2=0.0 for degenerate windows
-    # (too short or near-zero denominator) — those fail here too.
-    # ⚠️ NaN FIRST. A v6 candidate carries NaN for tau_ms / R2 / fit_coverage when
-    # the fit failed, replacing the old −1 / 0 sentinels. Every comparison against
-    # NaN is False, so the two gates below would silently PASS exactly the
-    # unfittable candidates — into Stage 3, where the imputer fills the gap and the
-    # SVM returns a confident-looking probability from imputed data. The sentinels
-    # failed those comparisons; NaN does not, so this test has to be explicit.
-    # `fit_valid` is authoritative when present; the isnan fallback covers callers
-    # that predate it.
-    if not int(cand.get('fit_valid', 1)):
-        return STAGE_BLOCKED_R2
-    _r2, _tau = cand.get('R2', 0.0), cand.get('tau_ms', -1.0)
-    if _r2 is None or _tau is None or (_r2 != _r2) or (_tau != _tau):   # NaN check
-        return STAGE_BLOCKED_R2
+    tier = STAGE2_TIER if tier is None else tier
+    snr_min = (STAGE2_TIER2_PEAK_SNR_MIN
+               if tier == STAGE2_TIER_AGGRESSIVE else STAGE2_PEAK_SNR_MIN)
 
-    if cand.get('R2', 0.0) < STAGE2_R2_MIN:
-        return STAGE_BLOCKED_R2
+    def _lt(key, threshold, default=None):
+        """True when the value is BELOW threshold. NaN and missing -> False (pass)."""
+        v = cand.get(key, default)
+        if v is None:
+            return False
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return False
+        return False if f != f else f < threshold          # f != f is the NaN test
 
-    # Gate 1b: τ ≤ 0 → no decay was fitted at all. _fit_decay_segment returns the
-    # −1 sentinel, and every decay-window feature (fall_time_ms, post_SNR, ZCR_post,
-    # asymmetry_integral, centroid_shift_hz) is then an artefact of the fallback
-    # window placement rather than of the signal. Same failure as Gate 1a — an
-    # unusable exponential fit — so it carries the same verdict.
-    if cand.get('tau_ms', -1.0) <= STAGE2_TAU_MIN:
-        return STAGE_BLOCKED_R2
+    def _gt(key, threshold, default=None):
+        v = cand.get(key, default)
+        if v is None:
+            return False
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return False
+        return False if f != f else f > threshold
 
-    # Gate 2: SPR ≥ 100 → extremely tonal signal, out-of-distribution
-    # for the SVM (never seen in training for either class).
-    if cand.get('SPR', 0.0) >= STAGE2_SPR_MAX:
+    # Ordered most-diagnostic first, so the verdict string says the most useful
+    # thing about why a row was dropped.
+    if _lt('peak_SNR', snr_min):
+        return STAGE_BLOCKED_SNR
+    if _lt('n_seg', STAGE2_N_SEG_MIN):
+        return STAGE_BLOCKED_NSEG
+    if _lt('local_crest', STAGE2_LOCAL_CREST_MIN):
+        return STAGE_BLOCKED_CREST
+    if _gt('harmonic_confinement', STAGE2_HC_MAX):
+        return STAGE_BLOCKED_HARM
+
+    # Retained: extremely tonal spectra were never shown to the SVM for either
+    # class, so a prediction there is out-of-distribution. It rejects only 0.4 %
+    # of real candidates — it is insurance, not a discriminator. Worth knowing:
+    # SPR does NOT separate clicks from noise (medians 8.92 vs 9.22).
+    if _gt('SPR', STAGE2_SPR_MAX - 1e-12):
         return STAGE_BLOCKED_SPR
 
     return STAGE_OK
@@ -3426,6 +3548,7 @@ def run_stages234_annotated(
     candidates: list,
     svm_model: dict,
     threshold: float = None,
+    stage2_tier: str = None,
 ) -> list:
     """
     Run Stages 2, 3 and 4 while keeping EVERY input candidate.
@@ -3477,7 +3600,7 @@ def run_stages234_annotated(
     annotated = []
     for cand in candidates:
         row = dict(cand)
-        row['stage_blocked']   = _stage2_reason(row)
+        row['stage_blocked']   = _stage2_reason(row, stage2_tier)
         row['svm_probability'] = None
         row['svm_prediction']  = None
         annotated.append(row)
