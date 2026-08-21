@@ -281,6 +281,27 @@ EXPORT_UNFILTERED = 'unfiltered' # EVERY Stage 1 candidate, including fit_valid 
 #: candidates, which are overwhelmingly noise, and this mode applies NO fit filter.
 
 
+def _sigfig(x, digits: int = 6):
+    """
+    Round to SIGNIFICANT FIGURES, for columns whose magnitude is not O(1).
+
+    `round(x, n)` keeps n decimal places, which destroys any quantity far below
+    1.0: Ê_floor is an energy in V² around 7e-8, and `round(x, 6)` made every
+    single one of them exactly 0.0. Use this wherever the column's natural scale
+    is unknown or very small; plain `round` is fine for ratios, mV and ms.
+
+    NaN and inf pass through unchanged — they are meaningful here (v6 §7.5.3) and
+    must not be coerced to a number.
+    """
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return x
+    if v != v or v in (float('inf'), float('-inf')) or v == 0.0:
+        return v
+    return float(f'{v:.{digits}g}')
+
+
 # ── CANDIDATE DATA STRUCTURE ────────────────────────────────────────────────
 
 @dataclass
@@ -442,7 +463,17 @@ class CandidateData:
             # remain comparable. See docs/fft_and_ifft/IFFT_AMPLITUDE_SCALE_FIX.md
             'noise_floor_mV': round(self.noise_floor * 1e3, 4),
             'std_noise_mV': round(self.std_noise * 1e3, 4),
-            'E_hat_floor': round(self.E_hat_floor, 6),
+            # ⚠️ SIGNIFICANT FIGURES, NOT DECIMAL PLACES — and the difference is the
+            # whole column. Ê_floor is an ENERGY in V², typically ~7e-8, so the
+            # `round(x, 6)` this used to be quantised every value to 0.0: measured
+            # at 290 061 of 290 061 rows across the v6 corpus, i.e. 100 %. It also
+            # silently broke the documented `E_i = k_ratio × E_hat_floor` recovery
+            # path, and it had been doing so since v5.
+            #
+            # Every other float here is a ratio, a millivolt or a millisecond —
+            # O(1e-3) or larger — so decimal-place rounding is fine for them and
+            # only this one column needed changing. Verified by scanning all 56.
+            'E_hat_floor': _sigfig(self.E_hat_floor, 6),
             'k_ratio': round(self.k_ratio, 4),
             'peak_SNR': round(self.peak_SNR, 3),
             'pre_SNR': round(self.pre_SNR, 3),
