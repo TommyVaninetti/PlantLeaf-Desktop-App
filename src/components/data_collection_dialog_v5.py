@@ -20,12 +20,22 @@ from PySide6.QtWidgets import (
     QPushButton, QSpinBox, QDoubleSpinBox, QLabel, QFileDialog,
     QProgressBar, QPlainTextEdit, QCheckBox, QAbstractItemView,
     QWidget, QSizePolicy, QApplication, QRadioButton, QButtonGroup,
-    QMessageBox, QGridLayout,
+    QMessageBox, QGridLayout, QComboBox,
 )
 from PySide6.QtCore import QThread, Signal, Qt, QPoint, QRect
 from PySide6.QtGui import QColor, QPixmap, QPainter, QFont, QImage, QPen
 
 from core.settings_manager import SettingsManager
+# Stage 2 mode names. ⚠️ IMPORTED AT MODULE LEVEL ON PURPOSE. They were previously
+# referenced only inside a conditional expression in the start handler, so the
+# NameError fired ONLY when the user selected the non-default option — a crash
+# that dialog-construction tests and every default-path run sail straight past.
+# This module otherwise uses lazy imports to dodge a circular import, but
+# click_pipeline_v5 imports nothing from components, so a top-level import of
+# these three names is safe.
+from core.click_pipeline_v5 import (            # noqa: E402
+    STAGE2_MODE_V5, STAGE2_MODE_CONSERVATIVE, STAGE2_MODE_AGGRESSIVE,
+)
 
 # Import v5 signal processing pipeline (use lazy imports to avoid circular imports)
 import importlib.util
@@ -114,7 +124,10 @@ CSV_COLUMNS = [
                            # `canonical_frame_idx` used to sit here and was dropped
                            # in v6: it is exactly `peak_abs // FFT_SIZE`.
     'timestamp_s',
-    'stage2_tier',         # 'conservative' | 'aggressive' — which Stage 2 rule ran.
+    'stage2_mode',         # which Stage 2 RULE produced this row:
+                           #   'v5_fitgate'      the original (costs 12.2 % of clicks)
+                           #   'v6_conservative' default, measured zero click loss
+                           #   'v6_aggressive'   opt-in, 2.1 % click cost
                            # Same reasoning as stage1_params: two exports made with
                            # different tiers are otherwise indistinguishable after
                            # the fact, and the aggressive one has a measured 2.1 %
@@ -383,7 +396,7 @@ class CandidateData:
     # can always be attributed to the rule that produced it even after the module
     # constants move on. Everything here is diagnostic; none of it is a feature.
     stage1_params: str = ''
-    stage2_tier: str = ''
+    stage2_mode: str = ''
     run_id: int = -1
     run_length: int = 0
     run_crest: float = float('nan')
@@ -462,7 +475,7 @@ class CandidateData:
             'peak_abs': self.peak_abs,
             'timestamp_s': round(self.timestamp_s, 6),
             'stage1_params': self.stage1_params,
-            'stage2_tier': self.stage2_tier,
+            'stage2_mode': self.stage2_mode,
             # mV since the iFFT amplitude-scale fix — the reconstructed signal is
             # now in true volts, so these land in the mV range. CSVs exported before
             # that fix carry uV columns 256x smaller; the 17 feature columns are
@@ -614,7 +627,7 @@ def _process_file_for_collection(
     stop_check=None,
     progress_cb=None,
     export_mode: str = EXPORT_ALL,
-    stage2_tier: str = None,
+    stage2_mode: str = None,
 ) -> Tuple[List[CandidateData], List[Dict]]:
     """
     Process single .paudio file: find Stage 1 survivors and compute all features.
@@ -657,7 +670,7 @@ def _process_file_for_collection(
         compute_features_v5,
         FS, FFT_SIZE,
         STAGE2_R2_MIN, STAGE2_TAU_MIN,
-        STAGE1_MODE, PEAK_REFRACTORY_R, LOCAL_CREST_C, STAGE2_TIER,
+        STAGE1_MODE, PEAK_REFRACTORY_R, LOCAL_CREST_C, STAGE2_MODE,
     )
 
     # Stamped on every row. R and C are PROVISIONAL (Stage 1 v5.1 spec §4.1, O-1):
@@ -668,7 +681,7 @@ def _process_file_for_collection(
     # The Stage 2 tier is stamped even when Stages 2-4 do not run, because the
     # question a reader asks later is "which rule COULD have rejected this row",
     # and a blank there is indistinguishable from "the default happened to apply".
-    stage2_tier_used = stage2_tier or STAGE2_TIER
+    stage2_mode_used = stage2_mode or STAGE2_MODE
 
     candidates = []
     csv_rows   = []
@@ -886,7 +899,7 @@ def _process_file_for_collection(
                 hc_r_A=features.get('hc_r_A', float('nan')),
                 hc_r_B=features.get('hc_r_B', float('nan')),
                 stage1_params=stage1_params,
-                stage2_tier=stage2_tier_used,
+                stage2_mode=stage2_mode_used,
                 run_id=int(survivor.get('run_id', -1)),
                 run_length=int(survivor.get('run_length', 0)),
                 run_crest=float(survivor.get('run_crest', float('nan'))),
@@ -1701,7 +1714,7 @@ class DataCollectionWorkerV5(QThread):
         svm_model: dict = None,
         export_mode: str = EXPORT_ALL,
         threshold: float = None,
-        stage2_tier: str = None,
+        stage2_mode: str = None,
     ):
         """
         Initialize worker thread.
@@ -1730,7 +1743,7 @@ class DataCollectionWorkerV5(QThread):
         self.export_mode = export_mode
         # None → the module default (conservative). Never defaulted to aggressive:
         # that tier has a measured 2.1 % click cost.
-        self.stage2_tier = stage2_tier
+        self.stage2_mode = stage2_mode
         self.threshold = threshold
         self._stop_requested = False
         # Holds the active AudioLoadWorker so request_stop() can cancel it mid-load.
@@ -1783,7 +1796,7 @@ class DataCollectionWorkerV5(QThread):
                             f"  → {paudio_file.name}: {done}/{total} survivors processed…"
                         ),
                         export_mode=self.export_mode,
-                        stage2_tier=self.stage2_tier,
+                        stage2_mode=self.stage2_mode,
                     )
 
                     ## STAGES 2-4 ##
@@ -1874,7 +1887,7 @@ class DataCollectionWorkerV5(QThread):
             [c.to_feature_dict() for c in candidates],
             self.svm_model,
             threshold=self.threshold,
-            stage2_tier=self.stage2_tier,
+            stage2_mode=self.stage2_mode,
         )
 
         # run_stages234_annotated preserves input order, so zip is a safe pairing.
@@ -2264,21 +2277,38 @@ class DataCollectionDialogV5(QDialog):
         mode_layout.addWidget(self.radio_confirmed)
         mode_layout.addWidget(self.radio_unfiltered)
 
-        # Stage 2 tier. Off by default and never chosen implicitly, because unlike
-        # every other control here it has a MEASURED recall cost.
-        self.check_stage2_aggressive = QCheckBox("Aggressive Stage 2")
-        self.check_stage2_aggressive.setToolTip(
-            "Raises the Stage 2 peak_SNR floor from 4.5 to 5.0.\n\n"
-            "Measured on 32 exhaustively-labelled recordings:\n"
-            "   conservative (default) : 0.0 % of clicks lost, 83.6 % of noise removed\n"
-            "   aggressive             : 2.1 % of clicks lost, 87.0 % of noise removed\n\n"
-            "For sessions whose candidate rate makes review impossible — outdoor\n"
-            "recordings have been measured at 344,000 candidates/hour. It is a real\n"
-            "recall cost, not a free win, so leave it off unless the volume forces it.\n\n"
-            "The tier used is written into each row's stage2_tier column, so an\n"
-            "export can always be attributed to the rule that produced it."
+        # ── Stage 2 rule ──
+        # Three RULES, not three strictness levels: v5 is the original gate, kept
+        # so a v5 result stays reproducible. Ordered by click cost so the default
+        # is in the middle and the expensive one cannot be picked by accident.
+        mode_layout.addSpacing(16)
+        mode_layout.addWidget(QLabel("Stage 2:"))
+        self.combo_stage2 = QComboBox()
+        #: (label, STAGE2_MODE_* value) — index order is the ONLY thing
+        #: _selected_stage2_mode() depends on, so append, never reorder.
+        self._stage2_choices = [
+            ("v6 conservative (default)", STAGE2_MODE_CONSERVATIVE),
+            ("v6 aggressive",             STAGE2_MODE_AGGRESSIVE),
+            ("v5 fit gate (legacy)",      STAGE2_MODE_V5),
+        ]
+        self.combo_stage2.addItems([n for n, _ in self._stage2_choices])
+        self.combo_stage2.setToolTip(
+            "Which Stage 2 rule to apply. Measured on 32 exhaustively-labelled\n"
+            "recordings (189 clicks / 99 ambiguous / 5786 noise):\n\n"
+            "  v6 conservative :  0.0 % clicks lost,  83.6 % of noise removed\n"
+            "  v6 aggressive   :  2.1 % clicks lost,  87.0 % of noise removed\n"
+            "  v5 fit gate     : 12.2 % clicks lost,  91.4 % of noise removed\n\n"
+            "v6 aggressive raises the peak_SNR floor from 4.5 to 5.0. It is for\n"
+            "sessions whose candidate rate makes review impossible — outdoor\n"
+            "recordings have been measured at 344,000 candidates/hour — and its\n"
+            "recall cost is real, not a rounding error.\n\n"
+            "v5 rejects any candidate whose decay fit failed. That is why it loses\n"
+            "12 % of clicks: 8-9 % of confirmed clicks have fit_valid = 0. Kept so a\n"
+            "v5 result can be reproduced exactly, not because it is recommended.\n\n"
+            "The rule used is written into each row's stage2_mode column, so an\n"
+            "export can always be attributed to what produced it."
         )
-        mode_layout.addWidget(self.check_stage2_aggressive)
+        mode_layout.addWidget(self.combo_stage2)
         mode_layout.addStretch()
         layout.addLayout(mode_layout)
 
@@ -2614,6 +2644,7 @@ class DataCollectionDialogV5(QDialog):
         self._log(f"Starting data collection for {len(self.file_list)} file(s)...")
         self._log(f"  k = {self.spinbox_k.value()}")
         self._log(f"  Normalize: True (fixed)")
+        self._log(f"  Stage 2 rule: {self._selected_stage2_mode()}")
         if classify:
             eff_thr = threshold if threshold is not None else float(svm_model['threshold'])
             mode_txt = ("every candidate incl. unfittable" if export_mode == EXPORT_UNFILTERED
@@ -2635,8 +2666,7 @@ class DataCollectionDialogV5(QDialog):
             svm_model=svm_model,
             export_mode=export_mode,
             threshold=threshold,
-            stage2_tier=(STAGE2_TIER_AGGRESSIVE
-                         if self.check_stage2_aggressive.isChecked() else None),
+            stage2_mode=self._selected_stage2_mode(),
         )
         
         # QueuedConnection → slot always executes on the main thread.
@@ -2843,6 +2873,19 @@ class DataCollectionDialogV5(QDialog):
         """Enable/disable Export button based on file list."""
         self.btn_export.setEnabled(self.file_list_widget.count() > 0 and not self.is_processing)
     
+    def _selected_stage2_mode(self) -> str:
+        """
+        The STAGE2_MODE_* value the user picked.
+
+        Reads self._stage2_choices by INDEX, so the combo's items may be appended
+        to but never reordered — same append-only rule the review dialog's filter
+        combo follows, and for the same reason: the index is the contract.
+        """
+        i = self.combo_stage2.currentIndex()
+        if 0 <= i < len(self._stage2_choices):
+            return self._stage2_choices[i][1]
+        return STAGE2_MODE_CONSERVATIVE
+
     def _log(self, message: str):
         """Append message to log area."""
         self.log_area.appendPlainText(message)

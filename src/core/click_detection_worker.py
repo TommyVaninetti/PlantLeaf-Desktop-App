@@ -55,7 +55,7 @@ class ClickDetectionWorker(QObject):
 
     def __init__(self, fft_data, phase_data, fs, fft_size, frame_duration_ms,
                  model_path=None, k=None, threshold=None, dm=None,
-                 stage2_tier=None):
+                 stage2_mode=None):
         super().__init__()
         self.fft_data          = fft_data
         self.phase_data        = phase_data
@@ -72,7 +72,7 @@ class ClickDetectionWorker(QObject):
         self.dm                = dm
         # None → the module default (conservative). The aggressive tier costs a
         # measured 2.1 % of clicks, so it is never chosen implicitly.
-        self.stage2_tier       = stage2_tier
+        self.stage2_mode       = stage2_mode
         self._stop_requested   = False
 
     def request_stop(self):
@@ -201,7 +201,7 @@ class ClickDetectionWorker(QObject):
 
             annotated = run_stages234_annotated(
                 candidates, svm_model, threshold=self.threshold,
-                stage2_tier=self.stage2_tier,
+                stage2_mode=self.stage2_mode,
             )
             self.finished.emit(annotated)
 

@@ -357,15 +357,27 @@ STAGE2_HC_MAX = 1.6         # harmonic_confinement = log2(min(r_A, r_B)) on the
                             # measured across the indoor `teca` sessions.
                             # Measured: 0.0 % / 0.0 % / 3.2 % indoor, 16.9 % corpus.
 
-#: Aggressive tier — opt-in per session, for recordings whose candidate rate makes
-#: review impossible (measured up to 344,773/hour outdoors). It buys 86.5 % of
+#: Aggressive mode — opt-in per session, for recordings whose candidate rate makes
+#: review impossible (measured up to 344,773/hour outdoors). It buys 87.0 % of
 #: noise for 2.1 % of clicks and 2.0 % of ambiguous. That cost is REAL and stated
 #: here so it can never be enabled without seeing it.
-STAGE2_TIER2_PEAK_SNR_MIN = 5.0
+STAGE2_AGGRESSIVE_PEAK_SNR_MIN = 5.0
 
-STAGE2_TIER_CONSERVATIVE = 'conservative'   # default: measured zero click loss
-STAGE2_TIER_AGGRESSIVE   = 'aggressive'     # opt-in: 2.1 % click loss, stated
-STAGE2_TIER = STAGE2_TIER_CONSERVATIVE
+# ── STAGE 2 MODE — three RULES, not three strictness levels ─────────────────
+# 'v5_fitgate' is not a looser or tighter version of the v6 rule; it is the
+# ORIGINAL rule, kept selectable so a v5 result can be reproduced exactly. That
+# matters for two things the project actually needs: re-deriving any figure from
+# a v5-era CSV, and answering "what would the old pipeline have said about this
+# recording" without checking out an old commit.
+#
+# The v5 rule is preserved BIT-IDENTICALLY, including its NaN handling, which is
+# the exact inverse of v6's. Do not "tidy" the two paths into one.
+STAGE2_MODE_V5           = 'v5_fitgate'      # the original: fit gate + SPR
+STAGE2_MODE_CONSERVATIVE = 'v6_conservative' # default: measured zero click loss
+STAGE2_MODE_AGGRESSIVE   = 'v6_aggressive'   # opt-in: 2.1 % click loss, stated
+STAGE2_MODE = STAGE2_MODE_CONSERVATIVE
+
+STAGE2_MODES = (STAGE2_MODE_V5, STAGE2_MODE_CONSERVATIVE, STAGE2_MODE_AGGRESSIVE)
 
 STAGE2_SPR_MAX = 100.0  # Maximum acceptable Spectral Peak Ratio.
                          # SPR = max(power) / mean(power) over the 20–80 kHz band.
@@ -3170,7 +3182,7 @@ def run_stage1_v5_precomputed(dm, k: float = K_STAGE1_DEFAULT) -> list:
 # STAGE 2 — Valid-fit gate and single tone rejection  (§11)
 # =============================================================================
 
-def run_stage2_v5(candidates: list, tier: str = None) -> tuple:
+def run_stage2_v5(candidates: list, mode: str = None) -> tuple:
     """
     Stage 2 of the v5 click detection pipeline: valid-fit and OOD gate  (§11).
 
@@ -3213,9 +3225,9 @@ def run_stage2_v5(candidates: list, tier: str = None) -> tuple:
     ----------
     candidates : list of dict
         Stage 1 survivors with features already attached by compute_features_v5.
-    tier : str, optional
-        'conservative' (default, measured zero click loss) or 'aggressive'.
-        Passed straight through to _stage2_reason.
+    mode : str, optional
+        One of STAGE2_MODES. Passed straight through to _stage2_reason;
+        None means the module default (v6 conservative).
 
     Returns
     -------
@@ -3227,7 +3239,7 @@ def run_stage2_v5(candidates: list, tier: str = None) -> tuple:
     n_rejected = 0
 
     for cand in candidates:
-        if _stage2_reason(cand, tier) == STAGE_OK:
+        if _stage2_reason(cand, mode) == STAGE_OK:
             survivors.append(cand)
         else:
             n_rejected += 1
@@ -3235,7 +3247,50 @@ def run_stage2_v5(candidates: list, tier: str = None) -> tuple:
     return survivors, n_rejected
 
 
-def _stage2_reason(cand: dict, tier: str = None) -> str:
+def _stage2_reason_v5(cand: dict) -> str:
+    """
+    Stage 2 exactly as v5 shipped it. PRESERVED BIT-IDENTICALLY — do not tidy.
+
+    Kept selectable (STAGE2_MODE_V5) so a v5 result can be reproduced without
+    checking out an old commit: re-deriving a figure from a v5-era CSV, or asking
+    "what would the old pipeline have said about this recording".
+
+    ⚠️ ITS NaN HANDLING IS THE EXACT INVERSE OF v6's, and that is correct for this
+    rule. Here NaN R2/tau_ms means "the quantity being gated on is broken", so it
+    must FAIL explicitly — every comparison against NaN is False, so without the
+    explicit test the unfittable candidates would sail through into Stage 3 and be
+    scored from imputed values. In v6 the same NaN means "not applicable" and
+    PASSES. Two rules, two opposite conventions; merging them would break one.
+
+    ⚠️ It costs 12.2 % of confirmed clicks (23 of 189) and 32.3 % of ambiguous
+    rows, measured over 32 exhaustively-labelled recordings. That is why it is no
+    longer the default.
+    """
+    # Gate 1a: R² < 0.10 → decay fit is invalid; downstream features that depend
+    # on decay_start / decay_end are unreliable. _fit_decay_segment also returns
+    # R2 = 0.0 for degenerate windows, which fail here too.
+    if not int(cand.get('fit_valid', 1) or 0):
+        return STAGE_BLOCKED_R2
+    _r2, _tau = cand.get('R2', 0.0), cand.get('tau_ms', -1.0)
+    if _r2 is None or _tau is None or (_r2 != _r2) or (_tau != _tau):   # NaN check
+        return STAGE_BLOCKED_R2
+
+    if cand.get('R2', 0.0) < STAGE2_R2_MIN:
+        return STAGE_BLOCKED_R2
+
+    # Gate 1b: τ ≤ 0 → no decay was fitted at all. Every decay-window feature is
+    # then an artefact of the fallback window placement rather than of the signal.
+    if cand.get('tau_ms', -1.0) <= STAGE2_TAU_MIN:
+        return STAGE_BLOCKED_R2
+
+    # Gate 2: SPR ≥ 100 → extremely tonal, out-of-distribution for the SVM.
+    if cand.get('SPR', 0.0) >= STAGE2_SPR_MAX:
+        return STAGE_BLOCKED_SPR
+
+    return STAGE_OK
+
+
+def _stage2_reason(cand: dict, mode: str = None) -> str:
     """
     Which Stage 2 gate rejects this candidate, if any.
 
@@ -3290,14 +3345,24 @@ def _stage2_reason(cand: dict, tier: str = None) -> str:
 
     Parameters
     ----------
-    tier : 'conservative' (default) | 'aggressive'
-        Aggressive raises the peak_SNR floor to 5.0, buying 86.5 % of noise for a
-        MEASURED 2.1 % of clicks and 2.0 % of ambiguous. For sessions whose
-        candidate rate makes review impossible — up to 344,773/hour outdoors.
+    mode : one of STAGE2_MODES
+        'v6_conservative' (default) — the gates above; measured zero click loss.
+        'v6_aggressive'             — raises the peak_SNR floor to 5.0, buying
+                                      87.0 % of noise for a MEASURED 2.1 % of
+                                      clicks and 2.0 % of ambiguous. For sessions
+                                      whose candidate rate makes review impossible
+                                      (up to 344,773/hour outdoors).
+        'v5_fitgate'                — the ORIGINAL v5 rule, preserved verbatim in
+                                      _stage2_reason_v5 so a v5 result stays
+                                      reproducible. Costs 12.2 % of clicks.
     """
-    tier = STAGE2_TIER if tier is None else tier
-    snr_min = (STAGE2_TIER2_PEAK_SNR_MIN
-               if tier == STAGE2_TIER_AGGRESSIVE else STAGE2_PEAK_SNR_MIN)
+    mode = STAGE2_MODE if mode is None else mode
+    if mode == STAGE2_MODE_V5:
+        return _stage2_reason_v5(cand)
+    if mode not in STAGE2_MODES:
+        raise ValueError(f"unknown Stage 2 mode {mode!r}; expected one of {STAGE2_MODES}")
+    snr_min = (STAGE2_AGGRESSIVE_PEAK_SNR_MIN
+               if mode == STAGE2_MODE_AGGRESSIVE else STAGE2_PEAK_SNR_MIN)
 
     def _lt(key, threshold, default=None):
         """True when the value is BELOW threshold. NaN and missing -> False (pass)."""
@@ -3548,7 +3613,7 @@ def run_stages234_annotated(
     candidates: list,
     svm_model: dict,
     threshold: float = None,
-    stage2_tier: str = None,
+    stage2_mode: str = None,
 ) -> list:
     """
     Run Stages 2, 3 and 4 while keeping EVERY input candidate.
@@ -3600,7 +3665,7 @@ def run_stages234_annotated(
     annotated = []
     for cand in candidates:
         row = dict(cand)
-        row['stage_blocked']   = _stage2_reason(row, stage2_tier)
+        row['stage_blocked']   = _stage2_reason(row, stage2_mode)
         row['svm_probability'] = None
         row['svm_prediction']  = None
         annotated.append(row)
