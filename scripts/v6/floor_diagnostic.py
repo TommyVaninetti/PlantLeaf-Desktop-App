@@ -81,6 +81,20 @@ COLUMNS = [
     "gated_pct", "longest_gated_run", "stale_events",
     "floor_min", "floor_median", "floor_max", "floor_range",
     "cand_per_hour", "warm_up_frames",
+    # ── is the floor BELOW the actual ambient, and is the noise IMPULSIVE? ──
+    # Two different questions, and the answer to the second explains the first.
+    #
+    # `floor_pctile` is the percentile of the actual per-frame energy that the
+    # median Ê_floor sits at. Minimum-statistics estimators are SUPPOSED to track
+    # a low percentile — that is what makes them robust to speech/transients — so
+    # a small number is not by itself a bug. It becomes the whole story when the
+    # environment is impulsive: the quiet gaps between impulses are genuinely
+    # quiet, the floor correctly settles there, and k * Ê_floor then sits UNDER
+    # the impulses, so every impulse clears the threshold.
+    #
+    # `impulsivity` = p99/p50 of frame energy. Stationary noise is ~1-3; a train
+    # of transients over a quiet background is large.
+    "E_p50", "E_p99", "floor_pctile", "impulsivity", "frac_above_k_floor",
 ] + [f"gated_pct_alpha{a:g}" for a in ALPHA_SWEEP] + ["load_s", "note"]
 
 
@@ -202,6 +216,21 @@ def main() -> int:
                         row[f"gated_pct_alpha{a:g}"] = round(
                             100.0 * g.sum() / valid.sum(), 2)
 
+                # ── floor vs the actual energy distribution ──────────────────
+                Ef = E[np.isfinite(E) & (E > 0)]
+                Ff = F[np.isfinite(F) & (F > 0)]
+                if Ef.size > 100 and Ff.size > 100:
+                    e50, e99 = np.median(Ef), np.percentile(Ef, 99)
+                    fmed = np.median(Ff)
+                    row["E_p50"] = float(f"{e50:.6g}")
+                    row["E_p99"] = float(f"{e99:.6g}")
+                    # Where the floor sits within the energy distribution.
+                    row["floor_pctile"] = round(
+                        float(100.0 * np.mean(Ef < fmed)), 2)
+                    row["impulsivity"] = round(float(e99 / max(e50, 1e-30)), 2)
+                    row["frac_above_k_floor"] = round(
+                        float(100.0 * np.mean(E[1:] > K_STAGE1_DEFAULT * F[:-1])), 2)
+
                 src = nf if nf.size == F.size and np.isfinite(nf).any() else F
                 pos = src[np.isfinite(src) & (src > 0)]
                 if pos.size:
@@ -252,7 +281,20 @@ def _summarise(path: Path, alpha: float) -> None:
                   f"{np.median(v):6.2f}%")
     print("\n  Read it as: a few percent => the burst gate is NOT the problem.")
     print("  Tens of percent => the estimator sees only the quietest frames and")
-    print("  settles below the true ambient, so k*Ê_floor sits under the noise.\n")
+    print("  settles below the true ambient, so k*Ê_floor sits under the noise.")
+
+    have = [r for r in rows if r.get("impulsivity")]
+    if have:
+        imp = np.array([float(r["impulsivity"]) for r in have])
+        pct = np.array([float(r["floor_pctile"]) for r in have])
+        print(f"\n  impulsivity (p99/p50 of frame energy): median={np.median(imp):.1f}  "
+              f"max={imp.max():.1f}")
+        print(f"  floor sits at percentile of energy   : median={np.median(pct):.1f}  "
+              f"min={pct.min():.1f}")
+        print("\n  A LOW floor percentile with HIGH impulsivity is not a broken")
+        print("  estimator — it is minimum statistics correctly tracking the quiet")
+        print("  gaps between transients. The threshold then sits under the")
+        print("  transients, and every one of them becomes a candidate.\n")
 
 
 if __name__ == "__main__":

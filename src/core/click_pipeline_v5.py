@@ -342,6 +342,37 @@ STAGE2_PEAK_SNR_MIN = 4.5   # Lowest labelled click sits at peak_SNR 4.640.
                             # 5.0 would reach 82.5 % but costs 2.1 % of clicks —
                             # that is the aggressive tier, not this one.
 
+STAGE2_PEAK_SNR_MAX = 1e4   # ── SANITY BOUND, not a discriminator ──
+                            # peak_SNR reaches 1.14e40 on real exported rows.
+                            # peak_amp blows up in the iFFT when a frame's
+                            # transmitted spectrum is essentially a SINGLE non-zero
+                            # bin: its inverse transform is a pure tone that never
+                            # decays, the decay window runs to the end of the whole
+                            # stitched context (n_seg = 1536 = 3x512), and the
+                            # envelope peak is whatever garbage that bin held.
+                            # Fingerprint, measured on 37 such rows in 402,861:
+                            #     SPR == 154 EXACTLY on 28 of 37   (154 = _K_BINS,
+                            #        the ceiling of max/mean, reachable only when
+                            #        one bin holds all the power)
+                            #     n_seg == 1536 on 32 of 37
+                            #     fit_valid == 1 on all of them — they FIT fine
+                            #     spread over 26 recordings, so not one bad file
+                            #     0 are labelled clicks
+                            #
+                            # The SPR < 100 gate already rejects all 37 — but it is
+                            # the ONLY thing that does, and it catches them only
+                            # because this particular pathology happens to be
+                            # spectrally degenerate. A broadband blowup would pass
+                            # every other gate, since they are all LOWER bounds.
+                            # This is the independent net.
+                            #
+                            # 1e4 is 12.7x the highest labelled click (788.9) and
+                            # costs 0 labelled clicks. Deliberately NOT tightened to
+                            # ~1e3: that is only 1.3x the highest observed click,
+                            # and 208 positives is not enough to trust that ceiling.
+                            # ⚠️ A real click must never approach this. If one ever
+                            # does, the bound is wrong — do not raise it quietly.
+
 STAGE2_N_SEG_MIN = 10       # Region length in samples. Lowest labelled click is 10.
                             # Measured: 0.0 % / 0.0 % / 45.2 %. 12 already costs
                             # 0.5 % of clicks.
@@ -432,6 +463,8 @@ STAGE_BLOCKED_R2    = 'Stage2_R2'     # RETIRED as a gate in v6 — kept because
                                       # it. Nothing emits it any more.
 STAGE_BLOCKED_SPR   = 'Stage2_SPR'    # SPR ≥ STAGE2_SPR_MAX — out-of-distribution
 STAGE_BLOCKED_SNR   = 'Stage2_SNR'    # peak_SNR below the lowest labelled click
+STAGE_BLOCKED_NONPHYS = 'Stage2_nonphys'  # peak_SNR non-physically large — an iFFT
+                                      # reconstruction artefact, not a measurement
 STAGE_BLOCKED_NSEG  = 'Stage2_nseg'   # region too short to be an event
 STAGE_BLOCKED_CREST = 'Stage2_crest'  # no local prominence over its own background
 STAGE_BLOCKED_HARM  = 'Stage2_harm'   # energy confined to a 40/80 kHz harmonic pair
@@ -3337,6 +3370,15 @@ def _stage2_reason(cand: dict, mode: str = None) -> str:
         all four combined               0.0 %     0.0 %   83.1 %
         the OLD fit gate, for scale    12.2 %    32.3 %   91.4 %
 
+    Plus two OUT-OF-DISTRIBUTION bounds that are not discriminators and are not
+    tuned against the click distribution at all — they reject values that cannot
+    be measurements:
+
+        SPR < 100                — extremely tonal; 0.4 % of candidates, but it
+                                   catches 100 % of the single-bin iFFT blowups
+        peak_SNR <= 1e4          — non-physical amplitude; 12.7x the highest
+                                   labelled click, 0 clicks lost
+
     ⚠️ NaN PASSES every gate. A row whose feature could not be measured cannot be
     judged by it — harmonic_confinement is NaN on ~23 % of rows by design, and
     every v6 feature is NaN when b3_frames == 0. Note this is the OPPOSITE of the
@@ -3389,6 +3431,10 @@ def _stage2_reason(cand: dict, mode: str = None) -> str:
     # thing about why a row was dropped.
     if _lt('peak_SNR', snr_min):
         return STAGE_BLOCKED_SNR
+    # Sanity bound, checked right after the floor so the two peak_SNR tests sit
+    # together. Not a discriminator — nothing real lives up here.
+    if _gt('peak_SNR', STAGE2_PEAK_SNR_MAX):
+        return STAGE_BLOCKED_NONPHYS
     if _lt('n_seg', STAGE2_N_SEG_MIN):
         return STAGE_BLOCKED_NSEG
     if _lt('local_crest', STAGE2_LOCAL_CREST_MIN):
