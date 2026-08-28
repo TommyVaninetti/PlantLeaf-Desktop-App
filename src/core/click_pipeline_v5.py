@@ -16,17 +16,40 @@
 # along with PlantLeaf. If not, see <https://www.gnu.org/licenses/>.
 
 """
-PlantLeaf — Click Detection Pipeline v5.0
-==========================================
+PlantLeaf — Click Detection Pipeline
+====================================
 
 Full pipeline for automatic ultrasonic click detection using an adaptive noise
 estimator and a Support Vector Machine (SVM) classifier.
 
+⚠️ THE FILENAME SAYS v5. THE MODULE SERVES BOTH v5 AND v6.
+There is only one pipeline module, and it has never been forked. Which algorithm
+version runs is chosen by CONSTANTS and by the LOADED MODEL, never by importing a
+different file:
+
+    Stage 1   STAGE1_MODE   — STAGE1_MODE_V51 (peak picking) is the default;
+                              STAGE1_MODE_V5 (run-length) stays selectable.
+    Stage 2   STAGE2_MODE   — STAGE2_MODE_CONSERVATIVE (v6) is the default;
+                              STAGE2_MODE_V5 (the fit gate) stays selectable.
+    Stage 3   the model     — svm_model['features'] and ['threshold'] decide what
+                              is scored and where the cut falls, and
+                              ['nan_policy'] decides how sentinels are encoded.
+                              Nothing about Stage 3 is hardcoded here.
+    Stage 4   unchanged between versions.
+
+So a v5 run and a v6 run differ only in those settings. The name is kept because
+~20 modules and 11 by-path test scripts import it, and because a copy would mean
+two Stage 1s and two Stage 2s drifting apart. Renaming is a mechanical change if
+it is ever wanted; forking is not.
+
 Architecture (four stages):
-  Stage 1  – Adaptive energy threshold + run-length filter
+  Stage 1  – Adaptive energy threshold, then peak picking (v5.1) or run-length (v5)
              [compute_features_v5 is called between Stage 1 and Stage 2 by the caller]
-  Stage 2  – Valid-fit and OOD gate: R² ≥ STAGE2_R2_MIN, SPR < STAGE2_SPR_MAX
-  Stage 3  – SVM classification (RBF kernel, 16 features, calibrated threshold)
+  Stage 2  – v6: gates on measurable features (peak_SNR, n_seg, local_crest,
+             harmonic_confinement) plus OOD sanity bounds.
+             v5: valid-fit and OOD gate — R² ≥ STAGE2_R2_MIN, SPR < STAGE2_SPR_MAX
+  Stage 3  – SVM classification (kernel, feature set and threshold all read from
+             the model file; the deployed v6 model is RBF over 7 features)
   Stage 4  – Deduplication (merge nearby detections from the same physical click)
 
 The old v4 Stage 2 (FFT hard-threshold filters on SPR and peak FFT amplitude) has
@@ -470,6 +493,36 @@ STAGE_BLOCKED_CREST = 'Stage2_crest'  # no local prominence over its own backgro
 STAGE_BLOCKED_HARM  = 'Stage2_harm'   # energy confined to a 40/80 kHz harmonic pair
 STAGE_BLOCKED_SVM   = 'Stage3_SVM'    # SVM scored it below the decision threshold
 STAGE_BLOCKED_DEDUP = 'Stage4_dedup'  # duplicate of a higher-confidence detection
+
+#: Every verdict a candidate can carry other than STAGE_OK, in funnel order.
+#: stage_summary() builds its counters from this, so a gate added to Stage 2
+#: later is counted automatically instead of being silently dropped — which is
+#: exactly what happened to the five v6 verdicts when they were introduced and
+#: stage_summary still listed only the four v5 ones by hand.
+STAGE_BLOCKED_ALL = (
+    STAGE_BLOCKED_R2,
+    STAGE_BLOCKED_SPR,
+    STAGE_BLOCKED_SNR,
+    STAGE_BLOCKED_NONPHYS,
+    STAGE_BLOCKED_NSEG,
+    STAGE_BLOCKED_CREST,
+    STAGE_BLOCKED_HARM,
+    STAGE_BLOCKED_SVM,
+    STAGE_BLOCKED_DEDUP,
+)
+
+#: The Stage-2 subset of the above — what a UI means by "blocked at the gates".
+#: Callers that want a single gate count should sum these rather than adding up
+#: whichever two verdicts happened to exist when the call site was written.
+STAGE_BLOCKED_STAGE2 = (
+    STAGE_BLOCKED_R2,
+    STAGE_BLOCKED_SPR,
+    STAGE_BLOCKED_SNR,
+    STAGE_BLOCKED_NONPHYS,
+    STAGE_BLOCKED_NSEG,
+    STAGE_BLOCKED_CREST,
+    STAGE_BLOCKED_HARM,
+)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -3061,18 +3114,42 @@ def compute_features_v5(
 
 def load_svm_model(model_path: Path) -> dict:
     """
-    Load a PlantLeaf v5 SVM model from a .pkl file produced by train_svm.py.
+    Load a PlantLeaf SVM model from a .pkl file produced by train_svm.py.
+
+    VERSION-AGNOSTIC: this loads a v5 or a v6 model equally, and the caller does
+    not need to know which. The model dict is the single source of truth for
+    everything Stage 3 does — feature set, feature ORDER, decision threshold and
+    sentinel encoding all travel inside it.
 
     Called ONCE at application startup (or when the user loads a new model file)
     and the returned dict is kept in memory and passed to run_stage3_v5 for every
     recording. Do NOT call this per-frame.
 
+    Despite the .pkl extension these are joblib archives, not plain pickles:
+    joblib stores the numpy arrays as raw buffers appended after the pickle
+    stream, so pickle.load() fails partway through with an UnpicklingError. Load
+    them with joblib, as below.
+
     Expected dict keys in the .pkl (all written by train_svm.py):
-        'pipeline'    : fitted sklearn Pipeline (SimpleImputer → StandardScaler → SVC)
+        'pipeline'    : fitted sklearn Pipeline. v5 is
+                        SimpleImputer(mean) → StandardScaler → SVC;
+                        the deployed v6 is
+                        SimpleImputer(median) → PowerTransformer(yeo-johnson) → SVC.
         'threshold'   : float — optimal decision threshold from ROC optimisation
         'features'    : list[str] — ordered feature names the model was trained on
         'kernel'      : str  — 'linear' or 'rbf' (informational)
         'all_results' : dict — per-kernel AUC and threshold (informational)
+
+    v6 models additionally carry (absent on v5-era files):
+        'nan_policy'  : 'nan' | 'sentinel' — how the decay-fit failures were
+                        encoded during TRAINING. _stage3_scores branches on this
+                        to reproduce the same encoding at inference; a model
+                        saved before the key existed is v5-era by definition, so
+                        the read there defaults to 'sentinel'. Getting this wrong
+                        is a train/serve skew on ~90 % of candidates, in whichever
+                        direction the mismatch runs.
+        'mode'        : 'v5' | 'v6' — which trainer preset produced it
+                        (informational; nothing branches on it).
 
     Parameters
     ----------
@@ -3478,8 +3555,11 @@ def run_stage3_v5(candidates: list, svm_model: dict) -> tuple:
     Stage 3 of the v5 click detection pipeline: SVM classification  (§12).
 
     Feeds the feature vector of every Stage 2 survivor into the pre-trained
-    sklearn Pipeline (SimpleImputer → StandardScaler → SVC with Platt scaling)
-    and applies the optimised decision threshold to obtain the binary prediction.
+    sklearn Pipeline (imputer → scaler → SVC with Platt scaling) and applies the
+    optimised decision threshold to obtain the binary prediction. The exact steps
+    depend on the model: v5 is SimpleImputer(mean) → StandardScaler, the deployed
+    v6 is SimpleImputer(median) → PowerTransformer(yeo-johnson). Stage 3 does not
+    care — it calls predict_proba on whatever Pipeline the model file contains.
 
     The feature order and the decision threshold are both read from the model
     dict (loaded once by load_svm_model). The pipeline module never hardcodes
@@ -3497,7 +3577,8 @@ def run_stage3_v5(candidates: list, svm_model: dict) -> tuple:
         Stage 2 survivors. Each dict must contain every feature name listed in
         svm_model['features']. Any feature value that is NaN (e.g. from a
         degenerate frame) is handled by the SimpleImputer in the pipeline, which
-        fills it with the training-set mean — safe but worth monitoring.
+        fills it with the training-set mean (v5) or median (v6) — safe, but
+        worth monitoring.
 
     svm_model : dict
         Dict returned by load_svm_model. Must contain:
@@ -3787,17 +3868,22 @@ def stage_summary(annotated: list) -> dict:
     Returns
     -------
     dict
-        {'total', 'Stage2_R2', 'Stage2_SPR', 'Stage3_SVM', 'Stage4_dedup',
-         'confirmed'}. The four blocked counts plus 'confirmed' sum to 'total'.
+        {'total', 'confirmed', 'unknown'} plus one key per verdict in
+        STAGE_BLOCKED_ALL. Every blocked count plus 'confirmed' plus 'unknown'
+        sums to 'total', by construction — see the note below.
+
+    ⚠️ THIS USED TO UNDER-REPORT. The counter dict was written out by hand with
+    the four v5 verdicts, and the loop body was `elif verdict in counts`. When
+    Stage 2 was rebuilt for v6 the five new verdicts (Stage2_SNR, Stage2_nonphys,
+    Stage2_nseg, Stage2_crest, Stage2_harm) matched neither branch and were
+    dropped on the floor: a candidate blocked by the v6 SNR floor was counted
+    nowhere, so the funnel silently failed to reconcile and every UI reading it
+    under-reported the gates. Building from STAGE_BLOCKED_ALL is what stops the
+    next gate from doing the same thing, and 'unknown' is what makes it loud
+    rather than lossy if a verdict ever arrives from outside this module.
     """
-    counts = {
-        'total':               len(annotated),
-        STAGE_BLOCKED_R2:      0,
-        STAGE_BLOCKED_SPR:     0,
-        STAGE_BLOCKED_SVM:     0,
-        STAGE_BLOCKED_DEDUP:   0,
-        'confirmed':           0,
-    }
+    counts = {'total': len(annotated), 'confirmed': 0, 'unknown': 0}
+    counts.update({verdict: 0 for verdict in STAGE_BLOCKED_ALL})
 
     for row in annotated:
         verdict = row.get('stage_blocked', STAGE_OK)
@@ -3805,5 +3891,7 @@ def stage_summary(annotated: list) -> dict:
             counts['confirmed'] += 1
         elif verdict in counts:
             counts[verdict] += 1
+        else:
+            counts['unknown'] += 1
 
     return counts

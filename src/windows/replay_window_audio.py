@@ -2483,12 +2483,17 @@ class ReplayWindowAudio(ReplayBaseWindow):
         self.btn_detect_clicks.setEnabled(True)
         self.btn_export_detections.setEnabled(bool(self._v5_detections))
 
-        from core.click_pipeline_v5 import stage_summary
+        from core.click_pipeline_v5 import STAGE_BLOCKED_STAGE2, stage_summary
         counts = stage_summary(self._v5_detections)
+
+        # Sum every Stage-2 verdict rather than the two v5 ones: under the v6
+        # gates R2 and SPR are ~always zero, so adding just those reported
+        # "gates 0" on runs where the SNR/nseg/crest/harm gates did the work.
+        n_gates = sum(counts[v] for v in STAGE_BLOCKED_STAGE2)
 
         self.label_detect_status.setText(
             f"{counts['total']} candidates → {counts['confirmed']} confirmed  "
-            f"(gates {counts['Stage2_R2'] + counts['Stage2_SPR']}, "
+            f"(gates {n_gates}, "
             f"SVM {counts['Stage3_SVM']}, dedup {counts['Stage4_dedup']})"
         )
 
@@ -2510,13 +2515,18 @@ class ReplayWindowAudio(ReplayBaseWindow):
         self.detection_table.setRowCount(len(visible))
 
         # Tint per verdict, so the blocked rows read at a glance in 'All candidates'.
-        tints = {
+        # Every Stage-2 verdict shares the same grey: the distinction a reader
+        # wants at a glance is "gate / SVM / dedup", and the exact gate is already
+        # spelled out in the verdict column. Built from STAGE_BLOCKED_STAGE2 so a
+        # new gate cannot end up as the one untinted row in the table.
+        from core.click_pipeline_v5 import STAGE_BLOCKED_STAGE2
+        _GATE_GREY = QColor(120, 120, 120, 45)
+        tints = {v: _GATE_GREY for v in STAGE_BLOCKED_STAGE2}
+        tints.update({
             '':             QColor(46, 125, 50, 60),    # confirmed — green
-            'Stage2_R2':    QColor(120, 120, 120, 45),  # invalid fit — grey
-            'Stage2_SPR':   QColor(120, 120, 120, 45),
             'Stage3_SVM':   QColor(211, 47, 47, 45),    # SVM said noise — red
             'Stage4_dedup': QColor(255, 152, 0, 45),    # duplicate — amber
-        }
+        })
 
         for r, det in enumerate(visible):
             verdict = det.get('stage_blocked', '')
@@ -2595,12 +2605,35 @@ class ReplayWindowAudio(ReplayBaseWindow):
                 QUALITY_COLUMNS, STAGE1_COLUMNS, HARMONIC_COLUMNS,
             )
             from core.click_pipeline_v5 import (
-                STAGE1_MODE, PEAK_REFRACTORY_R, LOCAL_CREST_C,
+                STAGE1_MODE, PEAK_REFRACTORY_R, LOCAL_CREST_C, STAGE2_MODE,
             )
 
             k_used = self.PeakThresholdSpinBox.value()
             stage1_params = (f'{STAGE1_MODE};k={k_used:.2f};'
                              f'R={PEAK_REFRACTORY_R};C={LOCAL_CREST_C}')
+
+            # Detection ran through ClickDetectionWorker without a stage2_mode
+            # override, so the module default is what actually produced these
+            # verdicts. Recording it keeps replay exports comparable with the
+            # Data Collection dialog's, which has always filled this column.
+            stage2_mode_used = STAGE2_MODE
+
+            # STAGE1_COLUMNS is imported to be CHECKED, not iterated: the five
+            # fields below are passed explicitly because they are not all the
+            # same type (run_crest is a float, the rest are ints) and the Data
+            # Collection dialog writes them the same explicit way. The guard is
+            # what makes that safe — a column added to STAGE1_COLUMNS later fails
+            # loudly here instead of being written empty, which is the exact
+            # regression described in the comment below.
+            _stage1_passed = {
+                'run_id', 'run_length', 'run_crest', 'pos_in_run', 'would_pass_v5',
+            }
+            _stage1_missing = [c for c in STAGE1_COLUMNS if c not in _stage1_passed]
+            if _stage1_missing:
+                raise RuntimeError(
+                    f"replay export does not fill Stage 1 column(s) "
+                    f"{_stage1_missing}; add them to the CandidateData call below."
+                )
 
             # Build a real CandidateData and let IT write the row.
             #
@@ -2649,6 +2682,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
                         canonical_frame_idx=_i(det, 'canonical_frame_idx'),
                         session_id=stem,
                         stage1_params=stage1_params,
+                        stage2_mode=stage2_mode_used,
                         k_ratio=k_ratio,
                         run_id=_i(det, 'run_id', -1),
                         run_length=_i(det, 'run_length'),
