@@ -1893,7 +1893,12 @@ def _fit_decay_segment(
     }
 
 
-def fit_result_to_nan(fit: dict) -> dict:
+#: The columns fit_result_to_nan blanks by default -- the two that really are
+#: sentinel-coded. fit_coverage is deliberately NOT here; see the docstring.
+FIT_SENTINEL_COLS = ('tau_ms', 'R2')
+
+
+def fit_result_to_nan(fit: dict, include_coverage: bool = True) -> dict:
     """
     Rewrite a fit result into the PHASE-2 EXPORT FORM: NaN, never a sentinel
     (v6 §7.5.3, decision D20).
@@ -1937,12 +1942,24 @@ def fit_result_to_nan(fit: dict) -> dict:
     i.e. a perfectly flat log-envelope, on the normal path. Only the first is a
     failure. fit_valid separates them correctly; a blanket "R2 == 0 → NaN" rewrite
     would not.
+
+    ⚠️ fit_coverage IS NOT A SENTINEL, and include_coverage=False says so.
+    Measured over the v6 corpus: of 363 552 rows with fit_valid == 0, only
+    3 802 have fit_coverage == 0.0. The other 359 750 carry a real
+    measurement — n_fit / decay_len, computed and returned on the failure
+    paths above — saying how much of the decay window the fitter got through
+    before giving up. Blanking it destroys that.
+
+    include_coverage defaults to True so the Phase-2 export form (D20) and the
+    tests covering it are unchanged. Stage 3 and train_svm pass False: a model
+    is better off with a measured coverage than with an imputed median.
     """
     out = dict(fit)
     if not int(out.get('fit_valid', 0)):
-        out['tau_ms'] = float('nan')
-        out['R2'] = float('nan')
-        out['fit_coverage'] = float('nan')
+        for _col in FIT_SENTINEL_COLS:
+            out[_col] = float('nan')
+        if include_coverage:
+            out['fit_coverage'] = float('nan')
     return out
 
 
@@ -3551,8 +3568,27 @@ def _stage3_scores(candidates: list, svm_model: dict) -> np.ndarray:
     # Values are extracted in the exact column order the SVM was trained on.
     # float64 is used throughout: the SVC C extension requires it, and it avoids
     # the silent overflow that affected float32 on large peak_SNR values.
+    # ── SENTINEL → NaN, so training and inference see the SAME encoding ──────
+    # The pipeline emits tau_ms = -1.0 / R2 = 0.0 when the decay fit fails, on
+    # 90.2 % of candidates. A v6 model is fitted AFTER converting those to NaN,
+    # so its Pipeline imputes them; serving it the raw -1.0 would be a
+    # train/serve skew affecting nearly every candidate.
+    #
+    # ⚠️ THIS MUST FOLLOW THE MODEL, NOT THE PIPELINE VERSION. The shipped v5
+    # model was trained ON the sentinels, so converting for it would create the
+    # very skew this exists to prevent, in the opposite direction. The training
+    # run stamps its choice into model['nan_policy']; a model saved before that
+    # key existed is v5-era by definition, hence the 'sentinel' default.
+    #
+    # include_coverage=False: fit_coverage is a real measurement even when the
+    # fit fails (see fit_result_to_nan), so it is passed through untouched.
+    if svm_model.get('nan_policy', 'sentinel') == 'nan':
+        prepared = [fit_result_to_nan(c, include_coverage=False) for c in candidates]
+    else:
+        prepared = candidates
+
     X = np.array(
-        [[cand.get(f, np.nan) for f in feat_names] for cand in candidates],
+        [[cand.get(f, np.nan) for f in feat_names] for cand in prepared],
         dtype=np.float64,
     )
 
