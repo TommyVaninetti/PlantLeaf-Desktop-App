@@ -81,6 +81,21 @@ class BubbleParameters:
     # Soglia minima del raggio per considerare il collasso completato [m]
     R_COLLAPSE_THRESHOLD = 1.0e-7  # 0.1 µm — collasso praticamente completo
 
+class BubbleResonance:
+    """
+    Parametri del modello di risonanza di bolla smorzata da irraggiamento
+    acustico (Minnaert + smorzamento radiativo/viscoso).
+
+    A differenza del precedente modello con guscio elastico arbitrario,
+    qui frequenza e tempo di decadimento del click dipendono SOLO da R0,
+    tramite formule fisiche standard (letteratura: Minnaert 1933; Brennen
+    1995; validato numericamente per il caso xylematico).
+    """
+
+    # Frazione di perturbazione iniziale del raggio rispetto a R0
+    # (ampiezza dell'oscillazione, non influenza frequenza o tau)
+    PERTURBATION_FRACTION = 0.10
+
 
 # =============================================================================
 # TENSIONE IDRICA DELLO XILEMA
