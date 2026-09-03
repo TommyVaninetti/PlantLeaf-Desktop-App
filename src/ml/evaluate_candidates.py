@@ -98,7 +98,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'core')) #KEEP I
 from click_pipeline_v5 import (   # noqa: E402
     _stage2_reason,                        # THE Stage 2 rule — called, never copied
     STAGE_OK,
-    DEDUP_WINDOW_FRAMES as _DEDUP_FRAMES,  # Frame-index proximity window for deduplication (Stage 4)
+    FIT_SENTINEL_COLS,                     # ('tau_ms', 'R2') — what nan_policy rewrites
+    PEAK_MATCH_SAMPLES as _PEAK_MATCH,     # Stage 4 identity window, in SAMPLES
+    DEDUP_WINDOW_FRAMES as _DEDUP_FRAMES,  # Stage 4 fallback for CSVs with no peak_abs
 )
 
 # All 17 feature names in the order computed by compute_features_v5.
@@ -112,6 +114,21 @@ _ALL_FEATURES = [
     'kurtosis', 'centroid_shift_hz',
     'tau_ms', 'R2', 'fit_coverage',
     'SPR', 'R_spectral', 'FPE_hz',
+]
+
+# The v6 additions, plus the quality flags and Stage-2 inputs that are not v5
+# features. Listed here ONLY so load_csvs applies the Italian-locale decimal-comma
+# coercion to them as well. Without it a v6 column that has been through Excel
+# arrives as the string "1,43", _stage2_reason's float() raises, and its except
+# branch reads that as "pass the gate" — a gate silently disabled on exactly the
+# files a human has opened.
+_V6_NUMERIC = [
+    'peak_abs', 'k_ratio', 'E_hat_floor', 'noise_floor_mV', 'std_noise_mV',
+    'spectral_entropy', 'shape_novelty', 'spectral_tilt', 'temporal_concentration',
+    'FPE_hz_region', 'SPR_region', 'f_50_hz', 'IQR_f',
+    'harmonic_confinement', 'hc_f1_hz', 'hc_r_A', 'hc_r_B', 'local_crest',
+    'fit_valid', 'decay_len', 'n_seg', 'b3_frames', 'gibbs_fired',
+    'run_id', 'run_length', 'run_crest', 'pos_in_run', 'would_pass_v5',
 ]
 
 
@@ -161,7 +178,7 @@ def load_csvs(paths: list[Path]) -> pd.DataFrame:
         df['_source_csv'] = str(p)   # keep provenance; dropped before output
 
         # Coerce feature columns — handle "12,73" → 12.73 from Italian locale
-        for col in _ALL_FEATURES:
+        for col in _ALL_FEATURES + _V6_NUMERIC:
             if col not in df.columns:
                 continue
             if df[col].dtype == object:
@@ -244,6 +261,19 @@ def apply_stage3(df: pd.DataFrame, model: dict) -> pd.DataFrame:
     The feature vector is built in the exact column order stored in
     model['features']. Any missing or NaN feature value is handled by the
     SimpleImputer embedded in the sklearn Pipeline.
+
+    ⚠️ `model['nan_policy']` IS HONOURED HERE, exactly as click_pipeline_v5.run_stage3_v5
+    honours it. A v6 model is fitted after tau_ms / R2 have been rewritten to NaN
+    on the rows where the decay fit failed, and that is 90.2 % of candidates —
+    serving it the raw -1.0 / 0.0 sentinels the CSV carries would be a train/serve
+    skew affecting nearly every row. The v5 models were trained ON the sentinels,
+    so the 'sentinel' default must stay: converting for them would create the same
+    skew in the opposite direction. The key is stamped by train_svm.py; a model
+    saved before it existed is v5-era by definition.
+
+    include_coverage is effectively False here (fit_coverage is left untouched):
+    it is a real measurement even when the fit fails, and run_stage3_v5 passes
+    False for the same reason.
     """
     pipeline   = model['pipeline']
     threshold  = float(model['threshold'])
@@ -263,7 +293,22 @@ def apply_stage3(df: pd.DataFrame, model: dict) -> pd.DataFrame:
         sys.exit(1)
 
     # Build feature matrix — float64 required by libsvm
-    X = df.loc[s2_mask, feat_names].values.astype(np.float64)
+    X_df = df.loc[s2_mask, feat_names].astype(np.float64)
+
+    # ── SENTINEL → NaN, so training and inference see the SAME encoding ──────
+    if model.get('nan_policy', 'sentinel') == 'nan':
+        if 'fit_valid' in df.columns:
+            failed = df.loc[s2_mask, 'fit_valid'].fillna(0).astype(float) == 0.0
+            hit = [c for c in FIT_SENTINEL_COLS if c in X_df.columns]
+            if hit:
+                X_df.loc[failed, hit] = np.nan
+                print(f"  Stage 3: nan_policy='nan' — {int(failed.sum())} row(s) had "
+                      f"{', '.join(hit)} rewritten to NaN (fit_valid == 0)")
+        else:
+            print("  Stage 3: WARNING — model declares nan_policy='nan' but the CSV "
+                  "has no 'fit_valid' column; sentinels left as-is (train/serve skew)")
+
+    X = X_df.values
 
     # predict_proba column 1 = P(click)
     proba = pipeline.predict_proba(X)[:, 1]
@@ -290,13 +335,25 @@ def apply_stage4(df: pd.DataFrame) -> pd.DataFrame:
     """
     Deduplicate Stage 3 survivors within each recording.
 
-    Two detections from the same recording (same 'file' value) are considered
-    duplicates of the same physical click when their frame indices are within
-    _DEDUP_FRAMES of each other. From each such group, only the detection with
-    the highest svm_probability is kept; the others are tagged 'Stage4_dedup'.
+    Two detections from the same recording (same 'file' value) are duplicates of
+    one physical click when their ABSOLUTE PEAK SAMPLES are within _PEAK_MATCH of
+    each other. From each such group only the highest svm_probability is kept;
+    the others are tagged 'Stage4_dedup'.
+
+    ⚠️ peak_abs, NOT frame_idx — this is run_stage4_v5's rule, and the difference
+    is not cosmetic. The old frame-gap rule chained singly at a gap of
+    _DEDUP_FRAMES frames (7.7 ms), so a genuine burst of closely spaced clicks
+    collapsed into ONE detection and could chain indefinitely down the burst.
+    Any click-rate or burstiness analysis reads that as a flat recording. Both
+    candidates of one frame-straddling click carry an integer-identical peak_abs
+    by construction (resolve_click), so the sample rule merges exactly those.
+
+    The frame_idx rule is kept as a fallback for v5-schema CSVs, which predate
+    the peak_abs column. It is announced when it fires, because its counts are
+    not comparable with the peak_abs ones.
 
     Deduplication is performed per recording (per unique 'file' value) so that
-    events at similar frame positions in different files are never merged.
+    events at similar positions in different files are never merged.
     """
     # Only rows confirmed by Stage 3 (svm_prediction == 1, stage_blocked == '')
     click_mask = (df['stage_blocked'] == '') & (df['svm_prediction'] == 1)
@@ -308,21 +365,36 @@ def apply_stage4(df: pd.DataFrame) -> pd.DataFrame:
 
     n_deduped = 0
 
+    # peak_abs when the export has it (v6), frame_idx otherwise (v5-schema CSVs).
+    # `key_col` also picks the window: 8 samples vs 3 frames.
+    has_peak_abs = ('peak_abs' in df.columns
+                    and pd.to_numeric(df.loc[click_mask, 'peak_abs'],
+                                      errors='coerce').notna().all())
+    if has_peak_abs:
+        key_col, window = 'peak_abs', _PEAK_MATCH
+    else:
+        key_col, window = 'frame_idx', _DEDUP_FRAMES
+        print(f"  Stage 4: no usable 'peak_abs' column — falling back to the v5 "
+              f"frame_idx rule (gap <= {_DEDUP_FRAMES} frames). Counts are NOT "
+              f"comparable with a peak_abs run.")
+
+    keys = pd.to_numeric(df[key_col], errors='coerce')
+
     # Process per recording so proximity groups never cross file boundaries
     for file_id, group_df in df[click_mask].groupby('file'):
-        sorted_idx = group_df.sort_values('frame_idx').index.tolist()
+        sorted_idx = keys.loc[group_df.index].sort_values().index.tolist()
 
         if len(sorted_idx) <= 1:
             continue   # single detection in this recording — nothing to merge
 
         # Build proximity groups with single-linkage chaining:
-        # a new group starts whenever the gap to the previous frame exceeds _DEDUP_FRAMES
+        # a new group starts whenever the gap to the previous key exceeds `window`
         groups: list[list] = []
         current_group      = [sorted_idx[0]]
 
         for idx in sorted_idx[1:]:
-            gap = df.at[idx, 'frame_idx'] - df.at[current_group[-1], 'frame_idx']
-            if gap <= _DEDUP_FRAMES:
+            gap = keys.at[idx] - keys.at[current_group[-1]]
+            if gap <= window:
                 current_group.append(idx)
             else:
                 groups.append(current_group)

@@ -151,7 +151,7 @@ PlantLeaf-Desktop-App/
 │   │   ├── collect_training_set.py      # Assemble a labelled training CSV from a corpus
 │   │   ├── train_svm.py                 # SVM training with session-level CV
 │   │   ├── evaluate_candidates.py       # Batch inference on candidate CSVs
-│   │   ├── analyze_dataset.py           # Per-file stats, confusion matrix, plots
+│   │   ├── analyze_dataset.py           # Click rate + time distribution, per file and per folder
 │   │   ├── feature_transforms.py        # Picklable column transforms for the Pipeline
 │   │   ├── v5/                          # Deployed v5 model + training report
 │   │   └── v6/                          # Deployed v6 model + training report
