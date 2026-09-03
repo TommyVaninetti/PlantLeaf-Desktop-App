@@ -23,17 +23,17 @@ The project bridges plant biology, acoustic signal processing, and embedded syst
 
 ### Ultrasonic Click Detection
 - Real-time FFT visualisation of the 20–80 kHz ultrasonic band at 390 FPS
-- 4-stage click detection pipeline v5: adaptive noise floor, hard spectral gates, SVM classifier, deduplication
+- 4-stage click detection pipeline v6: adaptive noise floor, gates on measurable features, SVM classifier, deduplication
 - Time-domain signal reconstruction via inverse FFT (iFFT) with Gibbs suppression and Hilbert envelope
-- 17 acoustic features per candidate: SNR ratios, decay constant τ, R², ZCR, kurtosis, spectral shape
+- ~26 acoustic features computed per candidate: SNR ratios, decay constant τ, R², ZCR, kurtosis, spectral shape, and the v6 excess-spectrum family (entropy, shape novelty, tilt, harmonic confinement)
 - Interactive Stage 1 threshold filter with adaptive noise floor display during replay
-- Batch data collection export: CSV of 17 features + screenshots for manual labelling and model training
+- Batch data collection export: 57-column CSV + screenshots for manual labelling and model training
 
 ### Machine Learning Pipeline
-- SVM classifier (RBF kernel, scikit-learn Pipeline) trained on 285 labeled candidates across 4 species
+- SVM classifier (RBF kernel, scikit-learn Pipeline) trained on 1,136 Stage-2 survivors from 30 sessions (189 confirmed clicks, 4 species)
 - Session-level cross-validation (`StratifiedGroupKFold`) to prevent recording-level data leakage
-- AUC-ROC = 0.835; Set B recall = 0.962 at threshold 0.220 (optimised for recall ≥ 0.90)
-- Offline tools: `train_svm.py`, `evaluate_candidates.py`, `analyze_dataset.py` with per-file confusion matrices and click-rate plots
+- Cross-validated AUC-ROC = 0.929 (recall 0.905 at threshold 0.121, optimised for recall ≥ 0.90); held-out AUC-ROC = 0.958, recall 0.968
+- Offline tools: `collect_training_set.py`, `train_svm.py`, `evaluate_candidates.py`, `analyze_dataset.py` with per-file confusion matrices and click-rate plots
 
 ### Voltage Signal Analysis
 - Real-time acquisition and visualisation of plant electrical signals up to 1 kHz
@@ -77,16 +77,20 @@ python src/main.py
 
 ## Detection Algorithm
 
-The current algorithm (v5) is a 4-stage pipeline that processes continuous FFT streams from the STM32 firmware and identifies cavitation click candidates with high recall:
+The current algorithm (v6) is a 4-stage pipeline that processes continuous FFT streams from the STM32 firmware and identifies cavitation click candidates with high recall:
 
 | Stage | Operation |
 |-------|-----------|
-| **Stage 1** | Adaptive energy threshold: `E_i > k × Ê_floor` — per-frame noise floor estimated by `AdaptiveNoiseEstimatorV5` |
-| **Stage 2** | Hard gates: R² ≥ 0.10 (exponential decay quality) and SPR < 100 (broadband shape) |
-| **Stage 3** | SVM classifier (`SimpleImputer → StandardScaler → SVC`, RBF kernel, C=50, γ=0.01) on 16 acoustic features; threshold = 0.220 |
-| **Stage 4** | Deduplication across consecutive frames |
+| **Stage 1** | Adaptive energy threshold `E_i > k × Ê_floor` (k = 1.5), then **local peak picking** over ±1 frame — nothing is rejected for run length |
+| **Stage 2** | Gates on measurable features: `peak_SNR ≥ 4.5`, `n_seg ≥ 10`, `local_crest ≥ 1.2`, `harmonic_confinement ≤ 1.6`, plus two out-of-distribution bounds. Measured: 83.6 % of noise removed at **zero** cost in confirmed clicks |
+| **Stage 3** | SVM classifier (`SimpleImputer(median) → PowerTransformer(yeo-johnson) → SVC`, RBF kernel, C=50, γ=0.01, class_weight balanced) on 7 acoustic features; threshold = 0.121 |
+| **Stage 4** | Deduplication on the absolute peak sample (`peak_abs`) |
 
-**v5 full specification (current):** [CLICK_DETECTION_ALGORITHM_v5.md](https://github.com/TommyVaninetti/PlantLeaf---documentation/blob/main/App/Automatic_click_detection_algorithm/CLICK_DETECTION_ALGORITHM_v5.md)
+Every Stage 2 threshold is quoted in the specification with the measured percentage of confirmed clicks it costs. The v5 pipeline remains selectable for reproducing older results.
+
+**v6 full specification (current):** [CLICK_DETECTION_ALGORITHM_v6.md](https://github.com/TommyVaninetti/PlantLeaf---documentation/blob/main/App/Automatic_click_detection_algorithm/CLICK_DETECTION_ALGORITHM_v6.md)
+
+**v5 specification (historical):** [CLICK_DETECTION_ALGORITHM_v5.md](https://github.com/TommyVaninetti/PlantLeaf---documentation/blob/main/App/Automatic_click_detection_algorithm/CLICK_DETECTION_ALGORITHM_v5.md)
 
 **v4 specification (historical):** [CLICK_DETECTION_ALGORITHM_v4.md](https://github.com/TommyVaninetti/PlantLeaf---documentation/blob/main/App/Automatic_click_detection_algorithm/CLICK_DETECTION_ALGORITHM_v4.md)
 
@@ -128,7 +132,9 @@ PlantLeaf-Desktop-App/
 │   │   └── app_config.py                # Application-wide constants
 │   │
 │   ├── core/                            # Base classes and pipeline
-│   │   ├── click_pipeline_v5.py         # Full v5 detection pipeline + 17 features
+│   │   ├── click_pipeline_v5.py         # Full detection pipeline — serves BOTH v5 and v6
+│   │   │                                 #   (version chosen by STAGE1_MODE / STAGE2_MODE
+│   │   │                                 #    and by the loaded model, not by the filename)
 │   │   ├── replay_base_window.py        # Shared replay UI (MathOperations dialog)
 │   │   ├── base_window.py
 │   │   ├── file_handler_mixin.py
@@ -142,9 +148,13 @@ PlantLeaf-Desktop-App/
 │   │   └── wake_lock_manager.py
 │   │
 │   ├── ml/                              # Offline machine learning scripts
+│   │   ├── collect_training_set.py      # Assemble a labelled training CSV from a corpus
 │   │   ├── train_svm.py                 # SVM training with session-level CV
 │   │   ├── evaluate_candidates.py       # Batch inference on candidate CSVs
-│   │   └── analyze_dataset.py           # Per-file stats, confusion matrix, plots
+│   │   ├── analyze_dataset.py           # Per-file stats, confusion matrix, plots
+│   │   ├── feature_transforms.py        # Picklable column transforms for the Pipeline
+│   │   ├── v5/                          # Deployed v5 model + training report
+│   │   └── v6/                          # Deployed v6 model + training report
 │   │
 │   ├── plotting/
 │   │   └── plot_manager.py              # PyQtGraph wrappers
