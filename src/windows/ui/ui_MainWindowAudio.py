@@ -16,10 +16,10 @@ from PySide6.QtGui import (QAction, QBrush, QColor, QConicalGradient,
     QIcon, QImage, QKeySequence, QLinearGradient,
     QPainter, QPalette, QPixmap, QRadialGradient,
     QTransform)
-from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QDoubleSpinBox, QFrame,
-    QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-    QLayout, QMainWindow, QMenu, QMenuBar,
-    QPushButton, QSizePolicy, QTableWidget, QTableWidgetItem,
+from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QGroupBox,
+    QHBoxLayout, QHeaderView, QLabel, QLayout,
+    QMainWindow, QMenu, QMenuBar, QPushButton,
+    QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem,
     QToolBar, QVBoxLayout, QWidget)
 
 class Ui_MainWindowAudio(object):
@@ -73,6 +73,12 @@ class Ui_MainWindowAudio(object):
         icon6 = QIcon(QIcon.fromTheme(QIcon.ThemeIcon.DocumentPageSetup))
         self.actionSamplingSettings.setIcon(icon6)
         self.actionSamplingSettings.setMenuRole(QAction.MenuRole.NoRole)
+        self.actionSVM = QAction(MainWindowAudio)
+        self.actionSVM.setObjectName(u"actionSVM")
+        self.actionSVM.setMenuRole(QAction.MenuRole.NoRole)
+        self.actionResetSVM = QAction(MainWindowAudio)
+        self.actionResetSVM.setObjectName(u"actionResetSVM")
+        self.actionResetSVM.setMenuRole(QAction.MenuRole.NoRole)
         self.actionInfo = QAction(MainWindowAudio)
         self.actionInfo.setObjectName(u"actionInfo")
         self.actionInfo.setMenuRole(QAction.MenuRole.NoRole)
@@ -141,33 +147,97 @@ class Ui_MainWindowAudio(object):
         self.mainWidget.setObjectName(u"mainWidget")
         self.verticalLayout_3 = QVBoxLayout(self.mainWidget)
         self.verticalLayout_3.setObjectName(u"verticalLayout_3")
-        self.FFTVLayout = QVBoxLayout()
-        self.FFTVLayout.setObjectName(u"FFTVLayout")
-        self.FFTPlotVLayout = QVBoxLayout()
-        self.FFTPlotVLayout.setObjectName(u"FFTPlotVLayout")
-        self.FFTPlotVLayout.setContentsMargins(0, 0, 0, 0)
-        self.FFTPlotFrame = QFrame(self.mainWidget)
+        self.mainSplitter = QSplitter(self.mainWidget)
+        self.mainSplitter.setObjectName(u"mainSplitter")
+        sizePolicy.setHeightForWidth(self.mainSplitter.sizePolicy().hasHeightForWidth())
+        self.mainSplitter.setSizePolicy(sizePolicy)
+        self.mainSplitter.setOrientation(Qt.Orientation.Horizontal)
+        self.mainSplitter.setChildrenCollapsible(False)
+        self.graphsSplitter = QSplitter(self.mainSplitter)
+        self.graphsSplitter.setObjectName(u"graphsSplitter")
+        sizePolicy.setHeightForWidth(self.graphsSplitter.sizePolicy().hasHeightForWidth())
+        self.graphsSplitter.setSizePolicy(sizePolicy)
+        self.graphsSplitter.setOrientation(Qt.Orientation.Vertical)
+        self.graphsSplitter.setChildrenCollapsible(False)
+        self.IFFTPlotFrame = QFrame(self.graphsSplitter)
+        self.IFFTPlotFrame.setObjectName(u"IFFTPlotFrame")
+        sizePolicy.setHeightForWidth(self.IFFTPlotFrame.sizePolicy().hasHeightForWidth())
+        self.IFFTPlotFrame.setSizePolicy(sizePolicy)
+        self.IFFTPlotFrame.setFrameShape(QFrame.Shape.Box)
+        self.IFFTPlotFrame.setFrameShadow(QFrame.Shadow.Raised)
+        self.IFFTPlotVLayout = QVBoxLayout(self.IFFTPlotFrame)
+        self.IFFTPlotVLayout.setObjectName(u"IFFTPlotVLayout")
+        self.IFFTTitleLabel = QLabel(self.IFFTPlotFrame)
+        self.IFFTTitleLabel.setObjectName(u"IFFTTitleLabel")
+        font2 = QFont()
+        font2.setPointSize(14)
+        self.IFFTTitleLabel.setFont(font2)
+        self.IFFTTitleLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.IFFTPlotVLayout.addWidget(self.IFFTTitleLabel)
+
+        self.IFFTPlotWidget = QWidget(self.IFFTPlotFrame)
+        self.IFFTPlotWidget.setObjectName(u"IFFTPlotWidget")
+        sizePolicy.setHeightForWidth(self.IFFTPlotWidget.sizePolicy().hasHeightForWidth())
+        self.IFFTPlotWidget.setSizePolicy(sizePolicy)
+        self.IFFTPlotWidget.setMinimumSize(QSize(420, 160))
+
+        self.IFFTPlotVLayout.addWidget(self.IFFTPlotWidget)
+
+        self.graphsSplitter.addWidget(self.IFFTPlotFrame)
+        self.FFTPlotFrame = QFrame(self.graphsSplitter)
         self.FFTPlotFrame.setObjectName(u"FFTPlotFrame")
         self.FFTPlotFrame.setEnabled(True)
         sizePolicy.setHeightForWidth(self.FFTPlotFrame.sizePolicy().hasHeightForWidth())
         self.FFTPlotFrame.setSizePolicy(sizePolicy)
         self.FFTPlotFrame.setFrameShape(QFrame.Shape.Box)
         self.FFTPlotFrame.setFrameShadow(QFrame.Shadow.Raised)
-        self.horizontalLayout_3 = QHBoxLayout(self.FFTPlotFrame)
-        self.horizontalLayout_3.setObjectName(u"horizontalLayout_3")
-        self.FFTPlotHLayout = QHBoxLayout()
-        self.FFTPlotHLayout.setObjectName(u"FFTPlotHLayout")
+        self.FFTPlotVLayout = QVBoxLayout(self.FFTPlotFrame)
+        self.FFTPlotVLayout.setObjectName(u"FFTPlotVLayout")
+        self.FFTModeHLayout = QHBoxLayout()
+        self.FFTModeHLayout.setObjectName(u"FFTModeHLayout")
+        self.FFTModeHLayout.setContentsMargins(0, 0, 0, 0)
+        self.FFTModeLabel = QLabel(self.FFTPlotFrame)
+        self.FFTModeLabel.setObjectName(u"FFTModeLabel")
+        self.FFTModeLabel.setFont(font2)
+
+        self.FFTModeHLayout.addWidget(self.FFTModeLabel)
+
+        self.FFTModeComboBox = QComboBox(self.FFTPlotFrame)
+        self.FFTModeComboBox.addItem("")
+        self.FFTModeComboBox.addItem("")
+        self.FFTModeComboBox.setObjectName(u"FFTModeComboBox")
+        self.FFTModeComboBox.setFont(font2)
+
+        self.FFTModeHLayout.addWidget(self.FFTModeComboBox)
+
+        self.FFTModeHLayout.addStretch(1)
+
+        self.FFTPlotVLayout.addLayout(self.FFTModeHLayout)
+
         self.FFTPotWidget = QWidget(self.FFTPlotFrame)
         self.FFTPotWidget.setObjectName(u"FFTPotWidget")
         sizePolicy.setHeightForWidth(self.FFTPotWidget.sizePolicy().hasHeightForWidth())
         self.FFTPotWidget.setSizePolicy(sizePolicy)
-        self.FFTPotWidget.setMinimumSize(QSize(625, 245))
+        self.FFTPotWidget.setMinimumSize(QSize(420, 200))
 
-        self.FFTPlotHLayout.addWidget(self.FFTPotWidget)
+        self.FFTPlotVLayout.addWidget(self.FFTPotWidget)
 
-        self.FFTTableVLayout = QVBoxLayout()
-        self.FFTTableVLayout.setObjectName(u"FFTTableVLayout")
-        self.FFTClicksDetectedLabel = QLabel(self.FFTPlotFrame)
+        self.graphsSplitter.addWidget(self.FFTPlotFrame)
+        self.graphsSplitter.setStretchFactor(0, 2)
+        self.graphsSplitter.setStretchFactor(1, 3)
+        self.graphsSplitter.setSizes([280, 420])
+
+        self.mainSplitter.addWidget(self.graphsSplitter)
+        self.rightPanel = QWidget(self.mainSplitter)
+        self.rightPanel.setObjectName(u"rightPanel")
+        sizePolicy.setHeightForWidth(self.rightPanel.sizePolicy().hasHeightForWidth())
+        self.rightPanel.setSizePolicy(sizePolicy)
+        self.rightPanel.setMinimumWidth(620)
+        self.rightPanelVLayout = QVBoxLayout(self.rightPanel)
+        self.rightPanelVLayout.setObjectName(u"rightPanelVLayout")
+        self.rightPanelVLayout.setContentsMargins(0, 0, 0, 0)
+        self.FFTClicksDetectedLabel = QLabel(self.rightPanel)
         self.FFTClicksDetectedLabel.setObjectName(u"FFTClicksDetectedLabel")
         font1 = QFont()
         font1.setPointSize(21)
@@ -175,39 +245,26 @@ class Ui_MainWindowAudio(object):
         self.FFTClicksDetectedLabel.setFont(font1)
         self.FFTClicksDetectedLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.FFTTableVLayout.addWidget(self.FFTClicksDetectedLabel)
+        self.rightPanelVLayout.addWidget(self.FFTClicksDetectedLabel)
 
-        self.FFTClicksDetectedTableWidget = QTableWidget(self.FFTPlotFrame)
+        self.FFTClicksDetectedTableWidget = QTableWidget(self.rightPanel)
         if (self.FFTClicksDetectedTableWidget.columnCount() < 5):
             self.FFTClicksDetectedTableWidget.setColumnCount(5)
         self.FFTClicksDetectedTableWidget.setObjectName(u"FFTClicksDetectedTableWidget")
         self.FFTClicksDetectedTableWidget.setColumnCount(5)
+        sizePolicy.setHeightForWidth(self.FFTClicksDetectedTableWidget.sizePolicy().hasHeightForWidth())
+        self.FFTClicksDetectedTableWidget.setSizePolicy(sizePolicy)
 
-        self.FFTTableVLayout.addWidget(self.FFTClicksDetectedTableWidget)
+        self.rightPanelVLayout.addWidget(self.FFTClicksDetectedTableWidget)
 
-        self.FFTPlotHLayout.addLayout(self.FFTTableVLayout)
-
-        self.FFTPlotHLayout.setStretch(0, 3)
-        self.FFTPlotHLayout.setStretch(1, 1)
-
-        self.horizontalLayout_3.addLayout(self.FFTPlotHLayout)
-
-
-        self.FFTPlotVLayout.addWidget(self.FFTPlotFrame)
-
-
-        self.FFTVLayout.addLayout(self.FFTPlotVLayout)
-
-        self.FFTInfoGroupBox = QGroupBox(self.mainWidget)
+        self.FFTInfoGroupBox = QGroupBox(self.rightPanel)
         self.FFTInfoGroupBox.setObjectName(u"FFTInfoGroupBox")
-        sizePolicy1 = QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        sizePolicy1 = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         sizePolicy1.setHorizontalStretch(0)
         sizePolicy1.setVerticalStretch(0)
         sizePolicy1.setHeightForWidth(self.FFTInfoGroupBox.sizePolicy().hasHeightForWidth())
         self.FFTInfoGroupBox.setSizePolicy(sizePolicy1)
-        self.FFTInfoGroupBox.setMaximumSize(QSize(950, 70))
-        font2 = QFont()
-        font2.setPointSize(14)
+        self.FFTInfoGroupBox.setMaximumSize(QSize(16777215, 70))
         self.FFTInfoGroupBox.setFont(font2)
         self.FFTInfoGroupBox.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.horizontalLayout_2 = QHBoxLayout(self.FFTInfoGroupBox)
@@ -217,6 +274,9 @@ class Ui_MainWindowAudio(object):
         self.horizontalLayout_2.setObjectName(u"horizontalLayout_2")
         self.horizontalLayout_2.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         self.horizontalLayout_2.setContentsMargins(5, 5, 5, 5)
+
+        self.horizontalLayout_2.addStretch(1)
+
         self.FFTStartStopButton = QPushButton(self.FFTInfoGroupBox)
         self.FFTStartStopButton.setObjectName(u"FFTStartStopButton")
         self.FFTStartStopButton.setEnabled(True)
@@ -235,44 +295,6 @@ class Ui_MainWindowAudio(object):
         self.FFTStartStopButton.setChecked(False)
 
         self.horizontalLayout_2.addWidget(self.FFTStartStopButton)
-
-        self.FFTInfoFrame1 = QFrame(self.FFTInfoGroupBox)
-        self.FFTInfoFrame1.setObjectName(u"FFTInfoFrame1")
-        self.FFTInfoFrame1.setFrameShape(QFrame.Shape.VLine)
-        self.FFTInfoFrame1.setFrameShadow(QFrame.Shadow.Raised)
-
-        self.horizontalLayout_2.addWidget(self.FFTInfoFrame1)
-
-        self.FFTThresholdHLayout = QHBoxLayout()
-#ifndef Q_OS_MAC
-        self.FFTThresholdHLayout.setSpacing(-1)
-#endif
-        self.FFTThresholdHLayout.setObjectName(u"FFTThresholdHLayout")
-        self.FFTThresholdHLayout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
-        self.FFTThresholdHLayout.setContentsMargins(5, -1, 5, -1)
-        self.FFTThresholdLabel = QLabel(self.FFTInfoGroupBox)
-        self.FFTThresholdLabel.setObjectName(u"FFTThresholdLabel")
-        font4 = QFont()
-        font4.setPointSize(18)
-        font4.setWeight(QFont.Medium)
-        self.FFTThresholdLabel.setFont(font4)
-        self.FFTThresholdLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        self.FFTThresholdHLayout.addWidget(self.FFTThresholdLabel)
-
-        self.FFTThresholdSpinBox = QDoubleSpinBox(self.FFTInfoGroupBox)
-        self.FFTThresholdSpinBox.setObjectName(u"FFTThresholdSpinBox")
-        self.FFTThresholdSpinBox.setFont(font)
-        self.FFTThresholdSpinBox.setMinimum(0.040000000000000)
-        self.FFTThresholdSpinBox.setMaximum(2.300000000000000)
-        self.FFTThresholdSpinBox.setSingleStep(1.000000000000000)
-        self.FFTThresholdSpinBox.setStepType(QAbstractSpinBox.StepType.DefaultStepType)
-        self.FFTThresholdSpinBox.setValue(1.500000000000000)
-
-        self.FFTThresholdHLayout.addWidget(self.FFTThresholdSpinBox)
-
-
-        self.horizontalLayout_2.addLayout(self.FFTThresholdHLayout)
 
         self.FFTInfoFrame2 = QFrame(self.FFTInfoGroupBox)
         self.FFTInfoFrame2.setObjectName(u"FFTInfoFrame2")
@@ -308,12 +330,14 @@ class Ui_MainWindowAudio(object):
         self.FFTClicksDetectorButton.setSizePolicy(sizePolicy2)
         self.FFTClicksDetectorButton.setMinimumSize(QSize(80, 20))
         self.FFTClicksDetectorButton.setMaximumSize(QSize(16777215, 35))
+        font4 = QFont()
+        font4.setPointSize(18)
+        font4.setWeight(QFont.Medium)
         self.FFTClicksDetectorButton.setFont(font4)
         self.FFTClicksDetectorButton.setCheckable(True)
         self.FFTClicksDetectorButton.setChecked(True)
 
         self.FFTClicksDetectorHLayout.addWidget(self.FFTClicksDetectorButton)
-
 
         self.horizontalLayout_2.addLayout(self.FFTClicksDetectorHLayout)
 
@@ -349,26 +373,31 @@ class Ui_MainWindowAudio(object):
 
         self.FFTTimePassedLabelTime = QLabel(self.FFTInfoGroupBox)
         self.FFTTimePassedLabelTime.setObjectName(u"FFTTimePassedLabelTime")
-        sizePolicy3 = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        sizePolicy3 = QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
         sizePolicy3.setHorizontalStretch(0)
         sizePolicy3.setVerticalStretch(0)
         sizePolicy3.setHeightForWidth(self.FFTTimePassedLabelTime.sizePolicy().hasHeightForWidth())
         self.FFTTimePassedLabelTime.setSizePolicy(sizePolicy3)
-        self.FFTTimePassedLabelTime.setMinimumSize(QSize(60, 0))
+        self.FFTTimePassedLabelTime.setMinimumSize(QSize(120, 0))
+        self.FFTTimePassedLabelTime.setMaximumSize(QSize(120, 16777215))
         self.FFTTimePassedLabelTime.setFont(font)
         self.FFTTimePassedLabelTime.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.FFTTimePassedLabelTime.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.FFTTimePassedHLayout.addWidget(self.FFTTimePassedLabelTime)
 
-
         self.horizontalLayout_2.addLayout(self.FFTTimePassedHLayout)
 
+        self.horizontalLayout_2.addStretch(1)
 
-        self.FFTVLayout.addWidget(self.FFTInfoGroupBox, 0, Qt.AlignmentFlag.AlignHCenter|Qt.AlignmentFlag.AlignVCenter)
+        self.rightPanelVLayout.addWidget(self.FFTInfoGroupBox)
 
+        self.mainSplitter.addWidget(self.rightPanel)
+        self.mainSplitter.setStretchFactor(0, 1)
+        self.mainSplitter.setStretchFactor(1, 1)
+        self.mainSplitter.setSizes([620, 660])
 
-        self.verticalLayout_3.addLayout(self.FFTVLayout)
+        self.verticalLayout_3.addWidget(self.mainSplitter)
 
 
         self.verticalLayout_2.addWidget(self.mainWidget)
@@ -435,6 +464,9 @@ class Ui_MainWindowAudio(object):
         self.menuExperiment.addSeparator()
         self.menuExperiment.addAction(self.actionSerialPort)
         self.menuExperiment.addAction(self.actionSamplingSettings)
+        self.menuExperiment.addSeparator()
+        self.menuExperiment.addAction(self.actionSVM)
+        self.menuExperiment.addAction(self.actionResetSVM)
         self.menuSettings.addAction(self.menuChoose_Theme.menuAction())
         self.menuSettings.addAction(self.menuChoose_Font_Scale.menuAction())
         self.menuChoose_Theme.addAction(self.actionDark)
@@ -463,6 +495,8 @@ class Ui_MainWindowAudio(object):
         self.toolBar.addAction(self.actionSerialPort)
         self.toolBar.addAction(self.actionViewGrid)
         self.toolBar.addAction(self.actionSamplingSettings)
+        self.toolBar.addSeparator()
+        self.toolBar.addAction(self.actionSVM)
 
         self.retranslateUi(MainWindowAudio)
 
@@ -508,6 +542,11 @@ class Ui_MainWindowAudio(object):
 #if QT_CONFIG(tooltip)
         self.actionSamplingSettings.setToolTip(QCoreApplication.translate("MainWindowAudio", u"Sampling Settings", None))
 #endif // QT_CONFIG(tooltip)
+        self.actionSVM.setText(QCoreApplication.translate("MainWindowAudio", u"Select SVM Model", None))
+#if QT_CONFIG(tooltip)
+        self.actionSVM.setToolTip(QCoreApplication.translate("MainWindowAudio", u"Choose the .pkl model to classify with", None))
+#endif // QT_CONFIG(tooltip)
+        self.actionResetSVM.setText(QCoreApplication.translate("MainWindowAudio", u"Reset to shipped v6 model", None))
         self.actionInfo.setText(QCoreApplication.translate("MainWindowAudio", u"Info", None))
         self.actionVersion.setText(QCoreApplication.translate("MainWindowAudio", u"Version", None))
         self.actionWebSite.setText(QCoreApplication.translate("MainWindowAudio", u"WebSite", None))
@@ -530,10 +569,13 @@ class Ui_MainWindowAudio(object):
         self.actionSmall.setText(QCoreApplication.translate("MainWindowAudio", u"Small", None))
         self.actionMedium.setText(QCoreApplication.translate("MainWindowAudio", u"Medium", None))
         self.actionLarge.setText(QCoreApplication.translate("MainWindowAudio", u"Large", None))
-        self.FFTClicksDetectedLabel.setText(QCoreApplication.translate("MainWindowAudio", u"Clicks Detected", None))
+        self.IFFTTitleLabel.setText(QCoreApplication.translate("MainWindowAudio", u"iFFT \u2014 no event", None))
+        self.FFTModeLabel.setText(QCoreApplication.translate("MainWindowAudio", u"Spectrum:", None))
+        self.FFTModeComboBox.setItemText(0, QCoreApplication.translate("MainWindowAudio", u"Frame FFT (transmitted)", None))
+        self.FFTModeComboBox.setItemText(1, QCoreApplication.translate("MainWindowAudio", u"Region FFT (click)", None))
+        self.FFTClicksDetectedLabel.setText(QCoreApplication.translate("MainWindowAudio", u"Events", None))
         self.FFTInfoGroupBox.setTitle("")
         self.FFTStartStopButton.setText(QCoreApplication.translate("MainWindowAudio", u"START", None))
-        self.FFTThresholdLabel.setText(QCoreApplication.translate("MainWindowAudio", u"Threshold:", None))
         self.FFTClicksDetectorLabel.setText(QCoreApplication.translate("MainWindowAudio", u"Clicks detection:", None))
         self.FFTClicksDetectorButton.setText(QCoreApplication.translate("MainWindowAudio", u"ON", None))
         self.FFTTimePassedLabel.setText(QCoreApplication.translate("MainWindowAudio", u"Time Passed", None))

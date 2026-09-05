@@ -22,8 +22,9 @@ Finestra principale per il monitoraggio Audio
 import os
 import tempfile
 import struct
+from pathlib import Path
 
-from PySide6.QtWidgets import QSplitter, QMessageBox, QFileDialog, QProgressDialog, QApplication
+from PySide6.QtWidgets import QMessageBox, QFileDialog, QProgressDialog, QApplication
 from PySide6.QtCore import Signal, QTimer, Qt, QThread
 
 from core import BaseWindow
@@ -31,11 +32,12 @@ from core.wake_lock_manager import WakeLockManager
 from .ui.ui_MainWindowAudio import Ui_MainWindowAudio
 from core.special_component import replace_widget
 from components.start_stop_button import StartStopButton
-from components.data_table import DataTable
+from components.events_table import EventsTable
 from plotting.plot_manager import BasePlotWidget
 from components.sampling_settings import AudioSamplingSettingsPopup
 from serial_communication.audio_reader import AudioSerialWorker
 from saving.audio_save_worker import AudioSaveWorker
+from ml import default_model_path
 
 import numpy as np
 import time
@@ -77,17 +79,26 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
 
         self.actionStart.setEnabled(False)
 
-        #setup splitter
-        self.setup_splitter()
+        # Gli splitter (mainSplitter / graphsSplitter) arrivano gia' montati dal
+        # file .ui: non c'e' piu' nessuna chirurgia di layout a runtime.
+        # replace_widget sa gia' sostituire un widget figlio di uno QSplitter.
 
         self._setup_ui()
 
         # Sostituzione tabelle
-        customTableFFT = DataTable(self.theme_manager, parent=self)
+        customTableFFT = EventsTable(
+            self.theme_manager,
+            parent=self,
+            settings_manager=self.settings_manager,
+        )
 
         replace_widget(self, "FFTClicksDetectedTableWidget", customTableFFT)
 
         self.FFTClicksDetectedTableWidget = customTableFFT
+
+        # ⚠️ DOPO la sostituzione: prima di questa riga l'attributo e' ancora il
+        # QTableWidget segnaposto del .ui, che non ha il segnale eventSelected.
+        self.FFTClicksDetectedTableWidget.eventSelected.connect(self.on_event_selected)
 
         self._setup_table_fonts()  # Imposta i font per le tabelle
 
@@ -108,6 +119,31 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         # Crea la curva principale con la penna desiderata
         self.plot_widget_fft.plot = self.plot_widget_fft.plot_widget.plot(name="Amplitude Data")
 
+        # Curva di riferimento per la modalita' Region FFT: lo spettro dell'intero
+        # frame resta visibile in grigio tratteggiato sotto quello della regione,
+        # esattamente come nel RegionFFTDialog.
+        self.reference_curve_fft = self.plot_widget_fft.plot_widget.plot(
+            name="Frame FFT (transmitted)",
+            pen={'color': '#888888', 'width': 1, 'style': Qt.PenStyle.DashLine}
+        )
+        self.reference_curve_fft.setVisible(False)
+
+        #iFFT (ricostruzione nel tempo dell'evento, centrata sul picco)
+        custom_plot_ifft = BasePlotWidget(
+            x_label="Time",
+            y_label="Amplitude",
+            x_range=(-1.28, 1.28),
+            y_range=(-0.05, 0.05),
+            unit_x="ms", unit_y="V",
+            parent=self
+        )
+        replace_widget(self, "IFFTPlotWidget", custom_plot_ifft)
+        self.plot_widget_ifft = custom_plot_ifft
+
+        # Asse normale, NON TimeAxisItem: quello formatta H:MM:SS.ss, illeggibile
+        # su un frame da 2.56 ms.
+        self.plot_widget_ifft.plot = self.plot_widget_ifft.plot_widget.plot(name="iFFT")
+
         self.setWindowTitle("Audio Monitor")
 
         self.layout_manager.center_window_on_screen(self)
@@ -116,6 +152,7 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         self.setup_menubar_actions()
 
         self.theme_manager.apply_theme_to_plot(self.plot_widget_fft.plot_widget, self.plot_widget_fft.plot)
+        self.theme_manager.apply_theme_to_plot(self.plot_widget_ifft.plot_widget, self.plot_widget_ifft.plot)
 
         #riapplica modifiche tema, font, layout
         self.layout_manager.adjust_window_size_for_content(self)
@@ -129,7 +166,6 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
 
         # Imposta l'azione di avvio dell'esperimento come disattivata e anche i pulsanti di start/stop
         self.FFTStartStopButton.setEnabled(False)
-        self.FFTThresholdSpinBox.setEnabled(True)
         self.FFTClicksDetectorButton.setEnabled(True)
         
         
@@ -181,6 +217,12 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
 
         self.is_acquiring = False
         self._wake_lock = WakeLockManager()
+
+        # Modello SVM in uso. Solo il PERCORSO all'avvio: joblib.load costa ~100 ms
+        # e finche' nessuno classifica non serve a niente caricarlo.
+        self.svm_model_path = default_model_path()   # ml/v6/plantleaf_svm_v6_DEPLOYED.pkl
+        self.svm_model = None
+        self._update_svm_action_tooltip()
 
         # mostra a tutto schermo mantenendo le grafiche
         self.showMaximized()
@@ -327,17 +369,24 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
                     self.click_peak_time = current_time_us
                     
         elif self.click_active:
-            # ✅ FORMATO NUOVO: "N FFT" invece di microsecondi
-            duration_str = f"{self.click_fft_count} FFT"
-            
-            self.FFTClicksDetectedTableWidget.add_data_row([
-                self.relative_timestamp,
-                f"{self.click_peak_frequency:.0f} Hz",
-                f"{self.click_peak_amplitude:.3f} V",
-                duration_str,  # ✅ NUOVO FORMATO
-                ""
-            ])
-            
+            # TRANSITORIO — questo ramo esiste solo finche' il firmware attuale
+            # continua a mandare TUTTI i frame e la rilevazione e' un semplice
+            # attraversamento di soglia. Riempie le sole chiavi dello schema v6
+            # che a questo stadio sono effettivamente note, cosi' la tabella e'
+            # gia' popolata e navigabile mentre il firmware a eventi viene
+            # scritto. Il reader a eventi sostituira' tutto questo con l'evento
+            # completo di feature, fft_mags e phases.
+            self.FFTClicksDetectedTableWidget.add_event({
+                'timestamp_s': self.relative_timestamp,
+                'FPE_hz': self.click_peak_frequency,
+                'label': '',
+                'note': '',
+                # Chiavi fuori schema, lette solo da export_click_data per tenere
+                # in vita il blocco CLCK dei file .paudio gia' salvati.
+                'peak_amplitude_v': self.click_peak_amplitude,
+                'duration_us': int(self.click_fft_count * self.fft_interval_us),
+            })
+
             # Reset contatore per prossimo click
             self.click_active = False
             self.click_fft_count = 0
@@ -346,9 +395,181 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
     # GRAFICO FFT - AGGIORNATO SOLO DAL TIMER
     def update_plot(self):
         """Aggiorna il plot solo se necessario (chiamato dal timer a 60Hz)"""
+        # In Region FFT il grafico appartiene all'evento selezionato: il flusso
+        # live non deve sovrascriverlo ad ogni frame.
+        if self.fft_mode != self.FFT_MODE_FRAME:
+            return
         if self.plot_needs_update and len(self.data_y_plot) > 0:
             self.plot_widget_fft.plot.setData(self.data_x, self.data_y_plot)
             self.plot_needs_update = False
+
+
+
+
+    #### EVENTI: SELEZIONE, GRAFICI, MODELLO SVM ####
+
+    #: Indici del FFTModeComboBox. Nominati perche' compaiono in tre posti.
+    FFT_MODE_FRAME = 0
+    FFT_MODE_REGION = 1
+
+    def on_event_selected(self, row):
+        """Una riga della tabella eventi e' stata selezionata: ridisegna i grafici."""
+        event = self.FFTClicksDetectedTableWidget.event_at(row)
+        if event is None:
+            self.IFFTTitleLabel.setText("iFFT — no event")
+            return
+        self._render_event(event)
+
+    def on_fft_mode_changed(self, index):
+        """Frame FFT (spettro trasmesso) vs Region FFT (spettro del solo click)."""
+        self.fft_mode = index
+        self.reference_curve_fft.setVisible(index == self.FFT_MODE_REGION)
+
+        event = self.FFTClicksDetectedTableWidget.current_event()
+        if event is not None:
+            self._render_event(event)
+        elif index == self.FFT_MODE_FRAME:
+            # Nessun evento selezionato: torna semplicemente al flusso live.
+            self.plot_needs_update = True
+            self.update_plot()
+
+    def _render_event(self, event):
+        """
+        ⚠️ QUESTO E' IL PUNTO DI AGGANCIO DEL BACKEND A EVENTI.
+
+        Si aspetta due chiavi extra sull'evento, che OGGI NESSUNO SCRIVE:
+
+            event['fft_mags']  ndarray, le magnitudini del frame trasmesso
+            event['phases']    ndarray int8, le fasi quantizzate
+
+        Quando ci saranno, la ricostruzione nel tempo e' gia' scritta e testata:
+
+            core.click_pipeline_v5.reconstruct_frame_v5(mags, phases,
+                fs=self.fs, fft_size=self.fft_size, normalize=False)['signal']
+
+        e lo spettro della regione si ottiene con
+        core.spectral_analysis.compute_spectrum() sulla finestra di decadimento.
+
+        Finche' mancano, il metodo dichiara esplicitamente che non c'e' forma
+        d'onda e pulisce le curve: una riga senza waveform deve VEDERSI, non
+        lasciare a schermo l'evento precedente.
+        """
+        mags = event.get('fft_mags')
+        phases = event.get('phases')
+        frame_idx = event.get('frame_idx')
+        where = f"frame {frame_idx}" if frame_idx not in (None, '') else \
+                f"t={event.get('timestamp_s', 0):.2f}s"
+
+        if mags is None or phases is None:
+            self.IFFTTitleLabel.setText(f"iFFT — {where} · no waveform yet")
+            self.plot_widget_ifft.plot.setData([], [])
+            if self.fft_mode == self.FFT_MODE_REGION:
+                self.plot_widget_fft.plot.setData([], [])
+                self.reference_curve_fft.setData([], [])
+            return
+
+        # --- da qui in poi: codice che il backend rendera' raggiungibile ---
+        from core.click_pipeline_v5 import reconstruct_frame_v5
+
+        result = reconstruct_frame_v5(
+            np.asarray(mags), np.asarray(phases),
+            fs=self.fs, fft_size=self.fft_size, normalize=False
+        )
+        if result is None:
+            self.IFFTTitleLabel.setText(f"iFFT — {where} · reconstruction failed")
+            self.plot_widget_ifft.plot.setData([], [])
+            return
+
+        signal = np.asarray(result['signal'])
+        # Centrato sull'evento: t = 0 e' il campione di picco, cosi' eventi
+        # diversi sono confrontabili a colpo d'occhio.
+        peak_idx = int(np.argmax(np.abs(signal)))
+        t_ms = (np.arange(signal.size) - peak_idx) * (1000.0 / self.fs)
+        self.plot_widget_ifft.plot.setData(t_ms, signal)
+        self.IFFTTitleLabel.setText(f"iFFT — {where} (centred on peak)")
+
+        if self.fft_mode == self.FFT_MODE_FRAME:
+            self.plot_widget_fft.plot.setData(self.data_x, np.asarray(mags))
+        else:
+            # Region FFT: lo spettro del frame resta come riferimento grigio.
+            self.reference_curve_fft.setData(self.data_x, np.asarray(mags))
+            self._render_region_spectrum(event, signal)
+
+    def _render_region_spectrum(self, event, signal):
+        """
+        Spettro della sola regione del click. Backend seam: serve la finestra di
+        decadimento (onset, decay_len) che oggi nessun evento porta con se'.
+        """
+        from core.spectral_analysis import compute_spectrum
+
+        onset = event.get('peak_abs')
+        decay_len = event.get('decay_len')
+        if onset in (None, '') or decay_len in (None, ''):
+            self.plot_widget_fft.plot.setData([], [])
+            return
+
+        start = max(0, int(onset) % self.fft_size)
+        stop = min(signal.size, start + int(decay_len))
+        segment = signal[start:stop]
+        if segment.size < 4:
+            self.plot_widget_fft.plot.setData([], [])
+            return
+
+        spec = compute_spectrum(segment, self.fs)
+        self.plot_widget_fft.plot.setData(spec.freqs, spec.mags)
+
+    def _update_svm_action_tooltip(self, model=None):
+        """Mostra sull'azione quale .pkl e' in uso, e cosa contiene se caricato."""
+        if not hasattr(self, 'actionSVM'):
+            return
+        name = self.svm_model_path.name if self.svm_model_path else "none"
+        if model is None:
+            self.actionSVM.setToolTip(f"SVM model: {name} (not loaded yet)")
+            return
+        try:
+            summary = (f"kernel={model['kernel']} "
+                       f"thr={model['threshold']:.3f} "
+                       f"feat={len(model['features'])}")
+        except Exception:
+            summary = "loaded"
+        self.actionSVM.setToolTip(f"SVM model: {name} — {summary}")
+
+    def svm_model_action(self):
+        """Sceglie il .pkl con cui classificare. Stesso flusso del model browser
+        del Data Collection dialog, cosi' i due si comportano allo stesso modo."""
+        from core.click_pipeline_v5 import load_svm_model
+
+        start_dir = str(self.svm_model_path.parent) if self.svm_model_path \
+            else self.settings_manager.get_last_directory("svm_model")
+
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Select SVM Model", start_dir, "SVM model (*.pkl)"
+        )
+        if not filepath:
+            return
+
+        try:
+            # joblib, non pickle: il modello contiene buffer numpy grezzi.
+            model = load_svm_model(Path(filepath))
+        except Exception as e:
+            # La selezione precedente resta valida: un modello illeggibile non
+            # deve lasciare la finestra senza modello.
+            print(f"❌ Modello SVM non caricabile: {e}")
+            self.show_error_dialog("Model Error", f"Cannot load SVM model:\n{e}")
+            return
+
+        self.svm_model_path = Path(filepath)
+        self.svm_model = model
+        self.settings_manager.set_last_directory("svm_model", filepath)
+        self._update_svm_action_tooltip(model)
+        print(f"🧠 Modello SVM selezionato: {self.svm_model_path.name}")
+
+    def reset_svm_model_action(self):
+        """Torna al modello v6 distribuito con l'app (ml/__init__.default_model_path)."""
+        self.svm_model_path = default_model_path()
+        self.svm_model = None
+        self._update_svm_action_tooltip()
+        print(f"🧠 Modello SVM ripristinato: {self.svm_model_path.name}")
 
 
 
@@ -767,30 +988,17 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         seconds = elapsed % 60
         self.FFTTimePassedLabelTime.setText(f"{hours}:{minutes:02}:{seconds:02}")
 
+
+    def set_fft_threshold(self, value):
         """
-    def update_table_data(self, frequency, amplitude, duration, duration_us, notes):
-        if hasattr(self, 'chrono_start_time') and self.chrono_start_time > 0:
-            self.relative_timestamp = self.get_acquisition_time()
-        else:
-            self.relative_timestamp = 0.0
+        Aggiorna la soglia: linea rossa sul plot + comando al microcontrollore.
 
-        # Passa SOLO 5 parametri: timestamp, frequency, amplitude, duration, notes
-        self.FFTClicksDetectedTableWidget.add_data_row([
-            self.relative_timestamp, frequency, amplitude, duration, notes
-        ])
+        Non c'e' piu' uno SpinBox che la chiami — resta perche' il valore viaggia
+        ancora nel protocollo seriale e nell'header del file, e perche' il nuovo
+        firmware avra' comunque bisogno di riceverlo una volta.
         """
+        print(f"🎚️ Threshold impostata a: {value:.3f}V")
 
-
-
-
-
-    #cambio valore spinBox = THRESHOLD e manda al microcontrollore
-    def on_fft_threshold_changed(self, value):
-        """Gestisce il cambio manuale della soglia dallo SpinBox."""
-            
-        print(f"🎚️ Threshold cambiata manualmente a: {value:.3f}V")
-        
-        # Registra il momento della modifica manuale
         self._last_user_threshold_change = time.time()
 
         try:
@@ -849,21 +1057,17 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         self.chrono_timer.timeout.connect(self.update_plot)  # Plot refresh a 60Hz
         self.FFTTimePassedLabelTime.setText("0:00:00")
 
-        # Configura FFTThresholdSpinBox
-        self.FFTThresholdSpinBox.setMinimum(0.001) 
-        self.FFTThresholdSpinBox.setMaximum(1.65)
-        
-        # FIXED: Imposta valore di default PRIMA di connettere il signal
-        self.threshold_value = 0.03  # Valore di default
-        self.FFTThresholdSpinBox.setValue(self.threshold_value)
-        
-        self.FFTThresholdSpinBox.setDecimals(3)
-        self.FFTThresholdSpinBox.setSingleStep(0.001)
-        self.FFTThresholdSpinBox.setSuffix(" V")
-        self.FFTThresholdSpinBox.setEnabled(False)
-        
-        # Connetti DOPO aver impostato il valore
-        self.FFTThresholdSpinBox.valueChanged.connect(self.on_fft_threshold_changed)
+        # La soglia non e' piu' regolabile dalla UI: con il nuovo firmware lo
+        # Stage 1 gira a bordo e il valore qui serve solo come riferimento (linea
+        # rossa sul plot, campo `threshold` dell'header .paudio, argomento di
+        # serial_worker.start). Il comando seriale !threshold resta disponibile.
+        self.threshold_value = 0.03
+
+        # Frame FFT (quello trasmesso) vs Region FFT (solo il click). L'indice 0
+        # e' la modalita' live di sempre.
+        self.fft_mode = self.FFT_MODE_FRAME
+        self.FFTModeComboBox.setCurrentIndex(self.FFT_MODE_FRAME)
+        self.FFTModeComboBox.currentIndexChanged.connect(self.on_fft_mode_changed)
 
     def create_initial_threshold(self):
         """Crea la threshold line iniziale"""
@@ -886,10 +1090,8 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         self.FFTClicksDetectedTableWidget.horizontalHeader().setFont(fonts['table_header'])
         self.FFTClicksDetectedTableWidget.setFont(fonts['table_content'])
         
-        self.FFTClicksDetectedTableWidget.setToolTip(
-            "Le note sono editabili (max 20 caratteri). "
-            "Clicca su una cella nella colonna 'Notes' per aggiungere appunti."
-        )
+        # Il tooltip lo imposta EventsTable.setup_table: descrive labelling,
+        # navigazione e menu delle colonne, che questa finestra non conosce.
 
     def toggle_clicks_detection(self):
         #CAMBIA STILE E ANCHE STATO
@@ -900,47 +1102,6 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         #self.FFTClicksDetectorButton.setStyleSheet(self.theme_manager.get_toggle_button_style(self.clicksDetectionStatus))
         self.clicks_detector_toggled.emit(self.clicksDetectionStatus)
         pass
-
-
-    def setup_splitter(self):
-        """Configura gli splitter"""
-        if (hasattr(self, 'FFTPlotHLayout') and hasattr(self, 'FFTPotWidget') and 
-            hasattr(self, 'FFTTableVLayout') and hasattr(self, 'FFTClicksDetectedLabel') and 
-            hasattr(self, 'FFTClicksDetectedTableWidget')):
-            self.setup_tab_splitter(
-                self.FFTPlotHLayout,
-                self.FFTPotWidget, 
-                self.FFTTableVLayout,
-                self.FFTClicksDetectedLabel,
-                self.FFTClicksDetectedTableWidget,
-                'fft_splitter'
-            )
-
-    def setup_tab_splitter(self, horizontal_layout, plot_widget, vertical_layout, 
-                          label_widget, table_widget, splitter_name):
-        """Configura lo splitter per un singolo tab"""
-        horizontal_layout.removeWidget(plot_widget)
-        horizontal_layout.removeItem(vertical_layout)
-        
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        setattr(self, splitter_name, splitter)
-        
-        splitter.addWidget(plot_widget)
-        
-        from PySide6.QtWidgets import QWidget, QVBoxLayout
-        table_container = QWidget()
-        container_layout = QVBoxLayout(table_container)
-        container_layout.setContentsMargins(0, 0, 0, 0)
-        
-        vertical_layout.removeWidget(label_widget)
-        vertical_layout.removeWidget(table_widget)
-        
-        container_layout.addWidget(label_widget)
-        container_layout.addWidget(table_widget)
-        
-        splitter.addWidget(table_container)
-        splitter.setSizes([700, 350])
-        horizontal_layout.addWidget(splitter)
 
 
     def start_experiment_action(self):
@@ -984,4 +1145,3 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         """Abilita o disabilita i pulsanti"""
         self.actionStart.setEnabled(enabled)
         self.FFTStartStopButton.setEnabled(enabled)
-        self.FFTThresholdSpinBox.setEnabled(enabled)
