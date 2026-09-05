@@ -291,12 +291,20 @@ HARMONIC_COLUMNS = [
 EXPORT_ALL        = 'all'        # every Stage 1 candidate with a valid fit, annotated
 EXPORT_CONFIRMED  = 'confirmed'  # only candidates that survived all four stages
 EXPORT_UNFILTERED = 'unfiltered' # EVERY Stage 1 candidate, including fit_valid == 0
+EXPORT_STAGE3     = 'stage3'     # only candidates that cleared Stage 2 (i.e. reached
+                                  # the SVM), whatever Stage 3/4 then did with them
 #: EXPORT_UNFILTERED exists because those rows have never reached a CSV in this
 #: project's history: Stage 2 dropped tau <= 0 before export, so a decay window that
 #: could not be fitted was invisible. They arrive with tau_ms / R2 / fit_coverage as
 #: NaN, which is only safe now that fit_valid disambiguates "no fit" from "bad fit"
 #: (v6 §7.5.3). Expect a lot of them and expect most to be noise — they are Stage 1
 #: candidates, which are overwhelmingly noise, and this mode applies NO fit filter.
+#:
+#: EXPORT_STAGE3 exists for reviewing the SVM/dedup decisions themselves: a
+#: candidate has svm_prediction is not None the moment it clears Stage 2 (see
+#: run_stages234_annotated), regardless of whether Stage 3 then accepted or
+#: rejected it, or Stage 4 deduplicated it. EXPORT_CONFIRMED throws all of that
+#: away except the survivors; this mode keeps it.
 
 
 def _sigfig(x, digits: int = 6):
@@ -448,6 +456,11 @@ class CandidateData:
     def is_confirmed_click(self) -> bool:
         """True once classified and it survived all four stages."""
         return self.svm_prediction is not None and self.stage_blocked == ''
+
+    @property
+    def reached_stage3(self) -> bool:
+        """True once it cleared Stage 2, whatever Stage 3/4 did with it after."""
+        return self.svm_prediction is not None
 
     def to_feature_dict(self) -> Dict:
         """
@@ -1729,9 +1742,12 @@ class DataCollectionWorkerV5(QThread):
                        dump with the three verdict columns left empty.
                        Loaded on the MAIN thread by the dialog so a bad .pkl is
                        reported in a message box instead of killing the worker.
-            export_mode: EXPORT_ALL (every candidate, annotated) or
-                       EXPORT_CONFIRMED (only clicks that survived all 4 stages).
-                       Ignored when svm_model is None.
+            export_mode: EXPORT_ALL (every candidate, annotated),
+                       EXPORT_CONFIRMED (only clicks that survived all 4 stages),
+                       EXPORT_UNFILTERED (every Stage 1 candidate, fit_valid == 0
+                       included), or EXPORT_STAGE3 (only candidates that cleared
+                       Stage 2, i.e. were scored by the SVM, regardless of the
+                       Stage 3/4 verdict). Ignored when svm_model is None.
             threshold: Override the model's own decision threshold. None = use it.
         """
         super().__init__()
@@ -1873,8 +1889,9 @@ class DataCollectionWorkerV5(QThread):
         Run Stages 2-4 over one file's candidates and attach the verdicts.
 
         Returns the list to actually export: every candidate in EXPORT_ALL mode,
-        only the confirmed clicks in EXPORT_CONFIRMED mode. Filtering here (rather
-        than at CSV-write time) means the discarded candidates also skip screenshot
+        only the confirmed clicks in EXPORT_CONFIRMED mode, only the candidates
+        that reached Stage 3 in EXPORT_STAGE3 mode. Filtering here (rather than
+        at CSV-write time) means the discarded candidates also skip screenshot
         rendering, which is where nearly all the time goes — typically only ~5-10%
         of candidates survive, so confirmed-only exports are dramatically faster.
         """
@@ -1907,6 +1924,8 @@ class DataCollectionWorkerV5(QThread):
 
         if self.export_mode == EXPORT_CONFIRMED:
             return [c for c in candidates if c.is_confirmed_click]
+        if self.export_mode == EXPORT_STAGE3:
+            return [c for c in candidates if c.reached_stage3]
         return candidates
 
     def _load_audio_file(self, paudio_path: Path, file_idx: int = 0, total_files: int = 1):
@@ -2268,14 +2287,25 @@ class DataCollectionDialogV5(QDialog):
             "overwhelmingly noise and this mode applies no fit filter at all."
         )
 
+        self.radio_stage3 = QRadioButton("Reached Stage 3")
+        self.radio_stage3.setToolTip(
+            "Only candidates that cleared Stage 2 — i.e. were scored by the SVM —\n"
+            "whatever Stage 3/4 then did with them. Includes SVM-rejected and\n"
+            "deduplicated candidates, not just confirmed clicks.\n\n"
+            "For reviewing the SVM's own decisions (threshold tuning, error\n"
+            "analysis) without the Stage 2 noise majority in the way."
+        )
+
         self.export_mode_group = QButtonGroup(self)
         self.export_mode_group.addButton(self.radio_all)
         self.export_mode_group.addButton(self.radio_confirmed)
         self.export_mode_group.addButton(self.radio_unfiltered)
+        self.export_mode_group.addButton(self.radio_stage3)
 
         mode_layout.addWidget(self.radio_all)
         mode_layout.addWidget(self.radio_confirmed)
         mode_layout.addWidget(self.radio_unfiltered)
+        mode_layout.addWidget(self.radio_stage3)
 
         # ── Stage 2 rule ──
         # Three RULES, not three strictness levels: v5 is the original gate, kept
@@ -2626,6 +2656,8 @@ class DataCollectionDialogV5(QDialog):
                 export_mode = EXPORT_CONFIRMED
             elif self.radio_unfiltered.isChecked():
                 export_mode = EXPORT_UNFILTERED
+            elif self.radio_stage3.isChecked():
+                export_mode = EXPORT_STAGE3
             else:
                 export_mode = EXPORT_ALL
             if not self.chk_use_model_threshold.isChecked():
@@ -2649,6 +2681,7 @@ class DataCollectionDialogV5(QDialog):
             eff_thr = threshold if threshold is not None else float(svm_model['threshold'])
             mode_txt = ("every candidate incl. unfittable" if export_mode == EXPORT_UNFILTERED
                         else "confirmed clicks only" if export_mode == EXPORT_CONFIRMED
+                        else "reached Stage 3 only" if export_mode == EXPORT_STAGE3
                         else "all candidates + stats")
             self._log(f"  Stages 2-4: {self.model_path.name}  (threshold = {eff_thr:.3f})")
             self._log(f"  Export: {mode_txt}")
