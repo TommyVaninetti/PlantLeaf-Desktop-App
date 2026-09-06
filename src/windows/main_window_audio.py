@@ -522,6 +522,9 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         self._refresh_events_label()
 
     def _sync_mode_button(self):
+        # Legacy name, now purely the mode mirror: it is what the
+        # clicks_detector_toggled signal carries. Nothing gates behaviour on it
+        # — see the note in on_new_fft_data.
         self.clicksDetectionStatus = self.event_mode
         self.FFTClicksDetectorButton.setText("ON" if self.event_mode else "OFF")
         self.FFTClicksDetectorButton.setChecked(self.event_mode)
@@ -658,10 +661,16 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         self.plot_needs_update = True
 
         # Click detection ULTRA-VELOCE (usa dati pre-calcolati)
-        # Full mode only. In event mode the board has already run Stage 1 and
+        # Gated on the MODE, not on clicksDetectionStatus. The two used to be
+        # the same flag and are not any more: clicksDetectionStatus now mirrors
+        # the mode (it is what clicks_detector_toggled carries), and gating on
+        # it here meant switching the button to OFF disabled the threshold rows
+        # instead of restoring them — the exact opposite of what OFF means.
+        #
+        # Full mode only: in event mode the board has already run Stage 1 and
         # the rows come from the real pipeline, so letting this add rows too
         # would mix two different notions of 'event' in one table.
-        if self.clicksDetectionStatus and not self.event_mode:
+        if not self.event_mode:
             self.check_for_clicks_optimized(max_amplitude, peak_bin, above_threshold)
 
         # ✅ AUTO-SAVE ogni N campioni (identico al voltage: 1000 campioni)
