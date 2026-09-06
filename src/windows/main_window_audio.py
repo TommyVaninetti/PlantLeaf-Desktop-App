@@ -405,6 +405,30 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         self.event_worker.error.connect(
             lambda msg: print(f"⚠️ Live pipeline: {msg}"))
         self.event_thread.start()
+        self._apply_event_mode_tooltip()
+
+    def _apply_event_mode_tooltip(self):
+        """
+        Say in the table what event mode cannot measure, rather than leaving a
+        column of NaN to be discovered.
+        """
+        table = getattr(self, 'FFTClicksDetectedTableWidget', None)
+        if table is None:
+            return
+        base = ("Click a row to show that event in the iFFT and FFT plots.\n"
+                "Label: 0 = noise, 1 = click, 2 = ambiguous (keys 0/1/2, Del to clear).\n"
+                "Right-click the header to show or hide feature columns.")
+        if self.event_mode:
+            base += (
+                "\n\nEvent mode: the board transmits only candidates and their "
+                "neighbours.\nThe v6 spectral features (spectral_entropy, "
+                "shape_novelty, spectral_tilt,\nFPE_hz_region, SPR_region, f_50_hz, "
+                "IQR_f, harmonic_confinement) need a\n750-frame noise PSD built from "
+                "the quiet frames, and local_crest needs\n+/-10 frames of energy. "
+                "Neither is on the wire, so both are NaN and their\nStage 2 gates are "
+                "not applied. The seven features the deployed SVM reads\nare all "
+                "available and are computed exactly as they are offline.")
+        table.setToolTip(base)
 
     def _setup_experiment_menu(self):
         """
@@ -534,8 +558,30 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
 
     def on_event_ready(self, row):
         """One fully annotated event: Stages 2, 3 and 4 have all had their say."""
+        note = self._loss_note(row)
+        if note and not row.get('note'):
+            # In the note column because that is the one place a per-row caveat
+            # is actually read. Editable, so it can be cleared or replaced.
+            row['note'] = note
         self.FFTClicksDetectedTableWidget.add_event(row)
         self._refresh_events_label()
+
+    @staticmethod
+    def _loss_note(row):
+        """
+        Say on the ROW when its own context was damaged.
+
+        A count in the status line tells you a recording lost something; it does
+        not tell you WHICH click was measured on two frames instead of three, or
+        which one sits right after a gap. Both change how much the features
+        below it are worth, so they belong on the row.
+        """
+        marks = []
+        if row.get('board_overflow'):
+            marks.append("events lost before this one")
+        if row.get('ctx_complete') is False:
+            marks.append("partial context")
+        return "; ".join(marks)
 
     def on_event_status(self, status):
         self._event_status = status
@@ -1450,6 +1496,7 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
 
         self.event_mode = not self.event_mode
         self._sync_mode_button()
+        self._apply_event_mode_tooltip()
         self._push_board_config()
         self._refresh_events_label()
         self.clicks_detector_toggled.emit(self.clicksDetectionStatus)

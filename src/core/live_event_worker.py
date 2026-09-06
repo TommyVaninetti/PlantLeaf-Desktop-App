@@ -255,7 +255,14 @@ class LiveEventWorker(QtCore.QObject):
                  if (c + 1) in self._frames or self._newest_idx > c + 1]
         for c in sorted(ready):
             self._waiting.remove(c)
-            self._resolve(c)
+            try:
+                self._resolve(c)
+            except Exception as e:                       # noqa: BLE001
+                # Caught HERE, not only in _drain: a candidate that raises must
+                # not skip the pruning and flushing below it, or one bad frame
+                # would strand every row already resolved and leak the ring.
+                self.n_failed += 1
+                print(f"⚠️ Live event: candidate {c} skipped ({e})")
 
         self._prune_frames()
         self._flush_pending()
