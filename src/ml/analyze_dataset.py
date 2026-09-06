@@ -122,6 +122,13 @@ def read_paudio_duration(path: Path) -> float | None:
         if magic != b'PLANTAUDIO':
             return None
 
+        # An event recording (v4) holds only the transmitted frames, so
+        # frame_count x frame_duration is its WIRE volume, not its duration -
+        # it would under-report a one-hour session as a few seconds.
+        version = struct.unpack('<f', header[10:14])[0]
+        if version >= 4.0:
+            return None
+
         fs       = struct.unpack('<I', header[34:38])[0]
         fft_size = struct.unpack('<I', header[38:42])[0]
 

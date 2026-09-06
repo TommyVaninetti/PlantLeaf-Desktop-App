@@ -21,6 +21,7 @@ import struct
 import json
 import zlib
 import os
+from core import paudio_format as pf
 from core.click_pipeline_v5 import (  #keep functions and constants in sync with click_pipeline_v5.py
     _normalize_fft,
     reconstruct_frame_v5,
@@ -84,14 +85,13 @@ class AudioLoadWorker(QObject):
                 # STEP 2: Load FFT data
                 self.progress.emit(5)
                 remaining_data = f.read()
-                click_start = remaining_data.find(b'CLCK')
-                
-                if click_start >= 0:
-                    fft_bytes = remaining_data[:click_start]
-                    click_section = remaining_data[click_start:]
-                else:
-                    fft_bytes = remaining_data
-                    click_section = None
+                # The body ends at the FIRST footer marker, whichever it is. A
+                # v4 file always writes CLCK before EVNT precisely so that a
+                # reader looking only for CLCK still stops in the right place,
+                # but a file truncated between the two must not turn the
+                # remaining EVNT bytes into magnitudes.
+                fft_bytes, click_payload, event_payload = pf.split_sections(
+                    remaining_data)
 
                 fft_data = []
                 phase_data = []
@@ -116,7 +116,10 @@ class AudioLoadWorker(QObject):
                             has_separators = True
                             print("📋 Rilevato formato v3.0 OLD (con separatori)")
                         else:
-                            print("📋 Rilevato formato v3.0 NEW (senza separatori)")
+                            kind = ("v4.0 a eventi"
+                                    if pf.is_event_recording(file_version)
+                                    else "v3.0 NEW")
+                            print(f"📋 Rilevato formato {kind} (senza separatori)")
                     
                     # === PARSING ADATTIVO ===
                     offset = 0
@@ -247,21 +250,23 @@ class AudioLoadWorker(QObject):
                 # CHECKPOINT 59%
                 self.progress.emit(59)
                 
-                click_events = []
-                try:
-                    if click_section and len(click_section) >= 8:
-                        marker = click_section[0:4]
-                        if marker == b'CLCK':
-                            click_length = struct.unpack('<I', click_section[4:8])[0]
-                            if len(click_section) >= 8 + click_length:
-                                compressed_data = click_section[8:8+click_length]
-                                try:
-                                    decompressed = zlib.decompress(compressed_data)
-                                    click_events = json.loads(decompressed.decode('utf-8'))
-                                except:
-                                    click_events = []
-                except:
-                    click_events = []
+                click_events = pf.parse_click_payload(click_payload)
+
+                # ── EVENT RECORDINGS (v4) ────────────────────────────────────
+                # In a v4 file body frame i is NOT the i-th frame of the signal:
+                # only click candidates and their neighbours were transmitted.
+                # The EVNT footer says where each one actually sits, and carries
+                # the noise state the board measured at that moment — which the
+                # host cannot recompute, because it comes from a
+                # minimum-statistics estimator over the quiet frames that were
+                # never sent.
+                event_meta = pf.parse_event_payload(event_payload)
+                is_event_file = pf.is_event_recording(file_version)
+                if is_event_file and len(event_meta['frame_idx']) != len(fft_data):
+                    print(f"⚠️ EVNT: {len(event_meta['frame_idx'])} record per "
+                          f"{len(fft_data)} frame — footer ignorato")
+                    event_meta = pf.parse_event_payload(b'')
+                    is_event_file = False
 
                 # STEP 4: Metadata and timing calculations
                                 
@@ -387,7 +392,13 @@ class AudioLoadWorker(QObject):
             # STEP 5: Overview — now instant (reads fft_means_arr)
             self.progress.emit(94)
             overview_fps    = 10
-            overview_points = int(total_duration_sec * overview_fps)
+            # max(1, ...) on BOTH: a recording shorter than 100 ms gives
+            # overview_points == 0, and total_frames // 0 raised
+            # ZeroDivisionError before any of this was reached — the file
+            # simply refused to open. Rare with a continuous recording; not
+            # rare at all with an EVENT one, where a quiet session legitimately
+            # produces a handful of transmitted frames.
+            overview_points = max(1, int(total_duration_sec * overview_fps))
             frame_step      = max(1, total_frames // overview_points)
             overview_x = []
             overview_y = []
@@ -443,6 +454,20 @@ class AudioLoadWorker(QObject):
                 'p_noise_snapshots'    : p_noise_snapshots,
                 'p_noise_stride'       : _p_stride,
                 'p_noise_counts'       : p_noise_counts,
+                # v4 only; empty arrays and False for a continuous recording, so
+                # a caller can read these unconditionally.
+                'is_event_recording'   : is_event_file,
+                'event_frame_idx'      : event_meta['frame_idx'],
+                'event_flags'          : event_meta['flags'],
+                'event_E_i'            : event_meta['E_i'],
+                'event_E_hat_floor'    : event_meta['E_hat_floor'],
+                'event_noise_floor'    : event_meta['noise_floor'],
+                'event_std_noise'      : event_meta['std_noise'],
+                # Where each transmitted frame really sits, in seconds. For a
+                # continuous file this is just frame index x frame duration.
+                'event_timestamps'     : (
+                    pf.event_timestamps(event_meta['frame_idx'], fs, fft_size)
+                    if is_event_file else np.array([], dtype=np.float64)),
             }
 
             self.finished.emit(data_dict)

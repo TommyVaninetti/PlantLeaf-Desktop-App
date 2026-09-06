@@ -56,6 +56,36 @@ from components.click_review_dialog import (                # noqa: E402
 )
 
 
+# ── ROW FILTER ──────────────────────────────────────────────────────────────
+#
+# Every candidate becomes a row: nothing the firmware sends is hidden from the
+# export or from the operator. What the filter changes is what is VISIBLE,
+# because the rate makes the raw view unusable — the measured bench candidate
+# rate is 10,000-30,000/hour against tens/hour on the offline corpus, and on a
+# dense recording Stage 1 has flagged 74 % of all frames.
+
+FILTER_ALL = 'all'            # every candidate, verdict included
+FILTER_SURVIVORS = 'stage2'   # cleared the Stage 2 gates (scored by the SVM)
+FILTER_CONFIRMED = 'confirmed'  # survived all four stages
+FILTER_MODES = (FILTER_ALL, FILTER_SURVIVORS, FILTER_CONFIRMED)
+
+FILTER_LABELS = {
+    FILTER_ALL:       'All candidates',
+    FILTER_SURVIVORS: 'Reached the SVM',
+    FILTER_CONFIRMED: 'Confirmed clicks',
+}
+
+#: Verdicts issued by Stage 2, i.e. the rows that never reached the model.
+_STAGE2_VERDICTS = ('Stage2_SNR', 'Stage2_nonphys', 'Stage2_nseg',
+                    'Stage2_crest', 'Stage2_harm', 'Stage2_SPR',
+                    'Stage2_R2', 'Stage2_fit')
+
+#: Rows kept in the widget. Beyond this the OLDEST are discarded, arrays and
+#: all, and the count is reported rather than swallowed: at 30,000 events/hour
+#: an unbounded QTableWidget stops being a table and starts being a leak.
+MAX_ROWS_DEFAULT = 20000
+
+
 # ── COLUMN LAYOUT ───────────────────────────────────────────────────────────
 
 #: The five columns the user actually interacts with, hoisted to the front.
@@ -255,6 +285,10 @@ class EventsTable(QTableWidget):
         self._events = []            # raw dicts, parallel to the rows
         self._visible_keys = set()
         self._suppress_label_signal = False
+        self._filter_mode = FILTER_SURVIVORS
+        self._max_rows = MAX_ROWS_DEFAULT
+        #: Rows discarded to stay under _max_rows. Never silently zero again.
+        self.n_discarded = 0
         self.setup_table()
 
     # ── construction ────────────────────────────────────────────────────────
@@ -313,12 +347,14 @@ class EventsTable(QTableWidget):
         Extra keys are kept, not dropped — that is how `fft_mags` / `phases` and
         the legacy `peak_amplitude_v` ride along without becoming columns.
         """
+        self._enforce_cap()
         row = self.rowCount()
         self._suppress_label_signal = True
         try:
             self.insertRow(row)
             self._events.append(dict(event))
             self._fill_row(row, event)
+            self.setRowHidden(row, not self._passes_filter(self._events[row]))
         finally:
             self._suppress_label_signal = False
 
@@ -328,6 +364,23 @@ class EventsTable(QTableWidget):
         if self.currentRow() < 0:
             self.scrollToBottom()
         return row
+
+    def _enforce_cap(self):
+        """Drop the oldest rows so the widget stays bounded under a burst."""
+        if self._max_rows <= 0 or self.rowCount() < self._max_rows:
+            return
+        # A chunk at a time: removing one row per event would make every
+        # subsequent insert an O(n) shuffle for the whole recording.
+        drop = min(max(1, self._max_rows // 10), self.rowCount())
+        was = self._suppress_label_signal
+        self._suppress_label_signal = True
+        try:
+            for _ in range(drop):
+                self.removeRow(0)
+            del self._events[:drop]
+            self.n_discarded += drop
+        finally:
+            self._suppress_label_signal = was
 
     def set_events(self, events):
         self.clear_events()
@@ -339,8 +392,40 @@ class EventsTable(QTableWidget):
         try:
             self.setRowCount(0)
             self._events = []
+            self.n_discarded = 0
         finally:
             self._suppress_label_signal = False
+
+    # ── row filter ──────────────────────────────────────────────────────────
+
+    def _passes_filter(self, event) -> bool:
+        if self._filter_mode == FILTER_ALL:
+            return True
+        verdict = event.get('stage_blocked', LABEL_NONE)
+        if self._filter_mode == FILTER_CONFIRMED:
+            return verdict == ''
+        # FILTER_SURVIVORS: everything Stage 2 did not block, which is exactly
+        # the set the SVM scored — a row rejected by the model is still a row
+        # worth seeing, because that is where a mislabelled click hides.
+        return verdict not in _STAGE2_VERDICTS
+
+    def filter_mode(self):
+        return self._filter_mode
+
+    def set_filter_mode(self, mode):
+        """Choose which verdicts are visible. Rows are hidden, never deleted:
+        export_rows() and the CLCK block stay complete whatever is on screen."""
+        if mode not in FILTER_MODES:
+            raise ValueError(f"unknown filter {mode!r}; expected one of {FILTER_MODES}")
+        self._filter_mode = mode
+        for row in range(self.rowCount()):
+            self.setRowHidden(row, not self._passes_filter(self._events[row]))
+
+    def visible_count(self):
+        return sum(0 if self.isRowHidden(r) else 1 for r in range(self.rowCount()))
+
+    def set_max_rows(self, n):
+        self._max_rows = int(n)
 
     def event_at(self, row):
         if 0 <= row < len(self._events):

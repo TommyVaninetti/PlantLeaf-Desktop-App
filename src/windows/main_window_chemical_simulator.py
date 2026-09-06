@@ -549,6 +549,16 @@ class MainWindowChemicalSimulator(QMainWindow):
                 return
 
             version = struct.unpack('<f', header_bytes[10:14])[0]
+            if version >= 4.0:
+                # Event recording: frames are NOT contiguous in time, and this
+                # loader lays them out as if they were. Refusing is the only
+                # honest option - the wrong answer here would look right.
+                QMessageBox.warning(
+                    self, "Event recording",
+                    "This is an event .paudio (v4): only click candidates were "
+                    "recorded, so its frames are not continuous in time.\n\n"
+                    "The chemical simulator needs a continuous recording.")
+                return
             fs       = struct.unpack('<I', header_bytes[34:38])[0]
             fft_size = struct.unpack('<I', header_bytes[38:42])[0]
             freq_min = struct.unpack('<I', header_bytes[42:46])[0]

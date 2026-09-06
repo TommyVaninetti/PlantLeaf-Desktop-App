@@ -364,6 +364,12 @@ class LiveEventWorker(QtCore.QObject):
             'ctx_signal': ctx['signal'],
             'ctx_origin': ctx['origin'],
             'ctx_seams': ctx['seams'],
+            # The decay window, as indices into ctx_signal — the SAME span
+            # _feat_v6_spectral measures on. Handing the plot the span rather
+            # than making it re-derive one from peak_abs is what keeps the
+            # picture and the numbers describing the same samples.
+            'ctx_region': (int(resolved['onset']),
+                           int(resolved['decay_end']) + 1),
             'fft_mags': np.asarray(event['fft_mags']),
             'phases': np.asarray(event['phases']),
             'ctx_complete': bool(prev is not None and nxt is not None),
