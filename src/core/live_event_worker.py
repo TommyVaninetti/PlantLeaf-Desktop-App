@@ -23,13 +23,13 @@ candidates plus their two immediate neighbours. This worker turns that stream
 back into the same annotated rows the offline pipeline produces, so a click seen
 live and the same click re-analysed from its .paudio file are the same row.
 
-That is not an aspiration, it is the design rule: every step below calls the
-same function `click_detection_worker.py` calls, with the same arguments —
-`reconstruct_frame_v5(normalize=True)`, `build_click_context`, `resolve_click`,
-`compute_features_v5`, `click_event_key`, `run_stages234_annotated`. Nothing is
-reimplemented here. What IS here is the part that has no offline counterpart:
-reassembling prev|curr|next triples out of a stream that has gaps in it, and
-deduplicating without being able to see the whole recording first.
+That is not an aspiration, it is the design rule, and it is enforced by code
+rather than by discipline: the per-candidate computation lives in
+`core/candidate_analysis.analyse_candidate`, and the offline detector calls the
+same function with the same arguments. Nothing is reimplemented here. What IS
+here is the part that has no offline counterpart: reassembling prev|curr|next
+triples out of a stream that has gaps in it, and deduplicating without being
+able to see the whole recording first.
 
 WHAT EVENT MODE CANNOT PRODUCE, and why it is safe
 
@@ -71,6 +71,7 @@ import numpy as np
 from PySide6 import QtCore
 from PySide6.QtCore import Signal, Slot
 
+from core.candidate_analysis import analyse_candidate
 from core.click_pipeline_v5 import (
     FFT_SIZE,
     FS,
@@ -80,12 +81,7 @@ from core.click_pipeline_v5 import (
     PEAK_REFRACTORY_R,
     STAGE_BLOCKED_DEDUP,
     STAGE_OK,
-    build_click_context,
-    click_event_key,
-    compute_features_v5,
     load_svm_model,
-    reconstruct_frame_v5,
-    resolve_click,
     run_stage4_v5,
     run_stages234_annotated,
 )
@@ -290,57 +286,47 @@ class LiveEventWorker(QtCore.QObject):
             self.modelLoaded.emit(list(self._svm_model.get('features', [])))
         return self._svm_model
 
-    def _signal_of(self, idx):
+    def _frame_of(self, idx):
+        """(mags, phases) for one frame index, or None if it never arrived."""
         event = self._frames.get(idx)
         if event is None:
             return None
-        fd = reconstruct_frame_v5(
-            np.asarray(event['fft_mags']), np.asarray(event['phases']),
-            self.fs, self.fft_size, normalize=True,
-        )
-        return fd
+        return (event['fft_mags'], event['phases'])
 
     def _resolve(self, cand_idx):
         """Run Stages 2-4 for one candidate frame and queue the annotated row."""
-        curr = self._signal_of(cand_idx)
-        if curr is None:
+        event = self._frames.get(cand_idx)
+        if event is None:
             self.n_failed += 1
             return
-        event = self._frames[cand_idx]
 
-        prev = self._signal_of(cand_idx - 1)
-        nxt = self._signal_of(cand_idx + 1)
-        if prev is None or nxt is None:
+        prev_frame = self._frame_of(cand_idx - 1)
+        next_frame = self._frame_of(cand_idx + 1)
+        if prev_frame is None or next_frame is None:
             # Legal at the very start of a recording, and after a board FIFO
-            # overflow. build_click_context handles it; the row is marked so
+            # overflow. analyse_candidate handles it; the row is marked so
             # nobody later mistakes a truncated context for a clean one.
             self.n_incomplete += 1
 
-        ctx = build_click_context(
-            prev['signal'] if prev else None,
-            curr['signal'],
-            nxt['signal'] if nxt else None,
-        )
-
         noise_floor = float(event['noise_floor'])
         std_noise = float(event['std_noise'])
-        resolved = resolve_click(ctx, noise_floor, std_noise)
 
         # p_noise_psd is None on purpose — see the module docstring. It is the
         # one argument that differs from the offline call, and it is what turns
         # the v6 spectral family into an honest NaN instead of a wrong number.
-        features = compute_features_v5(
-            ctx, resolved,
-            curr['fft_norm'], curr['freq_axis'],
-            noise_floor, std_noise, self.fs,
+        analysed = analyse_candidate(
+            prev_frame, (event['fft_mags'], event['phases']), next_frame,
+            frame_idx=cand_idx,
+            noise_floor=noise_floor, std_noise=std_noise,
+            fs=self.fs, fft_size=self.fft_size,
             p_noise_psd=None,
         )
-        peak_abs, canonical_frame_idx = click_event_key(ctx, resolved, cand_idx)
+        if analysed is None:
+            self.n_failed += 1
+            return
 
         E_i = float(event['E_i'])
         E_hat_floor = float(event['E_hat_floor'])
-        d0 = int(resolved.get('decay_start', 0))
-        d1 = int(resolved.get('decay_end', 0))
 
         cand = {
             'schema_version': 'v6',
@@ -359,34 +345,16 @@ class LiveEventWorker(QtCore.QObject):
             'k_ratio': (E_i / E_hat_floor) if E_hat_floor else float('nan'),
             'timestamp_s': cand_idx * self.fft_size / float(self.fs),
         }
-        cand.update(features)
-        cand.update({
-            'peak_amp': resolved['peak_amp'],
-            'peak_abs': peak_abs,
-            'canonical_frame_idx': canonical_frame_idx,
-            'decay_len': max(0, d1 - d0),
-            # No Buffer 3 in event mode, so no frames went into one.
-            'b3_frames': 0,
-            # suppress_edge_artifacts' signature: its fade's first coefficient
-            # is exactly 0, and nothing else in the chain makes a hard zero.
-            'gibbs_fired': int(len(curr['signal']) > 0
-                               and curr['signal'][0] == 0.0),
-            # Live-only provenance. Kept out of CSV_COLUMNS on purpose: they
-            # describe the LINK, not the click.
-            'ctx_signal': ctx['signal'],
-            'ctx_origin': ctx['origin'],
-            'ctx_seams': ctx['seams'],
-            # The decay window, as indices into ctx_signal — the SAME span
-            # _feat_v6_spectral measures on. Handing the plot the span rather
-            # than making it re-derive one from peak_abs is what keeps the
-            # picture and the numbers describing the same samples.
-            'ctx_region': (int(resolved['onset']),
-                           int(resolved['decay_end']) + 1),
-            'fft_mags': np.asarray(event['fft_mags']),
-            'phases': np.asarray(event['phases']),
-            'ctx_complete': bool(prev is not None and nxt is not None),
-            'board_overflow': bool(event.get('had_overflow')),
-        })
+        cand.update(analysed)
+        # The transmitted spectrum, carried on the row so the FFT plot can draw
+        # the frame this click was found in. analyse_candidate deliberately does
+        # not return these — it is about analysis, not transport — so whoever
+        # has the frames attaches them.
+        cand['fft_mags'] = np.asarray(event['fft_mags'])
+        cand['phases'] = np.asarray(event['phases'])
+        # Live-only provenance. Kept out of CSV_COLUMNS on purpose: it describes
+        # the LINK, not the click.
+        cand['board_overflow'] = bool(event.get('had_overflow'))
 
         model = self._model()
         if model is None:

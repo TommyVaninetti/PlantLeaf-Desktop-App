@@ -662,14 +662,22 @@ class EventsTable(QTableWidget):
 
     # ── export ──────────────────────────────────────────────────────────────
 
-    def export_rows(self):
-        """Every row as a full CSV_COLUMNS dict, ready for
+    def export_rows(self, include_extras=False):
+        """
+        Every row as a full CSV_COLUMNS dict, ready for
         `csv.DictWriter(f, fieldnames=CSV_COLUMNS)` — the same call the offline
-        exporter and the replay window make, so the files are interchangeable."""
-        rows = []
-        for event in self._events:
-            rows.append({key: event.get(key, '') for key in CSV_COLUMNS})
-        return rows
+        exporter and the replay window make, so the files are interchangeable.
+
+        include_extras=True returns the raw event instead, keys outside the
+        schema included and missing keys left missing rather than blanked. That
+        is what the .paudio EVTR footer stores: it is a record of what this row
+        actually was, not a CSV line, and '' would turn "not measured" into
+        "measured as empty".
+        """
+        if include_extras:
+            return [dict(event) for event in self._events]
+        return [{key: event.get(key, '') for key in CSV_COLUMNS}
+                for event in self._events]
 
     def export_click_data(self):
         """

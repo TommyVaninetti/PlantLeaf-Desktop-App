@@ -20,8 +20,10 @@
 
     header   128 B                     PLANTAUDIO magic, version, metadata
     body     n_frames x 770 B          154 x (float32 magnitude + int8 phase)
-    CLCK     b'CLCK' + uint32 + zlib   click events, JSON
+    CLCK     b'CLCK' + uint32 + zlib   click events, JSON  (legacy, 5 fields)
     EVNT     b'EVNT' + uint32 + N*21   v4 only: per-frame event metadata
+    EVTR     b'EVTR' + uint32 + zlib   the analysed rows, JSON — features,
+                                       verdict, SVM probability and LABEL
 
 v3.0 is a CONTINUOUS recording: body frame i is the i-th frame of the signal,
 so its time is i * fft_size / fs.
@@ -69,6 +71,11 @@ FRAME_BYTES = BINS_PER_FRAME * RECORD_SIZE      # 770
 
 CLCK_MARKER = b'CLCK'
 EVNT_MARKER = b'EVNT'
+EVTR_MARKER = b'EVTR'
+
+#: Every footer marker, in write order. `split_sections` ends the body at
+#: whichever appears FIRST, so adding one here is all a new footer needs.
+FOOTER_MARKERS = (CLCK_MARKER, EVNT_MARKER, EVTR_MARKER)
 
 #: One EVNT record. Same fields, same order and same types as the 21 event
 #: bytes on the wire, so nothing is reinterpreted between the USB frame and
@@ -206,21 +213,102 @@ def find_block(blob: bytes, marker: bytes, start: int = 0):
 
 def split_sections(blob: bytes):
     """
-    Cut everything after the header into (body, click_payload, event_payload).
+    Cut everything after the header into
+    (body, click_payload, event_payload, row_payload).
 
-    The body ends at the FIRST footer marker, whichever it is: a v4 file always
-    writes CLCK first, but a file truncated between the two must not turn the
-    remaining EVNT bytes into magnitudes.
+    The body ends at the FIRST footer marker, whichever it is. A v4 file always
+    writes CLCK first — which is what lets a reader that knows only CLCK still
+    stop in the right place — but a file truncated between two footers must not
+    turn the remaining bytes into magnitudes.
     """
-    clck = find_block(blob, CLCK_MARKER)
-    evnt = find_block(blob, EVNT_MARKER)
+    blocks = {m: find_block(blob, m) for m in FOOTER_MARKERS}
 
-    ends = [b[0] for b in (clck, evnt) if b is not None]
+    ends = [b[0] for b in blocks.values() if b is not None]
     body_end = min(ends) if ends else len(blob)
 
-    click_payload = blob[clck[1]:clck[1] + clck[2]] if clck else b''
-    event_payload = blob[evnt[1]:evnt[1] + evnt[2]] if evnt else b''
-    return blob[:body_end], click_payload, event_payload
+    def payload(marker):
+        b = blocks[marker]
+        return blob[b[1]:b[1] + b[2]] if b else b''
+
+    return (blob[:body_end], payload(CLCK_MARKER),
+            payload(EVNT_MARKER), payload(EVTR_MARKER))
+
+
+def pack_row_footer(rows) -> bytes:
+    """
+    The EVTR block: the analysed rows exactly as the operator saw them.
+
+    WHY THIS EXISTS. The CLCK block keeps five fields — timestamp, frequency,
+    amplitude, duration, notes — and that is the whole legacy contract. Every
+    feature, the stage verdict, the SVM probability and, worst of all, the 0/1/2
+    LABEL were discarded the moment a recording was saved. Labelling a click
+    while recording it and finding the label gone afterwards is not a missing
+    feature, it is lost work.
+
+    Only JSON-serialisable schema values are stored. The stitched waveform
+    (`ctx_signal`) is ~1536 float64 per event and the spectrum is already in the
+    body, so neither goes in here; a reader that wants the waveform rebuilds it
+    from the frames, which is what the replay window does.
+    """
+    keep = []
+    for row in rows or []:
+        out = {}
+        for key, value in row.items():
+            if key.startswith('ctx_') or key in ('fft_mags', 'phases'):
+                continue
+            if isinstance(value, (str, bool, int, float)) or value is None:
+                out[key] = value
+            elif isinstance(value, (np.integer,)):
+                out[key] = int(value)
+            elif isinstance(value, (np.floating,)):
+                out[key] = float(value)
+            # anything else (arrays, tuples, objects) is not row data
+        keep.append(out)
+    payload = zlib.compress(
+        json.dumps(keep, separators=(',', ':'), allow_nan=True).encode('utf-8'))
+    return EVTR_MARKER + struct.pack('<I', len(payload)) + payload
+
+
+def parse_row_payload(payload: bytes):
+    """Decode the EVTR block. Returns [] when it is absent or unreadable."""
+    if not payload:
+        return []
+    try:
+        rows = json.loads(zlib.decompress(payload).decode('utf-8'))
+    except Exception:                                   # noqa: BLE001
+        return []
+    return rows if isinstance(rows, list) else []
+
+
+def gapped_series(timestamps, values, frame_duration_s):
+    """
+    Insert NaN wherever consecutive samples are not consecutive in time.
+
+    An event recording transmits clusters of frames minutes apart. Plotted as a
+    plain series, pyqtgraph draws a straight line from the last frame of one
+    cluster to the first of the next — a slope across forty minutes of silence
+    that looks exactly like data. A NaN between them breaks the line, so the gap
+    reads as a gap.
+
+    Returns (x, y) float64 arrays, longer than the input by one entry per gap.
+    Passing a contiguous recording returns it unchanged.
+    """
+    t = np.asarray(timestamps, dtype=np.float64)
+    v = np.asarray(values, dtype=np.float64)
+    if t.size == 0:
+        return t, v
+    n = min(t.size, v.size)
+    t, v = t[:n], v[:n]
+
+    # 1.5 frames of tolerance: consecutive frames differ by exactly one frame
+    # duration, and floating point should not be able to invent a gap.
+    gaps = np.flatnonzero(np.diff(t) > 1.5 * float(frame_duration_s))
+    if gaps.size == 0:
+        return t, v
+
+    x = np.insert(t.astype(np.float64), gaps + 1, np.nan)
+    y = np.insert(v.astype(np.float64), gaps + 1, np.nan)
+    return x, y
 
 
 def parse_click_payload(payload: bytes):

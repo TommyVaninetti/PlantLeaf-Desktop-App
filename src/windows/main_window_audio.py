@@ -1237,7 +1237,7 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
                     # Il corpo finisce al PRIMO marker di footer, qualunque
                     # sia: cercare solo CLCK trasformerebbe i byte di EVNT in
                     # magnitudini se il file fosse troncato fra i due.
-                    binary_data, _, _ = pf.split_sections(data)
+                    binary_data, _, _, _ = pf.split_sections(data)
                     
                     if binary_data:
                         # ✅ LETTURA INTERLACCIATA
@@ -1400,22 +1400,31 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
 
     def save_click_data(self, audio_filename):
         """
-        Append the footers: CLCK always, then EVNT for an event recording.
+        Append the footers: CLCK always, then EVNT for an event recording, then
+        EVTR whenever there are rows.
 
         ⚠️ In v4 the CLCK block is written EVEN WHEN EMPTY. Every reader in this
         repo finds the end of the body with find(b'CLCK'); without a CLCK block
         they would run past it and decode the EVNT bytes as magnitudes. The
         empty block is what makes the sidecar footer safe for readers that know
         nothing about it.
+
+        EVTR is written in BOTH modes. CLCK keeps five fields and nothing else,
+        so until now every feature, every verdict and — the part that actually
+        cost work — every 0/1/2 label applied during a recording was discarded
+        on save. A v3.0 file gaining this footer is safe for every existing
+        reader, because they all stop at CLCK.
         """
         try:
             if not hasattr(self, 'FFTClicksDetectedTableWidget'):
                 return
-            click_data = self.FFTClicksDetectedTableWidget.export_click_data()
+            table = self.FFTClicksDetectedTableWidget
+            click_data = table.export_click_data()
+            rows = table.export_rows(include_extras=True)
             is_event = self._file_version() >= pf.VERSION_EVENT
             meta = getattr(self, '_event_meta', []) if is_event else []
 
-            if not click_data and not is_event:
+            if not click_data and not is_event and not rows:
                 print("📊 Nessun click data da integrare")
                 return
 
@@ -1440,11 +1449,16 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
                 f.write(pf.pack_click_footer(click_data))
                 if is_event:
                     f.write(pf.pack_event_footer(meta))
+                if rows:
+                    f.write(pf.pack_row_footer(rows))
 
             self._click_data_saved = True
             print(f"📊 Click data integrati nel file: {len(click_data)} eventi")
             if is_event:
                 print(f"📊 Footer EVNT: {len(meta)} frame trasmessi")
+            if rows:
+                labelled = sum(1 for r in rows if str(r.get('label', '')).strip())
+                print(f"📊 Footer EVTR: {len(rows)} righe, {labelled} etichettate")
 
         except Exception as e:
             print(f"⚠️ Errore integrazione click data: {e}")
