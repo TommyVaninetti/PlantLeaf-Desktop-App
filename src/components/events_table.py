@@ -35,6 +35,7 @@ import math
 from PySide6.QtWidgets import (QTableWidget, QTableWidgetItem, QLineEdit, QComboBox,
                                QHeaderView, QStyledItemDelegate, QMenu)
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
 
 # Module-level despite the import graph: click_review_dialog already imports this
 # same module at module level (with the same noqa), and data_collection_dialog_v5
@@ -54,6 +55,11 @@ from components.data_collection_dialog_v5 import (          # noqa: E402
 from components.click_review_dialog import (                # noqa: E402
     LABEL_CLICK, LABEL_NOISE, LABEL_AMBIG, LABEL_NONE, LABELS_DECIDED,
 )
+
+# The Stage 2 verdict names, for tinting. Imported rather than listed: this used
+# to be a hardcoded pair (Stage2_R2, Stage2_SPR) and the five v6 gates that
+# replaced them went untinted and uncounted.
+from core.click_pipeline_v5 import STAGE_BLOCKED_STAGE2   # noqa: E402
 
 
 # ── ROW FILTER ──────────────────────────────────────────────────────────────
@@ -79,6 +85,19 @@ FILTER_LABELS = {
 _STAGE2_VERDICTS = ('Stage2_SNR', 'Stage2_nonphys', 'Stage2_nseg',
                     'Stage2_crest', 'Stage2_harm', 'Stage2_SPR',
                     'Stage2_R2', 'Stage2_fit')
+
+#: Row tint per verdict, so a census reads at a glance. Every Stage-2 verdict
+#: shares one grey: what a reader wants from the colour is "gate / SVM / dedup",
+#: and WHICH gate is already spelled out in the verdict column. Built from
+#: STAGE_BLOCKED_STAGE2 rather than listed here, so a new gate cannot end up as
+#: the one untinted row in the table.
+_GATE_GREY = QColor(120, 120, 120, 45)
+VERDICT_TINTS = {v: _GATE_GREY for v in STAGE_BLOCKED_STAGE2}
+VERDICT_TINTS.update({
+    '':             QColor(46, 125, 50, 60),    # confirmed — green
+    'Stage3_SVM':   QColor(211, 47, 47, 45),    # the SVM said noise — red
+    'Stage4_dedup': QColor(255, 152, 0, 45),    # duplicate of a stronger one — amber
+})
 
 #: Rows kept in the widget. Beyond this the OLDEST are discarded, arrays and
 #: all, and the count is reported rather than swallowed: at 30,000 events/hour
@@ -445,6 +464,11 @@ class EventsTable(QTableWidget):
         for row in range(self.rowCount()):
             self.setRowHidden(row, not self._passes_filter(self._events[row]))
 
+    def visible_events(self):
+        """The raw dicts the filter is currently showing, in display order."""
+        return [self._events[r] for r in range(self.rowCount())
+                if not self.isRowHidden(r)]
+
     def visible_count(self):
         return sum(0 if self.isRowHidden(r) else 1 for r in range(self.rowCount()))
 
@@ -474,6 +498,10 @@ class EventsTable(QTableWidget):
         return self.currentRow()
 
     def _fill_row(self, row, event: dict):
+        verdict = event.get('stage_blocked')
+        # None means "not analysed" (a legacy threshold row), which is not the
+        # same thing as "survived every stage" and must not be tinted green.
+        tint = VERDICT_TINTS.get(verdict) if verdict is not None else None
         for col, key in enumerate(COLUMN_KEYS):
             item = QTableWidgetItem(format_cell(key, event.get(key)))
             if col in (COL_LABEL, COL_NOTE):
@@ -483,6 +511,8 @@ class EventsTable(QTableWidget):
             if col == COL_PROB or col in _NUMERIC_ALIGNED:
                 item.setTextAlignment(Qt.AlignmentFlag.AlignRight
                                       | Qt.AlignmentFlag.AlignVCenter)
+            if tint is not None:
+                item.setBackground(tint)
             self.setItem(row, col, item)
         # The raw dict lives on column 0 so a consumer never has to parse the
         # formatted strings back into numbers.

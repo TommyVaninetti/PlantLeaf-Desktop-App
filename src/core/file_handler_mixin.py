@@ -204,39 +204,15 @@ class FileHandlerMixin:
         replay_window = ReplayWindowAudio(self.file_path)
         dm = replay_window.data_manager
         
-        # Popola data manager
-        dm.header_info = data['header_info']
-        dm.fft_data = data['fft_data']
-        dm.phase_data = data.get('phase_data', [])
-        dm.frequency_axis = np.array(data['frequency_axis'])
-        dm.total_frames = data['total_frames']
-        dm.frame_duration_ms = data['frame_duration_ms']
-        dm.total_duration_sec = data['total_duration_sec']
-        dm.click_events = data['click_events']
-        dm.overview_x = np.array(data['overview_x'])
-        dm.overview_y = np.array(data['overview_y'])
-        dm.overview_loaded = True
-        dm.streaming_x = np.array(data['streaming_x'])
-        dm.streaming_y = np.array(data['streaming_y'])
-        dm.streaming_start_time = data['streaming_start_time']
-        dm.streaming_end_time = data['streaming_end_time']
-        
-        # Pre-computed arrays
-        dm.fft_means       = data['fft_means']        # np.float32[n_frames]
-        dm.fft_timestamps  = data['fft_timestamps']   # np.float64[n_frames]
-        dm.E_hat_floor_arr = data['E_hat_floor_arr']  # np.float32[n_frames]
-        dm.noise_floor_arr = data['noise_floor_arr']  # np.float32[n_frames]
-        dm.std_noise_arr   = data['std_noise_arr']    # np.float32[n_frames]
-        # v6 Buffer 3 — per-bin noise PSD, sampled on a stride. .get() rather than
-        # [] so a dict produced by an older worker still loads.
-        # ⚠️ EVERY key the worker emits must be copied here. When these three were
-        # missing, p_noise_at() returned None for every frame and all eight v6
-        # spectral features exported as NaN — silently, because NaN is also the
-        # legitimate "no estimate yet" value. b3_frames == 0 is the tell.
-        dm.p_noise_snapshots = data.get('p_noise_snapshots')   # float32[n_snap, 154]
-        dm.p_noise_stride    = data.get('p_noise_stride')      # int
-        dm.p_noise_counts    = data.get('p_noise_counts')      # int32[n_snap]
-        
+        # Popola data manager.
+        # ⚠️ ONE call, not a hand-written copy of the worker's dict. This block
+        # used to list every key by hand, and twice it fell behind: the three
+        # Buffer 3 keys went missing (every v6 feature then exported as NaN,
+        # silently, because NaN is also the legitimate "no estimate yet" value),
+        # and later the eight EVNT keys, which the worker parsed and this threw
+        # away. AudioDataManager.apply_loader_result owns the mapping now.
+        dm.apply_loader_result(data)
+
         # Setup UI
         replay_window._setup_metadata()
         replay_window._setup_ui_with_data()
