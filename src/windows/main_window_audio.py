@@ -139,6 +139,8 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
             y_label="Amplitude",
             x_range=(-1.28, 1.28),
             y_range=(-0.05, 0.05),
+            x_max=-8,x_min=8,
+            y_min=-0.4,y_max=0.4,
             unit_x="ms", unit_y="V",
             parent=self
         )
@@ -273,6 +275,12 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         # reader sees the boundary between them.
         if not (self._last_temp_file and os.path.exists(self._last_temp_file)):
             self._event_meta = []
+
+        self._frame_offset = self._compute_frame_offset()
+        if self._frame_offset:
+            print(f"⏱️ Eventi sfasati di {self._frame_offset} frame "
+                  f"({self._frame_offset * self.fft_size / self.fs:.1f} s "
+                  f"gia' registrati)")
         self.event_worker.model_path = self.svm_model_path
         self.event_worker.k = self.stage1_k
 
@@ -285,11 +293,22 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         # Disabilita azioni ma verifica se dopo serial_worker.start() è andcora tutto attivo:
         try:
             if self.serial_worker.is_connected:
-                # The firmware refuses a mode change while running; disable the
-                # control rather than let the user send a command that fails.
-                self.FFTClicksDetectorButton.setEnabled(False)
-                if hasattr(self, 'actionStage1K'):
-                    self.actionStage1K.setEnabled(False)
+                # Locked for the rest of this window's life, not just for the
+                # duration of the recording. Two reasons, both real:
+                #
+                #  * the mode decides the FILE's format version (v3 continuous
+                #    vs v4 event). Changing it half way through would leave one
+                #    file holding two kinds of recording with one header.
+                #  * AudioSerialWorker.stop() CLOSES the port, so between stop
+                #    and the next start there is nothing to send a command to.
+                #    The button used to still toggle there — the label changed
+                #    and the board never heard about it, which is exactly the
+                #    "button works but the behaviour doesn't" case.
+                #
+                # Clear does not unlock it either: Clear empties the data, it
+                # does not start a new experiment. File > New does, and that
+                # opens a fresh window with the button live again.
+                self._lock_mode_controls()
                 self.actionClear.setEnabled(False)
                 self.actionSamplingSettings.setEnabled(False)
                 self.actionSerialPort.setEnabled(False)
@@ -314,9 +333,8 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         # Chiama il metodo sicuro centralizzato in BaseWindow
         self._safe_stop_serial_worker()
 
-        self.FFTClicksDetectorButton.setEnabled(True)
-        if hasattr(self, 'actionStage1K'):
-            self.actionStage1K.setEnabled(True)
+        # Deliberately NOT re-enabled here: the mode is fixed for the life of
+        # this file. See _lock_mode_controls.
 
         # Resolve the candidates still waiting for a neighbour that will now
         # never arrive, and let their rows reach the table before anything
@@ -384,6 +402,12 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         come back as '!err busy'.
         """
         self.event_mode = True          # matches the firmware's boot default
+        #: Locked by the first !start!. See on_start.
+        self._mode_locked = False
+        #: Frames elapsed in the acquisitions already in this file. The board
+        #: restarts frame_idx at 0 on every !start!, so without this every
+        #: acquisition after the first would overwrite the first one in time.
+        self._frame_offset = 0
         self.stage1_k = self.STAGE1_K_DEFAULT
         self._pending_mode = None       # mode whose ack we are waiting for
         self._board_stats = None        # last '!stats ...' line
@@ -401,6 +425,10 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         self.event_worker.moveToThread(self.event_thread)
         self.event_thread.started.connect(self.event_worker.start)
         self.event_worker.eventReady.connect(self.on_event_ready)
+        # The table's default columns follow the classifier: the worker loads
+        # the model lazily, and says what it actually reads when it does.
+        self.event_worker.modelLoaded.connect(
+            self.FFTClicksDetectedTableWidget.set_model_features)
         self.event_worker.statusChanged.connect(self.on_event_status)
         self.event_worker.error.connect(
             lambda msg: print(f"⚠️ Live pipeline: {msg}"))
@@ -521,6 +549,45 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         self.FFTClicksDetectedTableWidget.set_filter_mode(mode)
         self._refresh_events_label()
 
+    def _compute_frame_offset(self):
+        """
+        Where in the file this acquisition starts, in frames.
+
+        The board counts frames from 0 on every !start!, so without this a
+        second acquisition in the same file would lay its events on top of the
+        first — every timestamp starting again from zero. The phase is the
+        recording time already elapsed, i.e. the SAME quantity the chronometer
+        shows, so the timestamp column and the clock on screen agree by
+        construction rather than by coincidence.
+
+        Note what this deliberately does NOT count: the wall-clock gap while
+        the recording was stopped. get_acquisition_time() accumulates only time
+        spent recording, so two acquisitions ten minutes apart sit back-to-back
+        on the time axis — which is exactly what the elapsed-time label says.
+        """
+        return int(round(self.get_acquisition_time() * self.fs / self.fft_size))
+
+    def _lock_mode_controls(self):
+        """Fix the mode and k for the rest of this window's life."""
+        if self._mode_locked:
+            return
+        self._mode_locked = True
+        mode = "event" if self.event_mode else "full"
+        self.FFTClicksDetectorButton.setEnabled(False)
+        self.FFTClicksDetectorButton.setToolTip(
+            f"Locked to {mode} mode for this file.\n"
+            "The mode decides the file format (v4 event / v3 continuous), so it "
+            "cannot change\nhalf way through a recording. File > New starts a "
+            "fresh one.")
+        if hasattr(self, 'actionStage1K'):
+            # Same reason plus one more: k is a firmware setting, and the board
+            # only accepts it while stopped — which is also when the port is
+            # closed. There is no moment left in this file's life where it
+            # could take effect.
+            self.actionStage1K.setEnabled(False)
+            self.actionStage1K.setToolTip(
+                f"Locked at k = {self.stage1_k:.2f} for this file.")
+
     def _sync_mode_button(self):
         # Legacy name, now purely the mode mirror: it is what the
         # clicks_detector_toggled signal carries. Nothing gates behaviour on it
@@ -539,6 +606,14 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         """
         if not getattr(self, "is_acquiring", False):
             return
+
+        # Put this acquisition after the ones already in the file. Applied HERE,
+        # once, so that everything downstream — triple assembly, timestamps, the
+        # table, the EVNT footer — works in one continuous timeline for the file
+        # instead of each stage having to know about the board's restarts.
+        if self._frame_offset:
+            evt = dict(evt)
+            evt['frame_idx'] += self._frame_offset
 
         # Saved exactly like a full-mode frame, so the .paudio body stays
         # byte-identical to v3 and every existing reader keeps working. What
@@ -738,14 +813,35 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
 
     # GRAFICO FFT - AGGIORNATO SOLO DAL TIMER
     def update_plot(self):
-        """Aggiorna il plot solo se necessario (chiamato dal timer a 60Hz)"""
-        # In Region FFT il grafico appartiene all'evento selezionato: il flusso
-        # live non deve sovrascriverlo ad ogni frame.
+        """
+        Aggiorna il plot solo se necessario (chiamato dal timer a 60Hz).
+
+        Il grafico FFT ha DUE proprietari e uno solo alla volta:
+
+          * il flusso live, quando nessun evento e' selezionato;
+          * l'evento selezionato, appena se ne clicca uno.
+
+        Il secondo caso mancava. In Region FFT il metodo usciva subito, ma in
+        Frame FFT no: si selezionava un evento, _render_event ne disegnava lo
+        spettro, e il tick successivo del timer lo sovrascriveva con l'ultimo
+        frame arrivato. Sembrava che il grafico "cambiasse da solo", o che
+        stesse mostrando a rotazione i frame del contesto; in realta' era il
+        flusso live che se lo riprendeva 60 volte al secondo.
+
+        Esc sulla tabella toglie la selezione e restituisce il grafico al vivo.
+        """
         if self.fft_mode != self.FFT_MODE_FRAME:
+            return
+        if self._event_is_pinned():
             return
         if self.plot_needs_update and len(self.data_y_plot) > 0:
             self.plot_widget_fft.plot.setData(self.data_x, self.data_y_plot)
             self.plot_needs_update = False
+
+    def _event_is_pinned(self):
+        """True while a row is selected, i.e. while the plots belong to it."""
+        table = getattr(self, 'FFTClicksDetectedTableWidget', None)
+        return table is not None and table.selected_row() >= 0
 
 
 
@@ -757,10 +853,20 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
     FFT_MODE_REGION = 1
 
     def on_event_selected(self, row):
-        """Una riga della tabella eventi e' stata selezionata: ridisegna i grafici."""
+        """
+        Una riga e' stata selezionata (o deselezionata): ridisegna i grafici.
+
+        row < 0 significa nessuna selezione — Esc sulla tabella — e restituisce
+        il grafico FFT al flusso live invece di lasciarci sopra l'ultimo evento
+        guardato.
+        """
         event = self.FFTClicksDetectedTableWidget.event_at(row)
         if event is None:
             self.IFFTTitleLabel.setText("iFFT — no event")
+            self.plot_widget_ifft.plot.setData([], [])
+            self.reference_curve_fft.setData([], [])
+            self.plot_needs_update = True
+            self.update_plot()
             return
         self._render_event(event)
 
@@ -914,6 +1020,10 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
 
         self.svm_model_path = Path(filepath)
         self.svm_model = model
+        self.event_worker.model_path = self.svm_model_path
+        self.event_worker._svm_model = model
+        self.FFTClicksDetectedTableWidget.set_model_features(
+            model.get('features', []))
         self.settings_manager.set_last_directory("svm_model", filepath)
         self._update_svm_action_tooltip(model)
         print(f"🧠 Modello SVM selezionato: {self.svm_model_path.name}")
@@ -1340,6 +1450,28 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
             print(f"⚠️ Errore integrazione click data: {e}")
 
 
+    def _clear_experiment_data(self):
+        """
+        Clear also has to reset what event mode accumulates, or the next save
+        would write an EVNT footer describing frames that are no longer in the
+        body — a count mismatch that silently drops the footer.
+
+        The mode stays locked: Clear empties the data, it does not start a new
+        experiment. File > New does, and that opens a fresh window.
+        """
+        super()._clear_experiment_data()
+        self._event_meta = []
+        self._frame_offset = 0
+        self._board_stats = None
+        self._event_status = {}
+        if hasattr(self, 'event_worker'):
+            self.event_worker.reset()
+        if hasattr(self, 'FFTClicksDetectedTableWidget'):
+            # setRowCount(0) in BaseWindow leaves EventsTable._events behind,
+            # so the raw dicts would outlive their rows.
+            self.FFTClicksDetectedTableWidget.clear_events()
+        self._refresh_events_label()
+
     def cleanup_resources(self):
         """Stop the live pipeline thread as well as everything BaseWindow knows."""
         try:
@@ -1495,12 +1627,14 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         rule — it answers '!err busy' — and asking anyway would leave the button
         showing a mode the board is not in.
         """
-        if self.is_acquiring:
+        if self.is_acquiring or self._mode_locked:
             self._sync_mode_button()      # undo the click
             self.show_error_dialog(
-                "Recording",
-                "Click detection can only be switched while the recording is "
-                "stopped.")
+                "Mode locked",
+                "The mode is fixed once a recording has started: it decides the "
+                "file format\n(v4 event / v3 continuous), and the board only "
+                "accepts a change while stopped,\nwhich is also when the serial "
+                "port is closed.\n\nFile > New starts a fresh experiment.")
             return
 
         self.event_mode = not self.event_mode

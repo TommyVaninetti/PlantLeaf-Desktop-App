@@ -129,9 +129,11 @@ COLUMN_GROUPS = [
     ('Provenance & verdicts',  PROVENANCE_COLUMNS),
 ]
 
-#: Visible on a fresh install, beside the five core columns. One representative
-#: from each stage of the pipeline rather than a whole group, so the default view
-#: fits on screen and still says something about every stage.
+#: One representative from each stage of the pipeline. Kept as a menu option
+#: because it is a useful way to look at the table, but it is no longer the
+#: default: most of it is not what the classifier reads, and three of its
+#: entries (spectral_entropy, harmonic_confinement, local_crest) are NaN in
+#: event mode by construction — a default view of empty columns.
 HEADLINE_KEYS = [
     'frame_idx',
     'peak_SNR', 'tau_ms', 'R2', 'FPE_hz',
@@ -139,8 +141,26 @@ HEADLINE_KEYS = [
     'spectral_entropy', 'harmonic_confinement', 'local_crest',
 ]
 
+#: The features of the shipped model (plantleaf_svm_v6_DEPLOYED, the
+#: 6bestfeatures_plusR2 set). Used until a model is actually loaded, because
+#: joblib.load costs ~100 ms and the table has to be built before that.
+#: set_model_features() replaces it with whatever the loaded model really reads.
+MODEL_FEATURES_FALLBACK = [
+    'peak_SNR', 'pre_SNR', 'post_SNR',
+    'fall_time_ms', 'rise_time_ms', 'fit_valid', 'R2',
+]
+
+#: Always shown next to the model's own features: which frame it was, and how
+#: far over the Stage 1 floor it sat. Neither is a feature; both are how you
+#: find the event again.
+MODEL_VIEW_EXTRA = ['frame_idx', 'k_ratio']
+
 #: settings_manager key for the persisted visible-column set.
-SETTINGS_KEY = 'audio_events_columns'
+#: ⚠️ Bumped to _v2 when the default became the model's feature set. Reusing the
+#: old key would have kept every existing install on the old headline default,
+#: i.e. the change would have been invisible to exactly the people who have
+#: used the table before.
+SETTINGS_KEY = 'audio_events_columns_v2'
 
 #: Schema columns that are integers. Formatting them as %.4g would print
 #: `frame_idx = 1.234e+04`, which is unreadable and un-greppable.
@@ -286,6 +306,10 @@ class EventsTable(QTableWidget):
         self._visible_keys = set()
         self._suppress_label_signal = False
         self._filter_mode = FILTER_SURVIVORS
+        self._model_features = list(MODEL_FEATURES_FALLBACK)
+        #: True once the user has chosen columns from the header menu. Until
+        #: then, loading a model is allowed to re-pick the default view.
+        self._columns_chosen = False
         self._max_rows = MAX_ROWS_DEFAULT
         #: Rows discarded to stay under _max_rows. Never silently zero again.
         self.n_discarded = 0
@@ -361,7 +385,7 @@ class EventsTable(QTableWidget):
         # Follow the stream only while the user is not inspecting something:
         # auto-scrolling out from under a selected row makes the table unusable
         # during an acquisition, which is exactly when events arrive.
-        if self.currentRow() < 0:
+        if self.selected_row() < 0:
             self.scrollToBottom()
         return row
 
@@ -433,7 +457,21 @@ class EventsTable(QTableWidget):
         return None
 
     def current_event(self):
-        return self.event_at(self.currentRow())
+        return self.event_at(self.selected_row())
+
+    def selected_row(self):
+        """
+        The selected row, or -1 when nothing is selected.
+
+        NOT the same as currentRow(). Qt keeps a 'current' cell for keyboard
+        navigation that survives clearSelection(), so currentRow() still says 0
+        when the user has just deselected everything — which left the plots
+        pinned to an event nobody had selected any more. Everything that means
+        'is the user looking at an event' has to go through this.
+        """
+        if not self.selectionModel().hasSelection():
+            return -1
+        return self.currentRow()
 
     def _fill_row(self, row, event: dict):
         for col, key in enumerate(COLUMN_KEYS):
@@ -453,7 +491,7 @@ class EventsTable(QTableWidget):
     # ── interaction ─────────────────────────────────────────────────────────
 
     def _on_selection_changed(self):
-        self.eventSelected.emit(self.currentRow())
+        self.eventSelected.emit(self.selected_row())
 
     def _on_item_changed(self, item):
         if self._suppress_label_signal or item is None:
@@ -481,8 +519,14 @@ class EventsTable(QTableWidget):
 
     def keyPressEvent(self, event):
         """0 / 1 / 2 label the selected row, Del/Backspace clears it — the same
-        keys as click_review_dialog, so the labelling reflex transfers. Only
-        reached when no cell editor is open, so it never eats note typing."""
+        keys as click_review_dialog, so the labelling reflex transfers. Esc drops
+        the selection, which is what releases the FFT plot back to the live
+        stream. Only reached when no cell editor is open, so it never eats note
+        typing."""
+        if event.key() == Qt.Key.Key_Escape:
+            self.clearSelection()
+            self.setCurrentCell(-1, -1)
+            return
         row = self.currentRow()
         if 0 <= row < len(self._events):
             text = event.text()
@@ -513,8 +557,9 @@ class EventsTable(QTableWidget):
             # Intersect with the current schema: a saved set from an older
             # schema must not resurrect columns that no longer exist.
             self._visible_keys = {k for k in saved if k in COLUMN_KEYS}
+            self._columns_chosen = True
         else:
-            self._visible_keys = set(HEADLINE_KEYS)
+            self._visible_keys = set(self.model_view_keys())
         self._apply_visibility()
 
     def _persist_visible_keys(self):
@@ -532,7 +577,32 @@ class EventsTable(QTableWidget):
             else:
                 self.setColumnHidden(col, key not in self._visible_keys)
 
+    def model_view_keys(self):
+        """The columns worth looking at for the model in use, in schema order."""
+        wanted = set(self._model_features) | set(MODEL_VIEW_EXTRA)
+        return [k for k in COLUMN_KEYS[N_CORE:] if k in wanted]
+
+    def set_model_features(self, features):
+        """
+        Tell the table which features the classifier actually reads.
+
+        The 55-column schema exists so a row can be exported for a RETRAIN; it
+        is not a reading view. What matters while events are arriving is the
+        handful of numbers the model in use looks at — so those are the default,
+        and they follow the loaded model rather than a list frozen in this file.
+
+        A view the user picked from the header menu is never overridden.
+        """
+        features = [f for f in features if f in COLUMN_KEYS]
+        if not features or features == self._model_features:
+            return
+        self._model_features = list(features)
+        if not self._columns_chosen:
+            self._visible_keys = set(self.model_view_keys())
+            self._apply_visibility()
+
     def set_visible_keys(self, keys):
+        self._columns_chosen = True
         self._visible_keys = {k for k in keys if k in COLUMN_KEYS}
         self._apply_visibility()
         self._persist_visible_keys()
@@ -541,6 +611,8 @@ class EventsTable(QTableWidget):
         menu = QMenu(self)
 
         all_optional = [k for k in COLUMN_KEYS[N_CORE:]]
+        menu.addAction(f"Model features only ({len(self._model_features)})",
+                       lambda: self.set_visible_keys(self.model_view_keys()))
         menu.addAction("Show all columns",
                        lambda: self.set_visible_keys(all_optional))
         menu.addAction("Headline features only",

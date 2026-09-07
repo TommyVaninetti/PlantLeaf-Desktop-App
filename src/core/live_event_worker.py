@@ -100,6 +100,10 @@ class LiveEventWorker(QtCore.QObject):
     statusChanged = Signal(dict)
     #: Non-fatal problem worth telling the user about once.
     error = Signal(str)
+    #: The feature names the loaded model actually reads. The model is loaded
+    #: lazily (joblib costs ~100 ms), so this is how the UI finds out which
+    #: columns are worth showing without paying that at startup.
+    modelLoaded = Signal(list)
 
     #: Frames held before feature extraction. 512 frames is ~1.3 s of a
     #: continuous burst — far more than the firmware's own 12-slot USB FIFO
@@ -283,6 +287,7 @@ class LiveEventWorker(QtCore.QObject):
         if self._svm_model is None and self.model_path is not None:
             # joblib, not pickle: the model carries raw numpy buffers.
             self._svm_model = load_svm_model(self.model_path)
+            self.modelLoaded.emit(list(self._svm_model.get('features', [])))
         return self._svm_model
 
     def _signal_of(self, idx):

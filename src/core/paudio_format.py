@@ -170,10 +170,16 @@ def pack_event_footer(records) -> bytes:
     `records` is an iterable of
         (frame_idx, flags, E_i, E_hat_floor, noise_floor, std_noise)
 
-    POSITIONAL, deliberately: record i describes body frame i. frame_idx is the
-    board's own counter and restarts at 0 on every !start!, so several
-    acquisitions appended to one file show up as frame_idx going backwards —
-    which is exactly how a reader finds the boundary between them.
+    POSITIONAL, deliberately: record i describes body frame i.
+
+    frame_idx is a position in the FILE, not the board's raw counter. The board
+    restarts its counter at 0 on every !start!, so the app phases each
+    acquisition by the recording time already elapsed before writing it here —
+    otherwise a second acquisition appended to the same file would sit on top
+    of the first in time. The values are therefore monotonic across the whole
+    file, and the phase counts recording time only: a stop-and-resume ten
+    minutes later leaves no ten-minute hole, exactly as the elapsed-time clock
+    in the UI shows it.
     """
     payload = bytearray()
     for rec in records:
