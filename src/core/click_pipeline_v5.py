@@ -16,17 +16,40 @@
 # along with PlantLeaf. If not, see <https://www.gnu.org/licenses/>.
 
 """
-PlantLeaf — Click Detection Pipeline v5.0
-==========================================
+PlantLeaf — Click Detection Pipeline
+====================================
 
 Full pipeline for automatic ultrasonic click detection using an adaptive noise
 estimator and a Support Vector Machine (SVM) classifier.
 
+⚠️ THE FILENAME SAYS v5. THE MODULE SERVES BOTH v5 AND v6.
+There is only one pipeline module, and it has never been forked. Which algorithm
+version runs is chosen by CONSTANTS and by the LOADED MODEL, never by importing a
+different file:
+
+    Stage 1   STAGE1_MODE   — STAGE1_MODE_V51 (peak picking) is the default;
+                              STAGE1_MODE_V5 (run-length) stays selectable.
+    Stage 2   STAGE2_MODE   — STAGE2_MODE_CONSERVATIVE (v6) is the default;
+                              STAGE2_MODE_V5 (the fit gate) stays selectable.
+    Stage 3   the model     — svm_model['features'] and ['threshold'] decide what
+                              is scored and where the cut falls, and
+                              ['nan_policy'] decides how sentinels are encoded.
+                              Nothing about Stage 3 is hardcoded here.
+    Stage 4   unchanged between versions.
+
+So a v5 run and a v6 run differ only in those settings. The name is kept because
+~20 modules and 11 by-path test scripts import it, and because a copy would mean
+two Stage 1s and two Stage 2s drifting apart. Renaming is a mechanical change if
+it is ever wanted; forking is not.
+
 Architecture (four stages):
-  Stage 1  – Adaptive energy threshold + run-length filter
+  Stage 1  – Adaptive energy threshold, then peak picking (v5.1) or run-length (v5)
              [compute_features_v5 is called between Stage 1 and Stage 2 by the caller]
-  Stage 2  – Valid-fit and OOD gate: R² ≥ STAGE2_R2_MIN, SPR < STAGE2_SPR_MAX
-  Stage 3  – SVM classification (RBF kernel, 16 features, calibrated threshold)
+  Stage 2  – v6: gates on measurable features (peak_SNR, n_seg, local_crest,
+             harmonic_confinement) plus OOD sanity bounds.
+             v5: valid-fit and OOD gate — R² ≥ STAGE2_R2_MIN, SPR < STAGE2_SPR_MAX
+  Stage 3  – SVM classification (kernel, feature set and threshold all read from
+             the model file; the deployed v6 model is RBF over 7 features)
   Stage 4  – Deduplication (merge nearby detections from the same physical click)
 
 The old v4 Stage 2 (FFT hard-threshold filters on SPR and peak FFT amplitude) has
@@ -107,10 +130,64 @@ _BIN_END       = int(BIN_END_HZ   / _BIN_FREQ)  # Last  bin index (inclusive)
 _K_BINS        = _BIN_END - _BIN_START + 1      # Number of analysis bins (= 154)
 
 # STAGE 1 (§5)
-MAX_RUN          = 3    # Maximum run length of consecutive above-threshold frames.
-                        # Runs longer than this are discarded as sustained noise.
-                        # A genuine cavitation click lasts ≤ 0.5 ms ≈ 1–2 frames;
-                        # a run of 4+ frames (≥10.24 ms) is virtually always noise.
+MAX_RUN          = 3    # ⚠️ SUPERSEDED as a rejection rule by STAGE1_MODE_V51.
+                        # Retained ONLY to (a) drive the legacy v5_runlength mode
+                        # and (b) compute `would_pass_v5`, the per-candidate flag
+                        # that makes the v5 → v5.1 delta computable from a single
+                        # export instead of by diffing two runs (D6).
+                        # Historical meaning: runs longer than this were discarded
+                        # wholesale as sustained noise.
+# ── Stage 1 v5.1 — local peak picking (STAGE1_PEAKPICK_v5.1_SPEC.md) ────────
+# Replaces run-length REJECTION with local peak SELECTION. The v5 rule discarded
+# an entire run of >MAX_RUN above-threshold frames as "sustained noise", which
+# deletes any click that happened to land inside one: the physical argument
+# ("a click cannot span 4+ frames") is about the CLICK, but the filter applied it
+# to the RUN — a property of the acoustic neighbourhood the click landed in.
+# A click is not made less impulsive by something else being audible 30 ms away.
+#
+# Measured on this corpus: the filter drops 45-53 % of above-threshold frames in
+# mechanical-stimulus recordings and 0 % in empty-room ones. A filter removing
+# noise would fire on the noise-only sessions too.
+STAGE1_MODE_V5   = 'v5_runlength'    # legacy: keep runs of length <= MAX_RUN, whole
+STAGE1_MODE_V51  = 'v51_peakpick'    # v5.1: keep local maxima, reject nothing
+STAGE1_MODE      = STAGE1_MODE_V51   # D6 — both modes must remain selectable
+
+PEAK_REFRACTORY_R = 1   # Local-maximum half-window, in frames (±2.56 ms).
+                        # Minimum separation at which two events are resolved as
+                        # distinct candidates. Bounds the candidate rate at one per
+                        # R+1 frames (~195/s at 390.6 fps) without any rejection.
+                        #
+                        # ⚠️ SET BY MEASUREMENT, not by the spec's proposed value.
+                        # The spec proposed R = 2 and §7.1 named the failure mode to
+                        # watch for: peak-picking can suppress a confirmed click that
+                        # is not a local maximum within ±R because a louder frame
+                        # sits beside it. It prescribed dropping to R = 1 if that
+                        # happened. It happened. AC-1 over all 91 confirmed clicks
+                        # in 19 recordings:
+                        #
+                        #     R = 2 : 87 / 91   FAILS
+                        #     R = 1 : 91 / 91   PASSES
+                        #
+                        # All four losses at R = 2 are the same mechanism, and it is
+                        # NOT the one the run-length filter had: the ±R window reaches
+                        # ACROSS run boundaries, because consecutive runs are separated
+                        # by at least one sub-threshold frame. Each lost click was an
+                        # isolated L = 1 run with a louder, unrelated event exactly two
+                        # frames (5.12 ms) away, so R = 2 merged two distinct events
+                        # into one. R = 1 cannot reach past the single gap frame that
+                        # separates two runs, which is why it resolves them.
+                        #
+                        # Still PROVISIONAL upward: nothing here shows R = 1 is optimal,
+                        # only that R = 2 costs confirmed clicks. Logged per candidate
+                        # in `stage1_params` so any later study can attribute results
+                        # to the value that produced them.
+
+LOCAL_CREST_C     = 10  # Local-background half-window for local_crest (±25.6 ms).
+                        # Long enough to sample background either side of a 1-2
+                        # frame event, short enough that the adaptive floor has not
+                        # meaningfully drifted.
+                        # ⚠️ PROVISIONAL, same status as PEAK_REFRACTORY_R.
+
 K_STAGE1_DEFAULT = 1.5  # Default Stage 1 threshold multiplier k.
                         # A frame is a candidate if E_i > k × Ê_floor.
                         # 1.5 casts a wide net for data collection.
@@ -122,6 +199,43 @@ TUKEY_TAPER_FRACTION = 0.10  # Fraction of analysis-band bins used for each
                               # spectrum. taper_len = max(5, round(K × fraction)).
                               # Smoothly ramps the spectral edges to zero to reduce
                               # Gibbs ringing in the reconstructed time-domain signal.
+
+# v6 STALE-FLOOR DETECTOR (observation only — changes no behaviour)
+STALE_FLOOR_FRAMES = SUBWINDOW_SIZE  # Consecutive burst-gated frames after which the
+                                     # noise floor is reported as possibly frozen.
+                                     # NOT a new tunable: it IS SUBWINDOW_SIZE (75
+                                     # frames = 192 ms), the estimator's own
+                                     # sub-window granularity. Chosen because it is
+                                     # 25x MAX_RUN — the longest run the v5 Stage 1
+                                     # was willing to call a click; v5.1 no longer
+                                     # caps run length, but the SIZING argument is
+                                     # unaffected — and ~12x the
+                                     # longest consecutive-burst run measured on real
+                                     # stationary recordings (6 frames), so it cannot
+                                     # fire on ordinary data.
+
+# v6 REGION SPECTRUM (SPECTRAL_FEATURES_v6_PROPOSAL.md §5)
+REGION_NFFT = 4096   # Transform length for the onset→decay_end region spectrum.
+                     # NOT a resolution: Δf is fixed by n_seg (REGION_FFT_FEATURE.md
+                     # §2). Zero-padding only interpolates the DTFT.
+                     #
+                     # FIXED rather than default_nfft(n_seg) on purpose. default_nfft
+                     # scales with the segment, which would make FPE_hz_region's
+                     # readout precision depend on the event's duration — and duration
+                     # coupling is already the open question for this feature family
+                     # (§4.3's mandatory corr(feature, n_seg) check). A fixed grid gives
+                     # every event the same FPE axis.
+                     #
+                     # The value is a DISPLAY GRID, not a tuned threshold: the
+                     # distributional features (entropy, novelty, tilt, quantiles) are
+                     # computed on the 12-band grid and are invariant to it — measured
+                     # spread < 1e-3 across n_fft 512→8192 (spectral_analysis
+                     # _self_test §15). It affects only how finely FPE's argmax is
+                     # interpolated. 4096 is the smallest power of two comfortably above
+                     # the longest possible region (a prev|curr|next stitch is 1536
+                     # samples, and compute_spectrum never truncates), giving 48.8 Hz
+                     # interpolation at fs = 200 kHz.
+                     # → not specified in v6; surfaced for confirmation.
 
 # GIBBS SUPPRESSION (§7, Step 3)
 GIBBS_CHECK_SAMPLES = 15   # Samples at each frame border examined for Gibbs energy.
@@ -219,6 +333,106 @@ STAGE2_TAU_MIN = 0.0    # τ must be strictly positive. _fit_decay_segment retur
                         # feature is meaningless. Rejected under the same verdict as the
                         # R² gate (STAGE_BLOCKED_R2) — both mean "invalid fit".
 
+# ── STAGE 2 v6 — gates on features that exist whether or not the fit converged ──
+#
+# WHY THE FIT GATE IS GONE (it used to be Stage 2's main effect):
+# Measured on 32 exhaustively-labelled recordings (189 clicks / 99 ambiguous /
+# 5786 noise), the old fit gate cost
+#
+#     12.2 % of confirmed clicks  (23 of 189)   and  32.3 % of ambiguous
+#
+# for 91.4 % of noise. It was rejecting real clicks whose exponential decay fit
+# failed to converge — 8-9 % of clicks have fit_valid == 0. A failed fit is
+# EVIDENCE, not disqualification, so fit_valid / R2 / tau_ms are now FEATURES and
+# Stage 3 decides what they are worth. The gates below reach 83.1 % of noise for
+# ZERO clicks and ZERO ambiguous, which is better on both axes.
+#
+# ⚠️ Every threshold here is set strictly OUTSIDE the labelled click
+# distribution, and each is justified by a measured cost, not by inspection.
+# Regenerate with scripts/v6/feature_distributions.py before changing any of them.
+# A Stage 2 reject is HARD — no probability, invisible to the SVM — so a gate
+# placed where the click distribution is merely thin costs recall irrecoverably.
+#
+# ⚠️ NaN ALWAYS PASSES every gate below. A row whose feature could not be
+# measured cannot be judged by it: harmonic_confinement is NaN on ~23 % of rows
+# BY DESIGN (second harmonic outside the transmitted band), and every v6 feature
+# is NaN when b3_frames == 0. This is the opposite of the Stage-2 fit gate's old
+# NaN handling, where NaN had to be failed explicitly — there, NaN meant "the
+# quantity being gated on is broken"; here it means "not applicable".
+
+STAGE2_PEAK_SNR_MIN = 4.5   # Lowest labelled click sits at peak_SNR 4.640.
+                            # Measured: 0.0 % clicks, 0.0 % ambiguous, 76.8 % noise.
+                            # 5.0 would reach 82.5 % but costs 2.1 % of clicks —
+                            # that is the aggressive tier, not this one.
+
+STAGE2_PEAK_SNR_MAX = 1e4   # ── SANITY BOUND, not a discriminator ──
+                            # peak_SNR reaches 1.14e40 on real exported rows.
+                            # peak_amp blows up in the iFFT when a frame's
+                            # transmitted spectrum is essentially a SINGLE non-zero
+                            # bin: its inverse transform is a pure tone that never
+                            # decays, the decay window runs to the end of the whole
+                            # stitched context (n_seg = 1536 = 3x512), and the
+                            # envelope peak is whatever garbage that bin held.
+                            # Fingerprint, measured on 37 such rows in 402,861:
+                            #     SPR == 154 EXACTLY on 28 of 37   (154 = _K_BINS,
+                            #        the ceiling of max/mean, reachable only when
+                            #        one bin holds all the power)
+                            #     n_seg == 1536 on 32 of 37
+                            #     fit_valid == 1 on all of them — they FIT fine
+                            #     spread over 26 recordings, so not one bad file
+                            #     0 are labelled clicks
+                            #
+                            # The SPR < 100 gate already rejects all 37 — but it is
+                            # the ONLY thing that does, and it catches them only
+                            # because this particular pathology happens to be
+                            # spectrally degenerate. A broadband blowup would pass
+                            # every other gate, since they are all LOWER bounds.
+                            # This is the independent net.
+                            #
+                            # 1e4 is 12.7x the highest labelled click (788.9) and
+                            # costs 0 labelled clicks. Deliberately NOT tightened to
+                            # ~1e3: that is only 1.3x the highest observed click,
+                            # and 208 positives is not enough to trust that ceiling.
+                            # ⚠️ A real click must never approach this. If one ever
+                            # does, the bound is wrong — do not raise it quietly.
+
+STAGE2_N_SEG_MIN = 10       # Region length in samples. Lowest labelled click is 10.
+                            # Measured: 0.0 % / 0.0 % / 45.2 %. 12 already costs
+                            # 0.5 % of clicks.
+
+STAGE2_LOCAL_CREST_MIN = 1.2  # E_i over its own ±C background median. Lowest
+                            # labelled click is 1.265.
+                            # Measured: 0.0 % / 0.0 % / 33.6 %.
+
+STAGE2_HC_MAX = 1.6         # harmonic_confinement = log2(min(r_A, r_B)) on the
+                            # frame excess spectrum. Highest labelled click is
+                            # 1.545, and the feature is bounded above by ~3.36 by
+                            # construction. Targets the 40.2 kHz interferer
+                            # measured across the indoor `teca` sessions.
+                            # Measured: 0.0 % / 0.0 % / 3.2 % indoor, 16.9 % corpus.
+
+#: Aggressive mode — opt-in per session, for recordings whose candidate rate makes
+#: review impossible (measured up to 344,773/hour outdoors). It buys 87.0 % of
+#: noise for 2.1 % of clicks and 2.0 % of ambiguous. That cost is REAL and stated
+#: here so it can never be enabled without seeing it.
+STAGE2_AGGRESSIVE_PEAK_SNR_MIN = 5.0
+
+# ── STAGE 2 MODE — three RULES, not three strictness levels ─────────────────
+# 'v5_fitgate' is not a looser or tighter version of the v6 rule; it is the
+# ORIGINAL rule, kept selectable so a v5 result can be reproduced exactly. That
+# matters for two things the project actually needs: re-deriving any figure from
+# a v5-era CSV, and answering "what would the old pipeline have said about this
+# recording" without checking out an old commit.
+#
+# The v5 rule is preserved BIT-IDENTICALLY, including its NaN handling, which is
+# the exact inverse of v6's. Do not "tidy" the two paths into one.
+STAGE2_MODE_V5           = 'v5_fitgate'      # the original: fit gate + SPR
+STAGE2_MODE_CONSERVATIVE = 'v6_conservative' # default: measured zero click loss
+STAGE2_MODE_AGGRESSIVE   = 'v6_aggressive'   # opt-in: 2.1 % click loss, stated
+STAGE2_MODE = STAGE2_MODE_CONSERVATIVE
+
+STAGE2_MODES = (STAGE2_MODE_V5, STAGE2_MODE_CONSERVATIVE, STAGE2_MODE_AGGRESSIVE)
+
 STAGE2_SPR_MAX = 100.0  # Maximum acceptable Spectral Peak Ratio.
                          # SPR = max(power) / mean(power) over the 20–80 kHz band.
                          # SPR ≥ 100 means the spectrum is dominated by a single
@@ -266,10 +480,49 @@ CLICK_PEAK_SEARCH_SAMPLES = FFT_SIZE  # After locating the click onset, the true
 # stay identical to the ones src/ml/evaluate_candidates.py writes, otherwise the
 # in-app export and the offline CLI would disagree on the same recording.
 STAGE_OK            = ''              # survived all four stages — a confirmed click
-STAGE_BLOCKED_R2    = 'Stage2_R2'     # R² < STAGE2_R2_MIN   — invalid decay fit
+STAGE_BLOCKED_R2    = 'Stage2_R2'     # RETIRED as a gate in v6 — kept because it
+                                      # appears in every CSV exported before this
+                                      # change and click_review_dialog filters on
+                                      # it. Nothing emits it any more.
 STAGE_BLOCKED_SPR   = 'Stage2_SPR'    # SPR ≥ STAGE2_SPR_MAX — out-of-distribution
+STAGE_BLOCKED_SNR   = 'Stage2_SNR'    # peak_SNR below the lowest labelled click
+STAGE_BLOCKED_NONPHYS = 'Stage2_nonphys'  # peak_SNR non-physically large — an iFFT
+                                      # reconstruction artefact, not a measurement
+STAGE_BLOCKED_NSEG  = 'Stage2_nseg'   # region too short to be an event
+STAGE_BLOCKED_CREST = 'Stage2_crest'  # no local prominence over its own background
+STAGE_BLOCKED_HARM  = 'Stage2_harm'   # energy confined to a 40/80 kHz harmonic pair
 STAGE_BLOCKED_SVM   = 'Stage3_SVM'    # SVM scored it below the decision threshold
 STAGE_BLOCKED_DEDUP = 'Stage4_dedup'  # duplicate of a higher-confidence detection
+
+#: Every verdict a candidate can carry other than STAGE_OK, in funnel order.
+#: stage_summary() builds its counters from this, so a gate added to Stage 2
+#: later is counted automatically instead of being silently dropped — which is
+#: exactly what happened to the five v6 verdicts when they were introduced and
+#: stage_summary still listed only the four v5 ones by hand.
+STAGE_BLOCKED_ALL = (
+    STAGE_BLOCKED_R2,
+    STAGE_BLOCKED_SPR,
+    STAGE_BLOCKED_SNR,
+    STAGE_BLOCKED_NONPHYS,
+    STAGE_BLOCKED_NSEG,
+    STAGE_BLOCKED_CREST,
+    STAGE_BLOCKED_HARM,
+    STAGE_BLOCKED_SVM,
+    STAGE_BLOCKED_DEDUP,
+)
+
+#: The Stage-2 subset of the above — what a UI means by "blocked at the gates".
+#: Callers that want a single gate count should sum these rather than adding up
+#: whichever two verdicts happened to exist when the call site was written.
+STAGE_BLOCKED_STAGE2 = (
+    STAGE_BLOCKED_R2,
+    STAGE_BLOCKED_SPR,
+    STAGE_BLOCKED_SNR,
+    STAGE_BLOCKED_NONPHYS,
+    STAGE_BLOCKED_NSEG,
+    STAGE_BLOCKED_CREST,
+    STAGE_BLOCKED_HARM,
+)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -602,7 +855,14 @@ class AdaptiveNoiseEstimatorV5:
       B2_std   – Hilbert-envelope std of the reconstructed iFFT [V]
                  → used to compute std_noise for Stage 3 features
 
-    All three buffers share the same burst-protection gate (§4.4): if a frame's
+    Plus, OPTIONALLY (v6, off unless update() is given `mags_norm`):
+
+      B3       – per-bin noise PSD [V²/Hz], 154 bins over 20-80 kHz
+                 → used to build the excess spectrum E[k] for the v6 spectral
+                   features. See _b3_update / p_noise_psd and
+                   docs/fft_and_ifft/SPECTRAL_FEATURES_v6_PROPOSAL.md §2.
+
+    All buffers share the same burst-protection gate (§4.4): if a frame's
     FFT energy exceeds ALPHA × current Ê_floor, the frame is considered energetic
     (a burst or click candidate) and is NOT written into any buffer. This prevents
     transient events from inflating — and thus corrupting — the noise estimate.
@@ -641,6 +901,49 @@ class AdaptiveNoiseEstimatorV5:
         self._E_hat_floor = 0.0
         self._noise_floor = 0.0
         self._std_noise   = 0.0
+
+        # ── Buffer 3 (v6) — per-bin noise PSD ────────────────────────────────
+        # Only allocated/updated when update() is given mags_norm. See _b3_update.
+        self._B3_running = np.full(_K_BINS, np.inf, dtype=np.float64)
+        self._B3_stored  = np.zeros((_K_BINS, M_SUBWINDOWS), dtype=np.float64)
+        self._B3_slot    = 0       # Next sub-window slot to overwrite (round-robin)
+        self._B3_filled  = 0       # Number of valid slots (0 → M_SUBWINDOWS)
+        self._B3_count   = 0       # Accepted frames in the current sub-window
+        # ── B3 'mean' mode (the DEFAULT — see p_noise_psd) ───────────────────
+        # A ROLLING mean over the last W_NOISE accepted frames, matching B1/B2's
+        # window exactly, kept as a ring plus a running sum so the update is O(K)
+        # per frame rather than O(K·W).
+        #
+        # The window is what makes the estimator adaptive: ambient noise is not
+        # stationary over a multi-hour recording, and a cumulative mean would keep
+        # dragging in conditions from an hour ago. It is also what bounds a single
+        # intermittent event's contribution to 1/W_NOISE.
+        #
+        # Cost: 154 × 750 × 8 B ≈ 924 kB, versus 6.8 kB for the min form. That is
+        # fine here and ONLY here — Buffer 3 is offline/Python by design (§8.3
+        # Phase 1 step 3, "no firmware"). A firmware port could not afford this
+        # ring and would need the recursive-average form instead.
+        self._B3_ring    = np.zeros((W_NOISE, _K_BINS), dtype=np.float64)
+        self._B3_sum     = np.zeros(_K_BINS, dtype=np.float64)
+        self._B3_ring_i  = 0
+        self._B3_n       = 0
+
+        # ── Stale-floor detector (v6) — OBSERVATION ONLY ─────────────────────
+        # A gated frame never enters the buffers, so if ambient noise steps up by
+        # more than ALPHA the gate rejects EVERY subsequent frame, nothing is
+        # admitted, and the floor stays pinned at the old low value indefinitely:
+        # the gate cannot tell "louder room" from "long burst". Demonstrated in
+        # test_scripts/verify_v6_buffer3.py — a 9x step leaves 750/750 frames
+        # gated with the estimate unchanged.
+        #
+        # This counter only OBSERVES that condition. It changes no behaviour and
+        # the candidate set is bit-identical, deliberately: Stage 1 is not touched
+        # without sign-off, and the point of the detector is to measure how often
+        # this really happens before deciding on a recovery.
+        self._consecutive_bursts = 0
+        self._max_consecutive_bursts = 0
+        self._stale_floor_events = 0
+        self._stale_floor_logged = False
 
     def _median_of_local_minima(self, buffer: np.ndarray) -> float:
         """
@@ -693,7 +996,145 @@ class AdaptiveNoiseEstimatorV5:
     # Public API
     # ------------------------------------------------------------------
 
-    def update(self, E_i: float, env_mean_i: float, env_std_i: float) -> dict:
+    def _b3_update(self, mags_norm: np.ndarray, fs: float, fft_size: int):
+        """
+        Buffer 3 (v6 §2) — per-bin noise PSD, the same minimum-statistics
+        machinery as B1/B2 applied per bin instead of to a scalar.
+
+        Structure, exactly as specified: 154 running sub-window minima + a
+        154 × 10 ring of stored minima = 154 × 11 floats.
+
+            P_noise[k] = β · median( m_1[k], …, m_10[k] )        β = BETA = 1.3
+
+        Stores PSD in V²/Hz, not raw magnitude (§2.3), so it can be subtracted
+        from a region spectrum of ANY length with no correction factor: under PSD
+        scaling stationary noise is invariant to segment length, whereas under
+        amplitude scaling it falls as N^(-1/2) and the correction would have to be
+        recomputed per event and be exactly right (§3.2).
+
+        ⚠️ THIS IS NOT THE SAME ALGORITHM AS B1, ALTHOUGH §2.1 SAYS "IDENTICAL TO
+        BUFFER 1". B1 stores the raw W_NOISE = 750 values and RECOMPUTES all ten
+        sub-window minima by slicing on every frame, with sub-windows pinned to
+        ARRAY POSITIONS — so once the circular buffer wraps, the chronological
+        seam falls inside one sub-window. B3 below is the textbook Martin (2001)
+        form: a running minimum over the current sub-window, rotated into a ring
+        of ten slots every SUBWINDOW_SIZE accepted frames, so its ten minima are
+        the ten most recent CHRONOLOGICAL sub-windows.
+
+        B3 uses the specified structure because that is what the 154 × 11 memory
+        budget describes and what a firmware port would have to do — storing
+        154 × 750 floats to mirror B1 would be 924 kB, not 6.8 kB. The divergence
+        is quantified in test_scripts/verify_v6_buffer3.py rather than assumed
+        away.
+        """
+        psd = np.asarray(mags_norm, dtype=np.float64)
+        psd = psd * psd * (float(fft_size) / (2.0 * float(fs)))
+
+        # ── 'mean' mode: rolling sum over the last W_NOISE accepted frames ───
+        idx = self._B3_ring_i % W_NOISE
+        self._B3_sum -= self._B3_ring[idx]      # evict the frame leaving the window
+        self._B3_ring[idx] = psd
+        self._B3_sum += psd
+        self._B3_ring_i += 1
+        if self._B3_n < W_NOISE:
+            self._B3_n += 1
+
+        # ── 'min' mode: running sub-window minimum, rotated into ten slots ───
+        np.minimum(self._B3_running, psd, out=self._B3_running)
+        self._B3_count += 1
+
+        if self._B3_count >= SUBWINDOW_SIZE:
+            self._B3_stored[:, self._B3_slot] = self._B3_running
+            self._B3_slot = (self._B3_slot + 1) % M_SUBWINDOWS
+            if self._B3_filled < M_SUBWINDOWS:
+                self._B3_filled += 1
+            self._B3_running[:] = np.inf
+            self._B3_count = 0
+
+    def p_noise_psd(self, mode: str = 'mean') -> Optional[np.ndarray]:
+        """
+        Buffer 3's per-bin noise PSD estimate [V²/Hz], 154 bins (20-80 kHz).
+
+        mode='mean' (DEFAULT)
+            P_noise[k] = mean over the last W_NOISE burst-gated frames
+        mode='min'  (v6 §2 as written — retained for comparison, NOT the default)
+            P_noise[k] = β · median( m_1[k], …, m_10[k] ),  m_j = sub-window min
+
+        Returns None until an estimate exists — one accepted frame for 'mean', one
+        closed sub-window for 'min'. None rather than zeros: a zero floor would
+        make every bin's excess equal the region itself, silently.
+
+        ⚠️ This is the UNTAPERED estimate, built from transmitted magnitudes. The
+        caller MUST apply the squared analysis-band taper before subtracting it
+        from a region spectrum — see analysis_band_taper() and trap (a) in §4.4.
+
+        ─────────────────────────────────────────────────────────────────────────
+        WHY THE DEFAULT IS 'mean' AND NOT §2's MINIMUM STATISTICS
+        ─────────────────────────────────────────────────────────────────────────
+
+        §2.1 specifies reusing B1's machinery per bin with the "same β = 1.3 bias
+        correction, same Martin (2001) justification". Measured on synthetic noise
+        with the correct statistics (a DFT bin of Gaussian noise is complex
+        Gaussian, so |X[k]| is Rayleigh and |X[k]|² is exponential, i.e. χ²₂):
+
+            B1, scalar E_i, β = 1.3   →  estimate / true mean =  1.067   ✅
+            B3, per bin,    β = 1.3   →  estimate / true mean =  0.0122  ❌  82× low
+            B3, per bin,    'mean'    →  estimate / true mean =  0.999   ✅
+
+        MARTIN'S β IS A FUNCTION OF THE EFFECTIVE DEGREES OF FREEDOM OF THE
+        ESTIMATOR'S INPUT, NOT A UNIVERSAL CONSTANT. B1's input E_i is already a
+        mean over 154 bins, so it is a high-DOF, low-variance quantity whose
+        sub-window minimum sits just below its mean — β ≈ 1.3 genuinely corrects
+        that. B3's input is a RAW PERIODOGRAM BIN: χ²₂, DOF = 2, where
+        E[min of W=75] = μ/75. That is not a bias to be corrected, it is a
+        different quantity. β would have to be ≈ 75, at which point it is the
+        estimator rather than a correction.
+
+        Consistently, §2 opens by correctly diagnosing that a single periodogram is
+        "useless bin-by-bin" and "needs averaging over many silent frames" — and
+        then adopts machinery that takes minima, not averages. 'mean' is what that
+        text actually asked for. It measures 0.999, and it REMOVES a tunable
+        constant instead of adding one, which is the direction this project
+        requires.
+
+        WHAT 'min' WOULD HAVE COST: with P_noise 82× low, E[k] = max(0, P_region −
+        P_noise) ≈ P_region, so the subtraction does nothing and every feature
+        silently degrades into "computed on the raw region spectrum" — the exact
+        failure §5.1 exists to prevent. Measured on a real hard negative, entropy
+        was unchanged (0.9329 either way, since P_region ≫ P_noise there) but
+        shape_novelty read 0.393 with 'min' versus 0.109 with 'mean'. Only the
+        latter matches §6's predicted 0.0-0.15 for an ambient amplitude excursion;
+        'min' makes a noise burst look like a click. The variance differs too:
+        CV across bins 0.369 ('min') vs 0.021 ('mean').
+
+        NARROWBAND INTERFERERS AND THE BURST GATE. The gate is BROADBAND — it
+        tests total band energy E_i against α·Ê_floor — so a persistent narrowband
+        tone (the 40/80 kHz parking sensors and pest repellers) passes it and
+        enters the mean. That is CORRECT, not a leak: a stationary tone IS part of
+        the noise this region should be judged against, and subtracting it is
+        exactly what shape_novelty needs to avoid flagging it as novel. Only
+        INTERMITTENT narrowband events are a concern, and over the W_NOISE = 750
+        frame window a single such event contributes at most 1/750 of the estimate.
+
+        (Faithful Martin (2001) is a third option: a first-order recursive smoother
+        on the periodogram BEFORE minimum statistics, with a bias correction that
+        is a function of the smoothed estimator's equivalent DOF. More machinery
+        and more parameters than 'mean', to reach an estimate the burst gate
+        already makes available directly.)
+        """
+        if mode == 'mean':
+            if self._B3_n == 0:
+                return None
+            return self._B3_sum / float(self._B3_n)
+        if mode != 'min':
+            raise ValueError(f"unknown mode {mode!r}; expected 'mean' or 'min'")
+        if self._B3_filled == 0:
+            return None
+        return BETA * np.median(self._B3_stored[:, :self._B3_filled], axis=1)
+
+    def update(self, E_i: float, env_mean_i: float, env_std_i: float,
+               mags_norm: Optional[np.ndarray] = None,
+               fs: float = FS, fft_size: int = FFT_SIZE) -> dict:
         """
         Process one frame and return the updated noise estimates.
 
@@ -709,6 +1150,23 @@ class AdaptiveNoiseEstimatorV5:
             Mean of the Hilbert envelope of the reconstructed iFFT [V].
         env_std_i : float
             Standard deviation of the Hilbert envelope [V].
+        mags_norm : np.ndarray or None, optional
+            The 154 MIC-NORMALISED analysis-band magnitudes of this frame
+            (i.e. reconstruct_frame_v5()['fft_norm'][_BIN_START:_BIN_END+1]),
+            used to update Buffer 3 (v6 §2).
+
+            OPTIONAL AND OFF BY DEFAULT. When None — which is every v5 call site —
+            Buffer 3 is not touched and this method behaves exactly as it did
+            before, bit for bit. Buffer 3 is a v6 addition and must not perturb
+            Stage 1 or Stage 2 while the v6 features are still being verified.
+
+            ⚠️ It must be the NORMALISED magnitudes (trap (b), §4.4): P_region and
+            P_noise have to be built from consistently mic-corrected data or the
+            whole feature family is corrupted silently. The correction is
+            frequency-dependent (0.55x-1.49x across the band), so it does not
+            cancel out of the subtraction.
+        fs, fft_size :
+            Only used to convert `mags_norm` to PSD. Ignored when it is None.
 
         Returns
         -------
@@ -736,6 +1194,29 @@ class AdaptiveNoiseEstimatorV5:
         else:
             is_burst = E_i > ALPHA * self._E_hat_floor
 
+        # ── Stale-floor detection (observation only, see __init__) ───────────
+        if is_burst:
+            self._consecutive_bursts += 1
+            if self._consecutive_bursts > self._max_consecutive_bursts:
+                self._max_consecutive_bursts = self._consecutive_bursts
+            # STALE_FLOOR_FRAMES is SUBWINDOW_SIZE: an existing constant, 25x
+            # MAX_RUN (the longest run the v5 Stage 1 called a click) and ~12x the
+            # longest consecutive-burst run measured on stationary recordings, so
+            # it does not chatter on ordinary data.
+            if (self._consecutive_bursts == STALE_FLOOR_FRAMES
+                    and not self._stale_floor_logged):
+                self._stale_floor_events += 1
+                self._stale_floor_logged = True
+                print(f"⚠️  noise floor may be STALE: {STALE_FLOOR_FRAMES} consecutive "
+                      f"frames rejected by the burst gate at frame "
+                      f"{self._frame_count} (Ê_floor = {self._E_hat_floor:.4e} V², "
+                      f"E_i = {E_i:.4e} V², ratio {E_i / max(self._E_hat_floor, 1e-30):.1f}x "
+                      f"> ALPHA = {ALPHA}). The floor cannot rise while every frame "
+                      f"is gated; if this persists the ambient level has stepped up.")
+        else:
+            self._consecutive_bursts = 0
+            self._stale_floor_logged = False
+
         # ── Buffer update ─────────────────────────────────────────────────────
         # Write this frame into the circular buffers only if it is not a burst.
         if not is_burst:
@@ -747,6 +1228,11 @@ class AdaptiveNoiseEstimatorV5:
             self._buf_idx += 1                     # Advance write pointer
             if self._fill < W_NOISE:               # Track how many entries are valid
                 self._fill += 1
+
+            # Buffer 3 shares this gate — no new parameters, and a click candidate
+            # cannot contaminate B3 any more than it can contaminate B1/B2 (§2.1).
+            if mags_norm is not None:
+                self._b3_update(mags_norm, fs, fft_size)
 
         # ── Estimate update ───────────────────────────────────────────────────
         # media of local minima instead of global minimum to reduce bias from outliers and non-stationary noise.
@@ -786,6 +1272,19 @@ class AdaptiveNoiseEstimatorV5:
         self._E_hat_floor = 0.0
         self._noise_floor = 0.0
         self._std_noise   = 0.0
+        self._B3_running[:]  = np.inf
+        self._B3_stored[:]   = 0.0
+        self._B3_slot     = 0
+        self._B3_filled   = 0
+        self._B3_count    = 0
+        self._B3_ring[:]  = 0.0
+        self._B3_sum[:]   = 0.0
+        self._B3_ring_i   = 0
+        self._B3_n        = 0
+        self._consecutive_bursts     = 0
+        self._max_consecutive_bursts = 0
+        self._stale_floor_events     = 0
+        self._stale_floor_logged     = False
 
     # ------------------------------------------------------------------
     # Read-only properties — convenient access without going through update()
@@ -815,6 +1314,140 @@ class AdaptiveNoiseEstimatorV5:
     def buffer_fill(self) -> int:
         """Number of valid (non-burst) frames currently stored in the buffers."""
         return self._fill
+
+    @property
+    def consecutive_bursts(self) -> int:
+        """Frames rejected by the burst gate since the last accepted one."""
+        return self._consecutive_bursts
+
+    @property
+    def max_consecutive_bursts(self) -> int:
+        """Longest run of consecutive gated frames seen so far.
+
+        On stationary recordings this stays in single digits (measured 1-6). A
+        large value means the floor was frozen for that long — see
+        stale_floor_events."""
+        return self._max_consecutive_bursts
+
+    @property
+    def stale_floor_events(self) -> int:
+        """Times the gate rejected STALE_FLOOR_FRAMES frames in a row.
+
+        Non-zero means the ambient level stepped up by more than ALPHA and the
+        estimator could not follow it. Observation only — nothing in the pipeline
+        acts on this yet."""
+        return self._stale_floor_events
+
+    @property
+    def b3_window_frames(self) -> int:
+        """Accepted frames currently inside the B3 rolling mean (0 → W_NOISE)."""
+        return self._B3_n
+
+    @property
+    def b3_filled(self) -> int:
+        """Number of closed Buffer-3 sub-windows (0 → M_SUBWINDOWS). 0 = no estimate."""
+        return self._B3_filled
+
+
+# =============================================================================
+# v6 — spectral_analysis bridge, and the analysis-band taper
+# =============================================================================
+
+_SPECTRAL = None
+
+
+def _spectral():
+    """
+    Lazily return the `spectral_analysis` module.
+
+    Deliberately lazy and deliberately dual-path. This module is imported two
+    different ways across the project:
+
+      * normally, as `core.click_pipeline_v5`, with `src/` on sys.path;
+      * by absolute path via importlib (test_scripts/*, scripts/*,
+        hybrid/pipeline_loader.py), where `core` is NOT an importable package.
+
+    A module-level `from core.spectral_analysis import ...` would break every
+    by-path caller; a bare `import spectral_analysis` would break the app. So try
+    the package import first and fall back to loading the sibling file directly,
+    which is the same idiom pipeline_loader.load_spectral() already uses.
+
+    The dependency direction matters and is safe: spectral_analysis imports
+    nothing from this project (only dataclasses/typing/numpy), so there is no
+    cycle, and the QThread-safety contract only forbids the REVERSE direction —
+    spectral_analysis must never import click_pipeline_v5.
+    """
+    global _SPECTRAL
+    if _SPECTRAL is None:
+        try:
+            from core import spectral_analysis as _sa      # normal app import
+        except ImportError:
+            import importlib.util
+            import os
+            _path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'spectral_analysis.py')
+            _spec = importlib.util.spec_from_file_location('spectral_analysis', _path)
+            _sa = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_sa)
+        _SPECTRAL = _sa
+    return _SPECTRAL
+
+
+# =============================================================================
+# The analysis-band taper, as a standalone array
+# =============================================================================
+
+def analysis_band_taper(n_bins: int = _K_BINS) -> np.ndarray:
+    """
+    The frequency-domain Tukey taper reconstruct_frame_v5 applies to the
+    analysis band, returned as a plain array.
+
+    TRAP (a) OF §4.4 — WHY THIS EXISTS.
+    P_region is computed from the RECONSTRUCTED time signal, which already carries
+    this taper (it is applied to the complex spectrum before the iFFT, Step 1d).
+    Buffer 3 is built from the TRANSMITTED magnitudes, which do not. Subtracting
+    one from the other without correction over-subtracts at the band edges, where
+    the region has been attenuated and the noise estimate has not.
+
+        Fix:  P_noise_corrected[k] = P_noise[k] · taper[k]²
+
+    squared because these are PSDs and the taper multiplies amplitude. That makes
+    the subtraction exact at every bin — measured ratio 1.000000, see
+    test_scripts/verify_psd_convention_v6.py. The alternative, restricting E[k] to
+    the 25.5-73.8 kHz plateau, throws away two of the twelve bands and blinds the
+    tilt feature to exactly the 20 kHz edge where PCB coupling lives.
+
+    NEVER invert this by dividing E[k] by taper², see below.
+
+    ⚠️ THE SPEC AND THE FFT SPEC BOTH UNDERSTATE THIS. §4.4(a) says the taper
+    "reaches −6 dB" at the band edges, and FFT_PHASE_TECHNICAL_SPECIFICATION.md
+    §7.2 states "Minimum Gain: 0.5 (−6 dB) at edges (bins 51, 204)". Both are
+    wrong, and that doc contradicts its own §7.1 pseudocode. The ramp is
+    0.5·(1 − cos(π·i/taper_len)) evaluated from i = 0, and at i = 0 that is
+    EXACTLY 0.0. Measured gains: bin 51 → 0.0000, 52 → 0.0109, 55 → 0.1654,
+    60 → 0.6545, plateau from bin 66.
+
+    Consequences, all benign but worth knowing:
+      - bin 51 (19.92 kHz) sits BELOW 20 kHz, so the 12-band grid excludes it;
+      - bin 204 (79.69 kHz) IS inside band 11 and is a dead bin — P_region and
+        taper²·P_noise are both 0 there, so the subtraction stays exact, but
+        band 11's average is diluted by one bin in thirteen;
+      - dividing E[k] by taper² to "restore" the edges would divide by zero at
+        bin 204 and amplify noise without bound next to it. Do not.
+
+    This deliberately DUPLICATES the loop at reconstruct_frame_v5 Step 1d rather
+    than refactoring it, so that Stage 1 is not touched. The duplication is held
+    consistent by an assertion in test_scripts/verify_psd_convention_v6.py that
+    compares this array against the shipped reconstruction element for element.
+    """
+    n = int(n_bins)
+    taper = np.ones(n, dtype=np.float64)
+    taper_len = max(5, round(n * TUKEY_TAPER_FRACTION))
+    for i in range(taper_len):
+        val = 0.5 * (1.0 - np.cos(np.pi * (i / taper_len)))
+        taper[i] = val
+        taper[n - 1 - i] = val
+    return taper
 
 
 # =============================================================================
@@ -859,6 +1492,134 @@ def compute_fft_energy(fft_magnitudes: np.ndarray) -> float:
 # STAGE 1 — Adaptive energy threshold + run-length filter
 # =============================================================================
 
+def _local_crest(E: np.ndarray, i: int, C: int = LOCAL_CREST_C) -> float:
+    """
+    local_crest(i) = E_i / median( E_j : j in [i-C, i+C] \ {i-1, i, i+1} )
+
+    How far this frame stands above its own local background — the physics the
+    run-length filter was reaching for, expressed without any of its pathologies.
+    A click is a spike against a comparatively flat background; sustained
+    mechanical noise is flat and gives ~1.
+
+    The three central frames are excluded from the background median so the event
+    itself — and any frame-boundary straddle of it — cannot inflate its own
+    reference level.
+
+    Deliberately INDEPENDENT of k and of Ê_floor. A run-based crest would inherit
+    both the threshold dependence (run length is a function of k) and the buffer
+    history dependence (the burst gate makes runs grow or self-terminate) that
+    make run length unusable as a feature — spec D5.
+
+    Returns NaN when the background median is 0 or non-finite. The spec asked for
+    a -1 sentinel; NaN is used instead to match the rest of the v6 quality-flag
+    policy (§7.5.3) — a magic in-band number silently becomes data, and the
+    imputer cannot tell it from a measurement. The spec's intent, "do not silently
+    substitute a value", is preserved.
+    """
+    lo = max(0, i - C)
+    hi = min(len(E), i + C + 1)
+    if hi - lo < 4:
+        return float('nan')
+    idx = [j for j in range(lo, hi) if j < i - 1 or j > i + 1]
+    if not idx:
+        return float('nan')
+    bg = float(np.median(E[idx]))
+    if not np.isfinite(bg) or bg <= 0.0:
+        return float('nan')
+    return float(E[i] / bg)
+
+
+def _stage1_select(E, flagged_idx, k, mode=None, R=None, C=None):
+    """
+    Turn above-threshold frames into Stage 1 candidates. THE ONLY implementation.
+
+    Both entry points (run_stage1_v5 and run_stage1_v5_precomputed) call this, and
+    so does scripts/v6/v6_diag_deadzone.py. That is not tidiness: the run-length
+    filter used to be written out three times, and this project has already been
+    bitten by two Stage-1 paths disagreeing (the raw-vs-mic-corrected E_i fix,
+    which produced 2762 vs 3879 candidates on one recording depending on which
+    path ran). One rule, one place.
+
+    Parameters
+    ----------
+    E : np.ndarray
+        Per-frame in-band FFT energy for the WHOLE recording [V²].
+    flagged_idx : sequence[int]
+        Frames satisfying E_i > k · Ê_floor(i), ascending.
+    mode : 'v51_peakpick' | 'v5_runlength'
+
+    Returns
+    -------
+    list of dict, one per candidate, carrying the §4.4 diagnostics:
+        frame_idx, run_id, run_length, run_crest, pos_in_run, local_crest,
+        would_pass_v5, group_size (legacy alias of run_length)
+
+    v5.1 rule (§4.2) — a candidate is a strict-left / non-strict-right local
+    maximum over ±R:
+
+        E_i >  E_j   for j in [i-R, i-1]
+        E_i >= E_j   for j in [i+1, i+R]
+
+    evaluated against the full energy series, not only the flagged frames: a
+    sub-threshold neighbour is by definition below a flagged frame, so including
+    it costs nothing and keeps the peak test independent of k. The asymmetry
+    resolves plateaus deterministically to the FIRST frame, guaranteeing exactly
+    one candidate per plateau.
+
+    NOTHING IS REJECTED for being in a long run. A 141 ms sustained noise burst
+    yields peaks rather than 55 candidates or zero.
+    """
+    mode = STAGE1_MODE if mode is None else mode
+    R = PEAK_REFRACTORY_R if R is None else R
+    C = LOCAL_CREST_C if C is None else C
+    E = np.asarray(E, dtype=np.float64)
+    flagged = list(flagged_idx)
+    if not flagged:
+        return []
+
+    # ── Group flagged frames into runs of consecutive indices ────────────────
+    runs, cur = [], [flagged[0]]
+    for j in range(1, len(flagged)):
+        if flagged[j] == flagged[j - 1] + 1:
+            cur.append(flagged[j])
+        else:
+            runs.append(cur)
+            cur = [flagged[j]]
+    runs.append(cur)
+
+    out = []
+    for run_id, run in enumerate(runs):
+        L = len(run)
+        med = float(np.median(E[run])) if L else 0.0
+        # would_pass_v5: exactly the v5 rule, evaluated inline so the v5 → v5.1
+        # delta is readable from ONE export rather than by diffing two runs (D6).
+        passes_v5 = (L <= MAX_RUN)
+
+        if mode == STAGE1_MODE_V5:
+            keep = list(run) if passes_v5 else []
+        else:
+            keep = []
+            for i in run:
+                if all(E[i] > E[j] for j in range(max(0, i - R), i)) and \
+                   all(E[i] >= E[j] for j in range(i + 1, min(len(E), i + R + 1))):
+                    keep.append(i)
+
+        for i in keep:
+            out.append({
+                'frame_idx'    : int(i),
+                'run_id'       : int(run_id),
+                'run_length'   : int(L),
+                'run_crest'    : float(E[i] / med) if med > 0 else float('nan'),
+                'pos_in_run'   : int(i - run[0]),
+                'local_crest'  : _local_crest(E, i, C),
+                'would_pass_v5': int(passes_v5),
+                # Legacy alias — run_length under its old name. No consumer outside
+                # this module, kept so nothing silently breaks.
+                'group_size'   : int(L),
+            })
+    return out
+
+
 def run_stage1_v5(dm, k: float = K_STAGE1_DEFAULT) -> list:
     """
     Stage 1 of the v5 click detection pipeline (§5).
@@ -872,8 +1633,11 @@ def run_stage1_v5(dm, k: float = K_STAGE1_DEFAULT) -> list:
       3. Update the noise estimator (burst protection applied internally).
       4. Check Stage 1 criterion: E_i  >  k × Ê_floor(i).
 
-    Then apply the run-length filter: discard any run of consecutive
-    above-threshold frames longer than MAX_RUN (sustained noise, not a click).
+    Then select candidates via _stage1_select. Under the shipped
+    STAGE1_MODE_V51 that is local peak picking, which discards NOTHING for run
+    length: a long run yields its peaks rather than being deleted whole. The
+    v5 run-length filter (discard any run longer than MAX_RUN) survives only
+    under STAGE1_MODE_V5, for the frozen-reference comparison.
 
     Parameters
     ----------
@@ -895,13 +1659,21 @@ def run_stage1_v5(dm, k: float = K_STAGE1_DEFAULT) -> list:
         'E_hat_floor' : float – Ê_floor at detection time [V²]
         'noise_floor' : float – noise_floor at detection time [V]  (for Stage 3)
         'std_noise'   : float – std_noise at detection time [V]    (for Stage 3)
-        'group_size'  : int   – run length this candidate belongs to (1 ≤ n ≤ MAX_RUN)
+        'group_size'  : int   – run length this candidate belongs to. NO LONGER
+                                bounded by MAX_RUN: under v5.1 a candidate may sit
+                                in a run of any length. Legacy alias of
+                                'run_length'; _stage1_select also returns run_id,
+                                run_crest, pos_in_run, local_crest and
+                                would_pass_v5 (§4.4).
     """
     fs       = dm.header_info.get('fs',       FS)
     fft_size = dm.header_info.get('fft_size', FFT_SIZE)
 
     estimator      = AdaptiveNoiseEstimatorV5()
-    above_threshold = []   # accumulates ALL above-threshold frames before run filter
+    above_threshold = []   # accumulates ALL above-threshold frames before selection
+    # Full per-frame energy series: the v5.1 local-maximum test compares against
+    # neighbours regardless of whether they cleared the threshold (§4.2).
+    E_series = np.zeros(dm.total_frames, dtype=np.float64)
 
     for frame_idx in range(dm.total_frames):
         fft_mags = dm.fft_data[frame_idx]
@@ -955,6 +1727,8 @@ def run_stage1_v5(dm, k: float = K_STAGE1_DEFAULT) -> list:
 
         # GUARD: skip check if we have no floor estimate yet (very first frame
         # before any warm-up data, E_hat_floor == 0).
+        E_series[frame_idx] = E_i
+
         if E_hat_floor > 0 and E_i > k * E_hat_floor:
             above_threshold.append({
                 'frame_idx'   : frame_idx,
@@ -967,29 +1741,11 @@ def run_stage1_v5(dm, k: float = K_STAGE1_DEFAULT) -> list:
     if not above_threshold:
         return []
 
-    # ── 4. Run-length filter ──────────────────────────────────────────────────
-    # Group consecutive above-threshold frames into runs.
-    # Two frames are consecutive if their frame indices differ by exactly 1.
-    runs    = []
-    current = [above_threshold[0]]
-
-    for i in range(1, len(above_threshold)):
-        if above_threshold[i]['frame_idx'] == above_threshold[i - 1]['frame_idx'] + 1:
-            current.append(above_threshold[i])   # extend current run
-        else:
-            runs.append(current)                  # close run, start new one
-            current = [above_threshold[i]]
-    runs.append(current)                          # close last run
-
-    # Keep only runs that are short enough to be click candidates.
-    # Tag each surviving frame with its run length for downstream use.
-    survivors = []
-    for run in runs:
-        if len(run) <= MAX_RUN:
-            for candidate in run:
-                survivors.append({**candidate, 'group_size': len(run)})
-
-    return survivors
+    # ── 4. Candidate selection (Stage 1 v5.1) ────────────────────────────────
+    # Delegated to _stage1_select — the ONLY implementation of this rule.
+    by_frame = {c['frame_idx']: c for c in above_threshold}
+    picks = _stage1_select(E_series, sorted(by_frame), k=k)
+    return [{**by_frame[p['frame_idx']], **p} for p in picks]
 
 
 # =============================================================================
@@ -1108,7 +1864,7 @@ def _fit_decay_segment(
     decay_len = decay_end - decay_start
 
     if decay_len < 1:
-        return {'tau_ms': -1.0, 'R2': 0.0, 'fit_coverage': 0.0,
+        return {'tau_ms': -1.0, 'R2': 0.0, 'fit_coverage': 0.0, 'fit_valid': 0,
                 'decay_start': decay_start, 'decay_end': decay_end}
 
     decay_segment = extended[decay_start : decay_end]
@@ -1145,7 +1901,7 @@ def _fit_decay_segment(
 
     if n_fit < MIN_FIT_SAMPLES:
         return {'tau_ms': -1.0, 'R2': 0.0,
-                'fit_coverage': n_fit / max(1, decay_len),
+                'fit_coverage': n_fit / max(1, decay_len), 'fit_valid': 0,
                 'decay_start': decay_start, 'decay_end': decay_end}
 
     # ── Step D: OLS log-linear fit ────────────────────────────────────────────
@@ -1161,7 +1917,7 @@ def _fit_decay_segment(
 
     if abs(denom) < 1e-30:
         return {'tau_ms': -1.0, 'R2': 0.0,
-                'fit_coverage': n_fit / max(1, decay_len),
+                'fit_coverage': n_fit / max(1, decay_len), 'fit_valid': 0,
                 'decay_start': decay_start, 'decay_end': decay_end}
 
     slope_m     = (n_pts * sum_xy - sum_x * sum_y) / denom
@@ -1170,8 +1926,10 @@ def _fit_decay_segment(
     # Negative slope + above numerical zero-guard → genuine exponential decay
     if slope_m < -_SLOPE_ZERO_GUARD:
         tau_ms = -1000.0 / (slope_m * fs)
+        fit_valid = 1
     else:
         tau_ms = -1.0
+        fit_valid = 0
 
     y_pred = slope_m * n_array + intercept_b
     ss_res = float(np.sum((log_env - y_pred)        ** 2))
@@ -1182,9 +1940,80 @@ def _fit_decay_segment(
         'tau_ms'      : tau_ms,
         'R2'          : R2,
         'fit_coverage': n_fit / max(1, decay_len),
+        'fit_valid'   : fit_valid,
         'decay_start' : decay_start,
         'decay_end'   : decay_end,
     }
+
+
+#: The columns fit_result_to_nan blanks by default -- the two that really are
+#: sentinel-coded. fit_coverage is deliberately NOT here; see the docstring.
+FIT_SENTINEL_COLS = ('tau_ms', 'R2')
+
+
+def fit_result_to_nan(fit: dict, include_coverage: bool = True) -> dict:
+    """
+    Rewrite a fit result into the PHASE-2 EXPORT FORM: NaN, never a sentinel
+    (v6 §7.5.3, decision D20).
+
+        fit_valid == 0  ⇒  tau_ms, R2, fit_coverage  →  NaN
+
+    ⚠️ NOT WIRED TO ANYTHING. Nothing in the pipeline calls this yet, and that is
+    deliberate. Stage 2 still reads the sentinels, in three places:
+
+        click_pipeline_v5._stage2_reason      R2 < STAGE2_R2_MIN, tau_ms <= STAGE2_TAU_MIN
+        ml/evaluate_candidates.apply_stage2   df['R2'].lt(...) | df['tau_ms'].le(...)
+        components/data_collection_dialog_v5  R2 == 0.0 or tau_ms <= STAGE2_TAU_MIN
+
+    All three are `<` / `<=` / `== 0.0` comparisons, and EVERY comparison against
+    NaN is False. Emitting NaN from _fit_decay_segment today would therefore not
+    make those gates stricter — it would silently DISABLE them, letting every
+    unfittable candidate through to Stage 3, where the sklearn Pipeline's
+    SimpleImputer would fill the gap and return a confident-looking probability
+    computed from imputed data. That is the Phase-3 candidate-pool expansion
+    arriving by accident, in the wrong phase, unlabelled.
+
+    Switching the gates over is Phase 2 work. When it happens, each site becomes
+    a test on `fit_valid` — which is exactly equivalent to today's behaviour,
+    since tau_ms <= 0 ⟺ tau_ms == -1 ⟺ fit_valid == 0 (a converged fit has
+    slope < 0, hence tau_ms = -1000/(slope·fs) > 0 always).
+
+    WHY fit_valid EXISTS AT ALL, beyond protecting the scaler. Two sentinels are
+    in play and they fail differently:
+
+      tau_ms = -1  is LOUD. Real values are ~0.1-0.6 ms, so -1 sits far outside
+                   the range: StandardScaler inflates the std and compresses all
+                   genuine variation toward zero.
+      R2 = 0.0     is SILENT, and worse. Zero is INSIDE the valid range [0, 1],
+                   so "the fit failed" and "the fit succeeded and was terrible"
+                   are currently indistinguishable in the data. fit_valid does not
+                   merely protect the scaler; it disambiguates two physically
+                   different states that have been collapsed into one value.
+
+    One nuance for whoever does Phase 2: R2 = 0.0 is emitted from TWO different
+    situations — a degenerate window (the three early returns) and ss_tot <= 1e-30,
+    i.e. a perfectly flat log-envelope, on the normal path. Only the first is a
+    failure. fit_valid separates them correctly; a blanket "R2 == 0 → NaN" rewrite
+    would not.
+
+    ⚠️ fit_coverage IS NOT A SENTINEL, and include_coverage=False says so.
+    Measured over the v6 corpus: of 363 552 rows with fit_valid == 0, only
+    3 802 have fit_coverage == 0.0. The other 359 750 carry a real
+    measurement — n_fit / decay_len, computed and returned on the failure
+    paths above — saying how much of the decay window the fitter got through
+    before giving up. Blanking it destroys that.
+
+    include_coverage defaults to True so the Phase-2 export form (D20) and the
+    tests covering it are unchanged. Stage 3 and train_svm pass False: a model
+    is better off with a measured coverage than with an imputed median.
+    """
+    out = dict(fit)
+    if not int(out.get('fit_valid', 0)):
+        for _col in FIT_SENTINEL_COLS:
+            out[_col] = float('nan')
+        if include_coverage:
+            out['fit_coverage'] = float('nan')
+    return out
 
 
 def find_decay_window_v5(
@@ -1990,6 +2819,154 @@ def click_event_key(ctx: dict, resolved: dict, frame_idx: int) -> tuple:
     return int(peak_abs), int(canonical_frame_idx)
 
 
+def _feat_harmonic_confinement(
+    fft_norm:    np.ndarray,
+    p_noise_psd: Optional[np.ndarray],
+    fs:          int = FS,
+    fft_size:    int = FFT_SIZE,
+) -> dict:
+    """
+    harmonic_confinement and its parts (HARMONIC_CONFINEMENT_FEATURE_SPEC.md).
+
+    FRAME domain, deliberately, and the reasons are structural rather than a
+    fallback (spec §1):
+
+      * The region window is defined by rise/fall logic that assumes the event
+        returns to the noise floor. A sustained oscillation satisfies neither
+        condition as intended — on the motivating frame `fall_time_ms` is
+        0.0150 ms because the envelope dipped below LEVEL for four samples
+        mid-cycle, not because anything ended. The region is then a few samples
+        wide and effectively arbitrary for exactly the noise class this feature
+        is aimed at.
+      * Region resolution (~3.8 kHz) is coarser than the 1-2 kHz transducer
+        linewidth the signature lives in; it would be smeared away before it
+        could be tested.
+      * Buffer 3 is itself estimated at frame resolution over these 154 bins, so
+        staying here makes P_frame - P_noise a same-grid, same-units subtraction
+        with NO rebinning and NO taper term — avoiding the class of conversion
+        factor that produced the (N/2)^2 = 65536 PSD bug and the 256x iFFT bug.
+
+    ⚠️ NO TAPER CORRECTION HERE, and that is the opposite of _feat_v6_spectral.
+    `fft_norm` is the TRANSMITTED, mic-normalised magnitude spectrum, which is
+    exactly what Buffer 3 is fed (see AdaptiveNoiseEstimatorV5.update). Both
+    sides are untapered, so applying analysis_band_taper() — correct for the
+    region, which comes from the reconstructed signal — would be wrong here.
+
+    Returns all-NaN when Buffer 3 has no estimate yet, rather than substituting a
+    zero floor, which would make the excess equal the frame and report a
+    confident number measuring nothing.
+    """
+    sa = _spectral()
+    out = {'harmonic_confinement': float('nan'), 'hc_f1_hz': float('nan'),
+           'hc_r_A': float('nan'), 'hc_r_B': float('nan')}
+    if p_noise_psd is None:
+        return out
+    band = np.asarray(fft_norm, dtype=np.float64)[_BIN_START:_BIN_END + 1]
+    noise = np.asarray(p_noise_psd, dtype=np.float64)
+    if band.size != noise.size:
+        return out
+    p_frame = sa.psd_from_amplitude(band, fs, fft_size)
+    r = sa.harmonic_confinement(p_frame, noise, fs=fs, n_frame=fft_size,
+                                k0=_BIN_START)
+    return {'harmonic_confinement': r['harmonic_confinement'],
+            'hc_f1_hz': r['f1_hz'], 'hc_r_A': r['r_A'], 'hc_r_B': r['r_B']}
+
+
+def _feat_v6_spectral(
+    ctx:         dict,
+    resolved:    dict,
+    p_noise_psd: Optional[np.ndarray],
+    freq_axis:   np.ndarray,
+    fs:          int = FS,
+) -> dict:
+    """
+    The v6 excess-spectrum feature family (SPECTRAL_FEATURES_v6_PROPOSAL.md §5).
+
+    Builds E[m] = max(0, P_region[m] - P_noise[m]) on the 12-band grid and the
+    statistics defined on it, plus the region-spectrum versions of FPE and SPR.
+
+    Returns every key as NaN when there is no usable noise estimate or the region
+    is too short to transform. NaN, never a sentinel: a zero noise floor would
+    make E[k] equal P_region and every feature would look plausible while
+    measuring nothing (§7.5.3 is about exactly this class of silent collapse).
+
+    ⚠️ TRAP (a), §4.4 — THE TAPER IS APPLIED HERE.
+    P_region comes from the RECONSTRUCTED signal, which already carries the
+    analysis-band Tukey taper (reconstruct_frame_v5 Step 1d). Buffer 3 is built
+    from TRANSMITTED magnitudes, which do not. So P_noise is multiplied by the
+    taper SQUARED (squared because these are PSDs and the taper acts on
+    amplitude) before subtraction. Without it the subtraction over-subtracts at
+    the band edges, where the region is attenuated and the noise estimate is not.
+    The taper reaches exactly 0 at bins 51/204 — NOT −6 dB as §4.4(a) and
+    FFT_PHASE_TECHNICAL_SPECIFICATION.md §7.2 both claim — so this must never be
+    inverted by dividing E[k] by taper²: that divides by zero at the edges.
+
+    ⚠️ TRAP (b), §4.4 — 50 % MIC NORMALISATION ON BOTH SIDES.
+    p_noise_psd must have been built from fft_norm (mic-corrected), and the region
+    comes from ctx['signal'], reconstructed from the same normalised spectrum, so
+    the frequency-dependent 0.55x-1.49x gain divides out of the subtraction.
+    Feeding Buffer 3 raw magnitudes instead corrupts the whole family silently —
+    measured at −5.2 … +3.5 dB. This is "do not accidentally break it" rather
+    than new work, but it is the easiest thing here to get wrong.
+    """
+    sa = _spectral()
+    keys = ('spectral_entropy', 'shape_novelty', 'spectral_tilt',
+            'temporal_concentration', 'FPE_hz_region', 'SPR_region',
+            'f_50_hz', 'IQR_f')
+    out = {k: float('nan') for k in keys}
+    out['n_seg'] = 0
+    out['n_seg_valid'] = 0
+
+    onset     = int(resolved['onset'])
+    decay_end = int(resolved['decay_end'])
+    signal    = ctx['signal']
+    envelope  = ctx['envelope']
+
+    i0 = max(0, min(onset, len(signal)))
+    i1 = max(i0, min(decay_end + 1, len(signal)))
+    n_seg = i1 - i0
+    out['n_seg'] = int(n_seg)
+    # §4.3: below V6_MIN_NSEG the bands are correlated and entropy is biased
+    # optimistically toward 1. Recorded and flagged, never special-cased away.
+    out['n_seg_valid'] = int(n_seg >= sa.V6_MIN_NSEG)
+
+    # temporal_concentration needs only the envelope — available even with no B3.
+    if n_seg >= 2:
+        out['temporal_concentration'] = sa.temporal_concentration(envelope, (i0, i1))
+
+    if p_noise_psd is None or n_seg < sa.MIN_SEGMENT_SAMPLES:
+        return out
+
+    p_noise = np.asarray(p_noise_psd, dtype=np.float64)
+    if p_noise.shape != (_K_BINS,) or not np.all(np.isfinite(p_noise)):
+        return out
+
+    # Trap (a): taper the noise estimate onto the region's footing.
+    p_noise = p_noise * analysis_band_taper(_K_BINS) ** 2
+    noise_freqs = np.asarray(freq_axis, dtype=np.float64)[_BIN_START:_BIN_END + 1]
+
+    region_spec = sa.compute_spectrum(
+        signal[i0:i1], fs,
+        window=sa.DEFAULT_WINDOW, alpha=sa.DEFAULT_ALPHA,
+        n_fft=REGION_NFFT, scaling='psd')
+
+    f6 = sa.v6_spectral_features(region_spec, p_noise, noise_freqs,
+                                 env=envelope, region=(i0, i1))
+    for k in ('spectral_entropy', 'shape_novelty', 'spectral_tilt',
+              'temporal_concentration', 'f_50_hz', 'IQR_f'):
+        out[k] = f6[k]
+    out['FPE_hz_region'] = f6['FPE_hz']
+
+    # SPR on the region spectrum — the D16 counterpart of the frame SPR, emitted
+    # so that "SPR is subsumed by entropy" can be tested rather than assumed.
+    band = (region_spec.freqs >= sa.V6_BAND_LO_HZ) & (region_spec.freqs <= sa.V6_BAND_HI_HZ)
+    if np.any(band):
+        power = region_spec.mags[band]
+        mean_p = float(np.mean(power))
+        out['SPR_region'] = float(np.max(power) / mean_p) if mean_p > 1e-30 else float('nan')
+    return out
+
+
 def compute_features_v5(
     ctx:         dict,
     resolved:    dict,
@@ -1998,6 +2975,7 @@ def compute_features_v5(
     noise_floor: float,
     std_noise:   float,
     fs:          int = FS,
+    p_noise_psd: Optional[np.ndarray] = None,
 ) -> dict:
     """
     Compute all 17 v5 features for a single resolved click candidate.
@@ -2010,9 +2988,12 @@ def compute_features_v5(
     ZCR_post / kurtosis / centroid_shift_hz / asymmetry_integral wrong for
     borderline clicks is structurally impossible here.
 
-    The spectral features (SPR, R_spectral, FPE_hz via _feat_fft_features) still
-    use the frame's transmitted FFT — migrating them to a Region-FFT window over
-    [onset, decay_end] is a separate, deferred change.
+    The v5 spectral features (SPR, R_spectral, FPE_hz via _feat_fft_features)
+    still use the frame's transmitted FFT. The v6 family (spectral_entropy,
+    shape_novelty, ...) is computed on the REGION spectrum instead, and is emitted
+    ALONGSIDE them rather than replacing them — deciding which survives is Phase 4
+    (v6 §7.4 runs A/B/C), and keeping both makes those runs column subsets of one
+    export instead of three separate exports.
 
     Parameters
     ----------
@@ -2023,6 +3004,15 @@ def compute_features_v5(
         the ctx arrays) + peak_amp.
     fft_norm, freq_axis : np.ndarray
         Mic-normalized frame FFT magnitudes and their frequency axis [Hz].
+    p_noise_psd : np.ndarray or None, optional
+        Buffer 3's per-bin noise PSD [V²/Hz], 154 bins, UNTAPERED — i.e. exactly
+        what AdaptiveNoiseEstimatorV5.p_noise_psd() returns. The squared
+        analysis-band taper is applied HERE, not by the caller (trap (a), §4.4).
+
+        When None — every v5 call site — the eight v6 features are emitted as NaN
+        and nothing else changes. That is what keeps this signature backward
+        compatible: v6 is additive, and a caller that has no Buffer 3 yet still
+        gets a complete, correct v5 feature vector.
     noise_floor, std_noise : float
         Adaptive noise estimates [V] for the candidate frame.
     fs : int
@@ -2096,6 +3086,21 @@ def compute_features_v5(
     features['tau_ms']       = fit['tau_ms']
     features['R2']           = fit['R2']
     features['fit_coverage'] = fit['fit_coverage']
+    # v6 (§7.5.3): binary, disambiguates "the fit failed" from "the fit succeeded
+    # and was terrible" — R2 = 0 cannot, because 0 is inside R2's valid range.
+    # Carried alongside the sentinels, NOT instead of them: Stage 2 still gates on
+    # tau_ms <= 0 / R2 == 0 and must keep doing so until Phase 2. Emitted as an
+    # EXTRA dict key, so it does not disturb FEATURE_NAMES or the CSV schema —
+    # every consumer selects the 17 v5 names explicitly. See fit_result_to_nan.
+    features['fit_valid']    = fit.get('fit_valid', 0)
+
+    # ── v6 spectral family (§5) ───────────────────────────────────────────────
+    features.update(_feat_v6_spectral(ctx, resolved, p_noise_psd, freq_axis, fs))
+
+    # ── harmonic_confinement — FRAME domain, not region (its spec §1) ─────────
+    # Independent of decay_start/decay_end, the fit and Gibbs suppression, so it
+    # is computable on every candidate including fit_valid == 0 rows.
+    features.update(_feat_harmonic_confinement(fft_norm, p_noise_psd, fs, FFT_SIZE))
 
     # FFT-domain features (§8.9) — still the frame FFT (Region-FFT migration TODO)
     features.update(_feat_fft_features(fft_norm, freq_axis))
@@ -2109,18 +3114,42 @@ def compute_features_v5(
 
 def load_svm_model(model_path: Path) -> dict:
     """
-    Load a PlantLeaf v5 SVM model from a .pkl file produced by train_svm.py.
+    Load a PlantLeaf SVM model from a .pkl file produced by train_svm.py.
+
+    VERSION-AGNOSTIC: this loads a v5 or a v6 model equally, and the caller does
+    not need to know which. The model dict is the single source of truth for
+    everything Stage 3 does — feature set, feature ORDER, decision threshold and
+    sentinel encoding all travel inside it.
 
     Called ONCE at application startup (or when the user loads a new model file)
     and the returned dict is kept in memory and passed to run_stage3_v5 for every
     recording. Do NOT call this per-frame.
 
+    Despite the .pkl extension these are joblib archives, not plain pickles:
+    joblib stores the numpy arrays as raw buffers appended after the pickle
+    stream, so pickle.load() fails partway through with an UnpicklingError. Load
+    them with joblib, as below.
+
     Expected dict keys in the .pkl (all written by train_svm.py):
-        'pipeline'    : fitted sklearn Pipeline (SimpleImputer → StandardScaler → SVC)
+        'pipeline'    : fitted sklearn Pipeline. v5 is
+                        SimpleImputer(mean) → StandardScaler → SVC;
+                        the deployed v6 is
+                        SimpleImputer(median) → PowerTransformer(yeo-johnson) → SVC.
         'threshold'   : float — optimal decision threshold from ROC optimisation
         'features'    : list[str] — ordered feature names the model was trained on
         'kernel'      : str  — 'linear' or 'rbf' (informational)
         'all_results' : dict — per-kernel AUC and threshold (informational)
+
+    v6 models additionally carry (absent on v5-era files):
+        'nan_policy'  : 'nan' | 'sentinel' — how the decay-fit failures were
+                        encoded during TRAINING. _stage3_scores branches on this
+                        to reproduce the same encoding at inference; a model
+                        saved before the key existed is v5-era by definition, so
+                        the read there defaults to 'sentinel'. Getting this wrong
+                        is a train/serve skew on ~90 % of candidates, in whichever
+                        direction the mismatch runs.
+        'mode'        : 'v5' | 'v6' — which trainer preset produced it
+                        (informational; nothing branches on it).
 
     Parameters
     ----------
@@ -2167,6 +3196,52 @@ def has_precomputed_stage1_arrays(dm) -> bool:
         getattr(dm, name, None) is not None
         for name in ('fft_means', 'E_hat_floor_arr', 'noise_floor_arr', 'std_noise_arr')
     ) and len(dm.fft_means) == dm.total_frames
+
+
+def p_noise_at(dm, frame_idx: int) -> Optional[np.ndarray]:
+    """
+    Buffer 3's per-bin noise PSD [V²/Hz] in effect at `frame_idx`, or None.
+
+    AudioLoadWorker samples B3 on a fixed stride (SUBWINDOW_SIZE) rather than
+    storing it per frame — the full history would be n × 154 × 8 B, ~3 GB on a
+    2.5 M-frame recording. This returns the snapshot at or before `frame_idx`.
+
+    The staleness that introduces is bounded and small: B3 is a rolling mean over
+    W_NOISE = 750 accepted frames, so between two snapshots at most SUBWINDOW_SIZE
+    of those 750 entries have rotated — under 10 % of the window.
+
+    Returns None when the file was loaded without the v6 arrays (any recording
+    loaded before this change, or the no-phase fallback path), when the frame
+    precedes the first closed estimate, or when the snapshot is not finite.
+    Callers must treat None as "no noise estimate" and emit NaN features — NOT as
+    a zero floor, which would make E[k] equal P_region and look like a clean
+    detection (§7.5.3's silent-collapse failure).
+    """
+    snaps = getattr(dm, 'p_noise_snapshots', None)
+    stride = getattr(dm, 'p_noise_stride', None)
+    if snaps is None or not stride:
+        return None
+    j = int(frame_idx) // int(stride)
+    if j < 0 or j >= len(snaps):
+        return None
+    row = np.asarray(snaps[j], dtype=np.float64)
+    if row.shape != (_K_BINS,) or not np.all(np.isfinite(row)):
+        return None
+    return row
+
+
+def p_noise_frames_at(dm, frame_idx: int) -> int:
+    """Accepted frames behind the Buffer-3 estimate at `frame_idx` (0 if none).
+
+    Exported as `b3_frames`, so a reviewer can distinguish a warm, full-window
+    noise estimate from one built during warm-up — the v6 features are much
+    noisier in the latter case, and that is invisible in the feature values."""
+    counts = getattr(dm, 'p_noise_counts', None)
+    stride = getattr(dm, 'p_noise_stride', None)
+    if counts is None or not stride:
+        return 0
+    j = int(frame_idx) // int(stride)
+    return int(counts[j]) if 0 <= j < len(counts) else 0
 
 
 def run_stage1_v5_precomputed(dm, k: float = K_STAGE1_DEFAULT) -> list:
@@ -2222,30 +3297,19 @@ def run_stage1_v5_precomputed(dm, k: float = K_STAGE1_DEFAULT) -> list:
         for i in indices
     ]
 
-    # Run-length filter: a run longer than MAX_RUN is sustained noise, not a click.
-    runs, current = [], [above_threshold[0]]
-    for j in range(1, len(above_threshold)):
-        if above_threshold[j]['frame_idx'] == above_threshold[j - 1]['frame_idx'] + 1:
-            current.append(above_threshold[j])
-        else:
-            runs.append(current)
-            current = [above_threshold[j]]
-    runs.append(current)
-
-    candidates = []
-    for run in runs:
-        if len(run) <= MAX_RUN:
-            for entry in run:
-                candidates.append({**entry, 'group_size': len(run)})
-
-    return candidates
+    # Candidate selection (Stage 1 v5.1) — delegated to _stage1_select, which is
+    # the same code the slow path runs. `fft_means` is already the full per-frame
+    # energy series, which is exactly what the local-maximum test needs.
+    by_frame = {c['frame_idx']: c for c in above_threshold}
+    picks = _stage1_select(fft_means, sorted(by_frame), k=k)
+    return [{**by_frame[p['frame_idx']], **p} for p in picks]
 
 
 # =============================================================================
 # STAGE 2 — Valid-fit gate and single tone rejection  (§11)
 # =============================================================================
 
-def run_stage2_v5(candidates: list) -> tuple:
+def run_stage2_v5(candidates: list, mode: str = None) -> tuple:
     """
     Stage 2 of the v5 click detection pipeline: valid-fit and OOD gate  (§11).
 
@@ -2278,15 +3342,19 @@ def run_stage2_v5(candidates: list) -> tuple:
         observed in the training click set was ≈ 34, making this a generous
         safety margin rather than a tight discriminant.
 
-    All other features (peak_SNR, FPE_hz, ZCR, kurtosis, …) are left entirely
-    to the SVM. They vary continuously and the SVM boundary in those dimensions
-    was learned from labelled data.
+    ⚠️ THIS DOCSTRING'S GATE LIST IS OUT OF DATE ABOVE — see _stage2_reason,
+    which is the single source of truth. In v6 the fit gate was REMOVED (it cost
+    12.2 % of confirmed clicks) and replaced by gates on peak_SNR, n_seg,
+    local_crest and harmonic_confinement. SPR < 100 is retained as
+    out-of-distribution insurance only.
 
     Parameters
     ----------
     candidates : list of dict
-        Stage 1 survivors with features already attached (i.e. each dict
-        contains 'R2' and 'SPR' keys produced by compute_features_v5).
+        Stage 1 survivors with features already attached by compute_features_v5.
+    mode : str, optional
+        One of STAGE2_MODES. Passed straight through to _stage2_reason;
+        None means the module default (v6 conservative).
 
     Returns
     -------
@@ -2298,7 +3366,7 @@ def run_stage2_v5(candidates: list) -> tuple:
     n_rejected = 0
 
     for cand in candidates:
-        if _stage2_reason(cand) == STAGE_OK:
+        if _stage2_reason(cand, mode) == STAGE_OK:
             survivors.append(cand)
         else:
             n_rejected += 1
@@ -2306,39 +3374,173 @@ def run_stage2_v5(candidates: list) -> tuple:
     return survivors, n_rejected
 
 
-def _stage2_reason(cand: dict) -> str:
+def _stage2_reason_v5(cand: dict) -> str:
     """
-    Which Stage 2 gate rejects this candidate, if any.
+    Stage 2 exactly as v5 shipped it. PRESERVED BIT-IDENTICALLY — do not tidy.
 
-    The single source of truth for the Stage 2 rule. run_stage2_v5 uses it to
-    drop rejects; run_stages234_annotated uses it to *label* them. Keeping both
-    on one implementation is what guarantees the survivor-only path and the
-    annotated path can never disagree about the same candidate.
+    Kept selectable (STAGE2_MODE_V5) so a v5 result can be reproduced without
+    checking out an old commit: re-deriving a figure from a v5-era CSV, or asking
+    "what would the old pipeline have said about this recording".
 
-    Returns
-    -------
-    str
-        STAGE_OK ('') if every gate passes, otherwise STAGE_BLOCKED_R2 or
-        STAGE_BLOCKED_SPR — the first gate that rejects it, the fit gates first.
+    ⚠️ ITS NaN HANDLING IS THE EXACT INVERSE OF v6's, and that is correct for this
+    rule. Here NaN R2/tau_ms means "the quantity being gated on is broken", so it
+    must FAIL explicitly — every comparison against NaN is False, so without the
+    explicit test the unfittable candidates would sail through into Stage 3 and be
+    scored from imputed values. In v6 the same NaN means "not applicable" and
+    PASSES. Two rules, two opposite conventions; merging them would break one.
+
+    ⚠️ It costs 12.2 % of confirmed clicks (23 of 189) and 32.3 % of ambiguous
+    rows, measured over 32 exhaustively-labelled recordings. That is why it is no
+    longer the default.
     """
-    # Gate 1a: R² < 0.10 → decay fit is invalid; downstream features
-    # that depend on decay_start / decay_end are unreliable.
-    # _fit_decay_segment also returns R2=0.0 for degenerate windows
-    # (too short or near-zero denominator) — those fail here too.
+    # Gate 1a: R² < 0.10 → decay fit is invalid; downstream features that depend
+    # on decay_start / decay_end are unreliable. _fit_decay_segment also returns
+    # R2 = 0.0 for degenerate windows, which fail here too.
+    if not int(cand.get('fit_valid', 1) or 0):
+        return STAGE_BLOCKED_R2
+    _r2, _tau = cand.get('R2', 0.0), cand.get('tau_ms', -1.0)
+    if _r2 is None or _tau is None or (_r2 != _r2) or (_tau != _tau):   # NaN check
+        return STAGE_BLOCKED_R2
+
     if cand.get('R2', 0.0) < STAGE2_R2_MIN:
         return STAGE_BLOCKED_R2
 
-    # Gate 1b: τ ≤ 0 → no decay was fitted at all. _fit_decay_segment returns the
-    # −1 sentinel, and every decay-window feature (fall_time_ms, post_SNR, ZCR_post,
-    # asymmetry_integral, centroid_shift_hz) is then an artefact of the fallback
-    # window placement rather than of the signal. Same failure as Gate 1a — an
-    # unusable exponential fit — so it carries the same verdict.
+    # Gate 1b: τ ≤ 0 → no decay was fitted at all. Every decay-window feature is
+    # then an artefact of the fallback window placement rather than of the signal.
     if cand.get('tau_ms', -1.0) <= STAGE2_TAU_MIN:
         return STAGE_BLOCKED_R2
 
-    # Gate 2: SPR ≥ 100 → extremely tonal signal, out-of-distribution
-    # for the SVM (never seen in training for either class).
+    # Gate 2: SPR ≥ 100 → extremely tonal, out-of-distribution for the SVM.
     if cand.get('SPR', 0.0) >= STAGE2_SPR_MAX:
+        return STAGE_BLOCKED_SPR
+
+    return STAGE_OK
+
+
+def _stage2_reason(cand: dict, mode: str = None) -> str:
+    """
+    Which Stage 2 gate rejects this candidate, if any.
+
+    THE single source of truth for the Stage 2 rule. run_stage2_v5 uses it to
+    drop rejects, run_stages234_annotated uses it to *label* them, and
+    src/ml/evaluate_candidates.py calls it row-wise rather than keeping a second
+    copy — this project has been bitten before by two implementations of one rule
+    drifting apart.
+
+    Returns STAGE_OK ('') or the first gate that rejects, most-diagnostic first.
+
+    ── WHAT CHANGED IN v6, AND WHY ──────────────────────────────────────────
+    The fit gate is GONE. It used to reject any candidate whose exponential decay
+    fit failed (fit_valid == 0, NaN R2/tau, R2 < 0.10, tau <= 0), on the argument
+    that every decay-window feature was then unreliable. Measured against 32
+    exhaustively-labelled recordings, that gate cost:
+
+        12.2 % of confirmed clicks (23 of 189)  and  32.3 % of ambiguous rows
+
+    Those clicks were hard-rejected before Stage 3 and never reached the SVM at
+    all. A decay fit failing is evidence about a candidate, not grounds for
+    discarding it — so fit_valid, R2 and tau_ms are now FEATURES, and Stage 3
+    weighs them.
+
+    ⚠️ CONSEQUENCE, and it is not free: rows with NaN tau_ms / R2 now reach
+    Stage 3, where the Pipeline's SimpleImputer fills them and the SVM returns a
+    confident-looking probability computed partly from imputed values. That is
+    the exact hazard the old NaN handling here guarded against. The mitigation is
+    that fit_valid is a feature, so the model can condition on "this row's decay
+    features are imputed" — but it only works if fit_valid is actually in
+    model['features']. See the Stage 3 brief.
+
+    ── THE REPLACEMENT ──────────────────────────────────────────────────────
+    Gates on quantities that exist whether or not the fit converged. Every
+    threshold sits strictly outside the labelled click distribution and carries a
+    measured cost (regenerate with scripts/v6/feature_distributions.py):
+
+        gate                          clicks  ambiguous   noise
+        peak_SNR    >= 4.5              0.0 %     0.0 %   76.8 %
+        n_seg       >= 10               0.0 %     0.0 %   45.2 %
+        local_crest >= 1.2              0.0 %     0.0 %   33.6 %
+        harmonic_confinement <= 1.6     0.0 %     0.0 %    3.2 % (16.9 % corpus)
+        ------------------------------------------------------------------
+        all four combined               0.0 %     0.0 %   83.1 %
+        the OLD fit gate, for scale    12.2 %    32.3 %   91.4 %
+
+    Plus two OUT-OF-DISTRIBUTION bounds that are not discriminators and are not
+    tuned against the click distribution at all — they reject values that cannot
+    be measurements:
+
+        SPR < 100                — extremely tonal; 0.4 % of candidates, but it
+                                   catches 100 % of the single-bin iFFT blowups
+        peak_SNR <= 1e4          — non-physical amplitude; 12.7x the highest
+                                   labelled click, 0 clicks lost
+
+    ⚠️ NaN PASSES every gate. A row whose feature could not be measured cannot be
+    judged by it — harmonic_confinement is NaN on ~23 % of rows by design, and
+    every v6 feature is NaN when b3_frames == 0. Note this is the OPPOSITE of the
+    retired fit gate, where NaN had to be failed explicitly: there NaN meant "the
+    thing being gated on is broken", here it means "not applicable".
+
+    Parameters
+    ----------
+    mode : one of STAGE2_MODES
+        'v6_conservative' (default) — the gates above; measured zero click loss.
+        'v6_aggressive'             — raises the peak_SNR floor to 5.0, buying
+                                      87.0 % of noise for a MEASURED 2.1 % of
+                                      clicks and 2.0 % of ambiguous. For sessions
+                                      whose candidate rate makes review impossible
+                                      (up to 344,773/hour outdoors).
+        'v5_fitgate'                — the ORIGINAL v5 rule, preserved verbatim in
+                                      _stage2_reason_v5 so a v5 result stays
+                                      reproducible. Costs 12.2 % of clicks.
+    """
+    mode = STAGE2_MODE if mode is None else mode
+    if mode == STAGE2_MODE_V5:
+        return _stage2_reason_v5(cand)
+    if mode not in STAGE2_MODES:
+        raise ValueError(f"unknown Stage 2 mode {mode!r}; expected one of {STAGE2_MODES}")
+    snr_min = (STAGE2_AGGRESSIVE_PEAK_SNR_MIN
+               if mode == STAGE2_MODE_AGGRESSIVE else STAGE2_PEAK_SNR_MIN)
+
+    def _lt(key, threshold, default=None):
+        """True when the value is BELOW threshold. NaN and missing -> False (pass)."""
+        v = cand.get(key, default)
+        if v is None:
+            return False
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return False
+        return False if f != f else f < threshold          # f != f is the NaN test
+
+    def _gt(key, threshold, default=None):
+        v = cand.get(key, default)
+        if v is None:
+            return False
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return False
+        return False if f != f else f > threshold
+
+    # Ordered most-diagnostic first, so the verdict string says the most useful
+    # thing about why a row was dropped.
+    if _lt('peak_SNR', snr_min):
+        return STAGE_BLOCKED_SNR
+    # Sanity bound, checked right after the floor so the two peak_SNR tests sit
+    # together. Not a discriminator — nothing real lives up here.
+    if _gt('peak_SNR', STAGE2_PEAK_SNR_MAX):
+        return STAGE_BLOCKED_NONPHYS
+    if _lt('n_seg', STAGE2_N_SEG_MIN):
+        return STAGE_BLOCKED_NSEG
+    if _lt('local_crest', STAGE2_LOCAL_CREST_MIN):
+        return STAGE_BLOCKED_CREST
+    if _gt('harmonic_confinement', STAGE2_HC_MAX):
+        return STAGE_BLOCKED_HARM
+
+    # Retained: extremely tonal spectra were never shown to the SVM for either
+    # class, so a prediction there is out-of-distribution. It rejects only 0.4 %
+    # of real candidates — it is insurance, not a discriminator. Worth knowing:
+    # SPR does NOT separate clicks from noise (medians 8.92 vs 9.22).
+    if _gt('SPR', STAGE2_SPR_MAX - 1e-12):
         return STAGE_BLOCKED_SPR
 
     return STAGE_OK
@@ -2353,8 +3555,11 @@ def run_stage3_v5(candidates: list, svm_model: dict) -> tuple:
     Stage 3 of the v5 click detection pipeline: SVM classification  (§12).
 
     Feeds the feature vector of every Stage 2 survivor into the pre-trained
-    sklearn Pipeline (SimpleImputer → StandardScaler → SVC with Platt scaling)
-    and applies the optimised decision threshold to obtain the binary prediction.
+    sklearn Pipeline (imputer → scaler → SVC with Platt scaling) and applies the
+    optimised decision threshold to obtain the binary prediction. The exact steps
+    depend on the model: v5 is SimpleImputer(mean) → StandardScaler, the deployed
+    v6 is SimpleImputer(median) → PowerTransformer(yeo-johnson). Stage 3 does not
+    care — it calls predict_proba on whatever Pipeline the model file contains.
 
     The feature order and the decision threshold are both read from the model
     dict (loaded once by load_svm_model). The pipeline module never hardcodes
@@ -2372,7 +3577,8 @@ def run_stage3_v5(candidates: list, svm_model: dict) -> tuple:
         Stage 2 survivors. Each dict must contain every feature name listed in
         svm_model['features']. Any feature value that is NaN (e.g. from a
         degenerate frame) is handled by the SimpleImputer in the pipeline, which
-        fills it with the training-set mean — safe but worth monitoring.
+        fills it with the training-set mean (v5) or median (v6) — safe, but
+        worth monitoring.
 
     svm_model : dict
         Dict returned by load_svm_model. Must contain:
@@ -2443,8 +3649,27 @@ def _stage3_scores(candidates: list, svm_model: dict) -> np.ndarray:
     # Values are extracted in the exact column order the SVM was trained on.
     # float64 is used throughout: the SVC C extension requires it, and it avoids
     # the silent overflow that affected float32 on large peak_SNR values.
+    # ── SENTINEL → NaN, so training and inference see the SAME encoding ──────
+    # The pipeline emits tau_ms = -1.0 / R2 = 0.0 when the decay fit fails, on
+    # 90.2 % of candidates. A v6 model is fitted AFTER converting those to NaN,
+    # so its Pipeline imputes them; serving it the raw -1.0 would be a
+    # train/serve skew affecting nearly every candidate.
+    #
+    # ⚠️ THIS MUST FOLLOW THE MODEL, NOT THE PIPELINE VERSION. The shipped v5
+    # model was trained ON the sentinels, so converting for it would create the
+    # very skew this exists to prevent, in the opposite direction. The training
+    # run stamps its choice into model['nan_policy']; a model saved before that
+    # key existed is v5-era by definition, hence the 'sentinel' default.
+    #
+    # include_coverage=False: fit_coverage is a real measurement even when the
+    # fit fails (see fit_result_to_nan), so it is passed through untouched.
+    if svm_model.get('nan_policy', 'sentinel') == 'nan':
+        prepared = [fit_result_to_nan(c, include_coverage=False) for c in candidates]
+    else:
+        prepared = candidates
+
     X = np.array(
-        [[cand.get(f, np.nan) for f in feat_names] for cand in candidates],
+        [[cand.get(f, np.nan) for f in feat_names] for cand in prepared],
         dtype=np.float64,
     )
 
@@ -2551,6 +3776,7 @@ def run_stages234_annotated(
     candidates: list,
     svm_model: dict,
     threshold: float = None,
+    stage2_mode: str = None,
 ) -> list:
     """
     Run Stages 2, 3 and 4 while keeping EVERY input candidate.
@@ -2602,7 +3828,7 @@ def run_stages234_annotated(
     annotated = []
     for cand in candidates:
         row = dict(cand)
-        row['stage_blocked']   = _stage2_reason(row)
+        row['stage_blocked']   = _stage2_reason(row, stage2_mode)
         row['svm_probability'] = None
         row['svm_prediction']  = None
         annotated.append(row)
@@ -2642,17 +3868,22 @@ def stage_summary(annotated: list) -> dict:
     Returns
     -------
     dict
-        {'total', 'Stage2_R2', 'Stage2_SPR', 'Stage3_SVM', 'Stage4_dedup',
-         'confirmed'}. The four blocked counts plus 'confirmed' sum to 'total'.
+        {'total', 'confirmed', 'unknown'} plus one key per verdict in
+        STAGE_BLOCKED_ALL. Every blocked count plus 'confirmed' plus 'unknown'
+        sums to 'total', by construction — see the note below.
+
+    ⚠️ THIS USED TO UNDER-REPORT. The counter dict was written out by hand with
+    the four v5 verdicts, and the loop body was `elif verdict in counts`. When
+    Stage 2 was rebuilt for v6 the five new verdicts (Stage2_SNR, Stage2_nonphys,
+    Stage2_nseg, Stage2_crest, Stage2_harm) matched neither branch and were
+    dropped on the floor: a candidate blocked by the v6 SNR floor was counted
+    nowhere, so the funnel silently failed to reconcile and every UI reading it
+    under-reported the gates. Building from STAGE_BLOCKED_ALL is what stops the
+    next gate from doing the same thing, and 'unknown' is what makes it loud
+    rather than lossy if a verdict ever arrives from outside this module.
     """
-    counts = {
-        'total':               len(annotated),
-        STAGE_BLOCKED_R2:      0,
-        STAGE_BLOCKED_SPR:     0,
-        STAGE_BLOCKED_SVM:     0,
-        STAGE_BLOCKED_DEDUP:   0,
-        'confirmed':           0,
-    }
+    counts = {'total': len(annotated), 'confirmed': 0, 'unknown': 0}
+    counts.update({verdict: 0 for verdict in STAGE_BLOCKED_ALL})
 
     for row in annotated:
         verdict = row.get('stage_blocked', STAGE_OK)
@@ -2660,5 +3891,7 @@ def stage_summary(annotated: list) -> dict:
             counts['confirmed'] += 1
         elif verdict in counts:
             counts[verdict] += 1
+        else:
+            counts['unknown'] += 1
 
     return counts

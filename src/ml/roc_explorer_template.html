@@ -1,0 +1,537 @@
+<!-- This file is a template for the ROC explorer HTML report. It was generated using Claude Code, Opus 5. Every training using --report will produce a local link to access the interactive interface -->
+
+<title>Click Threshold Explorer</title>
+<meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+
+<style>
+:root {
+  --ground:      #f6f7f9;
+  --surface:     #ffffff;
+  --surface-2:   #eef1f5;
+  --ink:         #1a2028;
+  --ink-2:       #4a5663;
+  --muted:       #78838f;
+  --line:        #d8dee6;
+  --line-soft:   #e7ebf0;
+  --accent:      #c25e1e;
+  --accent-soft: #f3e2d4;
+  --click:       #2e86ab;
+  --click-soft:  #dbeaf3;
+  --err:         #b3455c;
+  --err-soft:    #f6dfe4;
+  --good:        #2f7d5f;
+  --shadow:      0 1px 2px rgba(20,30,40,.06), 0 8px 24px rgba(20,30,40,.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground:      #0d1117;
+    --surface:     #151b23;
+    --surface-2:   #1c242e;
+    --ink:         #e6edf3;
+    --ink-2:       #b6c2ce;
+    --muted:       #7d8b99;
+    --line:        #2a3542;
+    --line-soft:   #212a35;
+    --accent:      #e88b4a;
+    --accent-soft: #3a2617;
+    --click:       #58a6d8;
+    --click-soft:  #16303f;
+    --err:         #e0788d;
+    --err-soft:    #3a1f26;
+    --good:        #5fbf94;
+    --shadow:      0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.3);
+  }
+}
+:root[data-theme="dark"] {
+  --ground:      #0d1117;
+  --surface:     #151b23;
+  --surface-2:   #1c242e;
+  --ink:         #e6edf3;
+  --ink-2:       #b6c2ce;
+  --muted:       #7d8b99;
+  --line:        #2a3542;
+  --line-soft:   #212a35;
+  --accent:      #e88b4a;
+  --accent-soft: #3a2617;
+  --click:       #58a6d8;
+  --click-soft:  #16303f;
+  --err:         #e0788d;
+  --err-soft:    #3a1f26;
+  --good:        #5fbf94;
+  --shadow:      0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.3);
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font: 400 15px/1.55 "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1180px; margin: 0 auto; padding: 32px 24px 64px; }
+
+header { margin-bottom: 28px; }
+.eyebrow {
+  font: 500 11px/1 "IBM Plex Mono", ui-monospace, monospace;
+  letter-spacing: .14em; text-transform: uppercase; color: var(--muted);
+  margin-bottom: 10px;
+}
+h1 {
+  font: 700 clamp(26px, 3.4vw, 38px)/1.1 Archivo, system-ui, sans-serif;
+  letter-spacing: -.02em; margin: 0 0 10px; text-wrap: balance;
+}
+.lede { color: var(--ink-2); max-width: 68ch; margin: 0; }
+.lede strong { color: var(--ink); font-weight: 600; }
+
+.setbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 22px 0 20px; }
+.seg { display: inline-flex; background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px; padding: 3px; gap: 3px; }
+.seg button {
+  font: 500 13px/1 "IBM Plex Sans", sans-serif; color: var(--ink-2);
+  background: none; border: 0; padding: 8px 14px; border-radius: 6px; cursor: pointer;
+}
+.seg button[aria-pressed="true"] { background: var(--surface); color: var(--ink); box-shadow: var(--shadow); }
+.seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.setmeta { font: 400 13px/1 "IBM Plex Mono", monospace; color: var(--muted); }
+.setmeta b { color: var(--ink); font-weight: 600; }
+
+.grid { display: grid; grid-template-columns: minmax(0,1.15fr) minmax(0,1fr); gap: 20px; align-items: start; }
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+.card {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: 12px; padding: 20px; box-shadow: var(--shadow);
+}
+.card h2 {
+  font: 600 12px/1 "IBM Plex Mono", monospace; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--muted); margin: 0 0 4px;
+}
+.card .sub { font-size: 13px; color: var(--muted); margin: 0 0 16px; }
+
+svg { display: block; width: 100%; height: auto; touch-action: none; }
+.axis  { stroke: var(--line); stroke-width: 1; }
+.gridl { stroke: var(--line-soft); stroke-width: 1; }
+.chance { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 4; opacity: .55; }
+.curve { fill: none; stroke: var(--click); stroke-width: 2.25; stroke-linejoin: round; }
+.curve-fill { fill: var(--click); opacity: .09; }
+.cursor-line { stroke: var(--accent); stroke-width: 1; stroke-dasharray: 3 3; opacity: .75; }
+.op-dot { fill: var(--accent); stroke: var(--surface); stroke-width: 2.5; }
+.op-halo { fill: var(--accent); opacity: .16; }
+.tick { font: 400 10px/1 "IBM Plex Mono", monospace; fill: var(--muted); }
+.axlabel { font: 500 10px/1 "IBM Plex Mono", monospace; fill: var(--muted); letter-spacing: .08em; text-transform: uppercase; }
+.pr-recall { fill: none; stroke: var(--click); stroke-width: 2; }
+.pr-prec   { fill: none; stroke: var(--err); stroke-width: 2; }
+.pr-f1     { fill: none; stroke: var(--good); stroke-width: 2; stroke-dasharray: 4 3; }
+
+.cm { display: grid; grid-template-columns: auto 1fr 1fr; gap: 6px; margin: 4px 0 18px; }
+.cm .lbl { font: 500 10px/1.2 "IBM Plex Mono", monospace; color: var(--muted);
+           letter-spacing: .07em; text-transform: uppercase; align-self: center; }
+.cm .colhead { text-align: center; padding-bottom: 2px; }
+.cm .rowhead { writing-mode: vertical-rl; transform: rotate(180deg); text-align: center; justify-self: center; }
+.cell { border-radius: 9px; padding: 14px 10px; text-align: center; border: 1px solid transparent; }
+.cell .n { font: 600 26px/1 "IBM Plex Mono", monospace; font-variant-numeric: tabular-nums; display: block; }
+.cell .t { font: 500 10px/1 "IBM Plex Mono", monospace; letter-spacing: .09em;
+           text-transform: uppercase; color: var(--muted); margin-top: 6px; display: block; }
+.cell.tp { background: var(--click-soft); border-color: var(--click); }
+.cell.tp .n { color: var(--click); }
+.cell.tn { background: var(--surface-2); border-color: var(--line); }
+.cell.fp, .cell.fn { background: var(--err-soft); border-color: var(--err); }
+.cell.fp .n, .cell.fn .n { color: var(--err); }
+
+.metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.metric { background: var(--surface); padding: 12px 12px 11px; }
+.metric .k { font: 500 10px/1 "IBM Plex Mono", monospace; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.metric .v { font: 600 21px/1.15 "IBM Plex Mono", monospace; font-variant-numeric: tabular-nums; margin-top: 5px; }
+.metric.hero { background: var(--accent-soft); }
+.metric.hero .v { color: var(--accent); }
+
+.controls { margin-top: 20px; }
+.thr-row { display: flex; align-items: baseline; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
+.thr-label { font: 500 11px/1 "IBM Plex Mono", monospace; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.thr-val { font: 600 24px/1 "IBM Plex Mono", monospace; font-variant-numeric: tabular-nums; color: var(--accent); }
+.thr-note { font-size: 13px; color: var(--muted); }
+input[type=range] { width: 100%; accent-color: var(--accent); height: 26px; cursor: grab; }
+input[type=range]:active { cursor: grabbing; }
+input[type=range]:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
+
+.chips { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 14px; }
+.chip {
+  font: 500 12px/1 "IBM Plex Sans", sans-serif; color: var(--ink-2);
+  background: var(--surface); border: 1px solid var(--line);
+  padding: 7px 11px; border-radius: 999px; cursor: pointer;
+}
+.chip:hover { border-color: var(--accent); color: var(--ink); }
+.chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+:root[data-theme="dark"] .chip[aria-pressed="true"],
+:root:not([data-theme="light"]) .chip[aria-pressed="true"] { color: #17110b; }
+.chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 12px; font: 400 12px/1 "IBM Plex Mono", monospace; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.swatch { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+
+.note {
+  margin-top: 24px; padding: 16px 18px; border-left: 3px solid var(--accent);
+  background: var(--surface); border-radius: 0 10px 10px 0; color: var(--ink-2);
+  font-size: 14px; box-shadow: var(--shadow);
+}
+.note b { color: var(--ink); }
+.note code { font: 400 13px/1 "IBM Plex Mono", monospace; background: var(--surface-2);
+             padding: 2px 5px; border-radius: 4px; color: var(--ink); }
+footer { margin-top: 30px; font: 400 12px/1.6 "IBM Plex Mono", monospace; color: var(--muted); }
+
+@media (prefers-reduced-motion: no-preference) {
+  .op-dot, .op-halo, .cell .n { transition: all .09s linear; }
+}
+</style>
+
+<div class="wrap">
+<header>
+  <div class="eyebrow">PlantLeaf · Stage 3 · v6</div>
+  <h1>Where do you draw the line?</h1>
+  <p class="lede">One fitted model, one ROC curve, and a different confusion matrix at every point along it.
+  <strong>AUC-ROC is the area under the whole curve</strong> — it grades the model's ranking and names no
+  operating point. Recall and precision trade against each other here at fixed AUC, so
+  <strong>“high recall, poor precision” is a statement about this line, not about the model.</strong>
+  Drag the curve, the slider, or press ← →.</p>
+</header>
+
+<div class="setbar">
+  <div class="seg" role="group" aria-label="Evaluation set">
+    <button id="btnA" aria-pressed="true">Set A · cross-validated</button>
+    <button id="btnB" aria-pressed="false">Set B · held out</button>
+  </div>
+  <div class="setmeta" id="setmeta"></div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h2>ROC curve</h2>
+    <p class="sub" id="roc-sub"></p>
+    <svg id="roc" viewBox="0 0 460 420" role="img" aria-label="ROC curve, draggable operating point"></svg>
+    <div class="legend">
+      <span><i class="swatch" style="background:var(--click)"></i> ROC</span>
+      <span><i class="swatch" style="background:var(--muted)"></i> chance</span>
+      <span><i class="swatch" style="background:var(--accent)"></i> operating point</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Confusion matrix</h2>
+    <p class="sub">at the current threshold — <span id="cm-sub"></span></p>
+    <div class="cm">
+      <div></div>
+      <div class="lbl colhead">predicted click</div>
+      <div class="lbl colhead">predicted noise</div>
+      <div class="lbl rowhead">actual click</div>
+      <div class="cell tp"><span class="n" id="c-tp">0</span><span class="t">true positive · TP</span></div>
+      <div class="cell fn"><span class="n" id="c-fn">0</span><span class="t">false negative · FN</span></div>
+      <div class="lbl rowhead">actual noise</div>
+      <div class="cell fp"><span class="n" id="c-fp">0</span><span class="t">false positive · FP</span></div>
+      <div class="cell tn"><span class="n" id="c-tn">0</span><span class="t">true negative · TN</span></div>
+    </div>
+
+    <div class="metrics">
+      <div class="metric hero"><div class="k">Recall</div><div class="v" id="m-rec">—</div></div>
+      <div class="metric hero"><div class="k">Precision</div><div class="v" id="m-pre">—</div></div>
+      <div class="metric hero"><div class="k">F1</div><div class="v" id="m-f1">—</div></div>
+      <div class="metric"><div class="k">Specificity</div><div class="v" id="m-spec">—</div></div>
+      <div class="metric"><div class="k">Youden J</div><div class="v" id="m-j">—</div></div>
+      <div class="metric"><div class="k">MCC</div><div class="v" id="m-mcc">—</div></div>
+    </div>
+
+    <div class="controls">
+      <div class="thr-row">
+        <span class="thr-label">Threshold</span>
+        <span class="thr-val" id="thr-val">0.000</span>
+        <span class="thr-note" id="thr-note"></span>
+      </div>
+      <input type="range" id="slider" min="0" max="100" value="50"
+             aria-label="Decision threshold position along the ROC curve">
+      <div class="chips" id="chips"></div>
+    </div>
+  </div>
+</div>
+
+<div class="card" style="margin-top:20px">
+  <h2>Recall, precision and F1 versus threshold</h2>
+  <p class="sub">Where the two curves cross is the balance point. F1 peaks near it; the amber line is where you are.</p>
+  <svg id="pr" viewBox="0 0 940 260" role="img" aria-label="Recall, precision and F1 against threshold"></svg>
+  <div class="legend">
+    <span><i class="swatch" style="background:var(--click)"></i> recall</span>
+    <span><i class="swatch" style="background:var(--err)"></i> precision</span>
+    <span><i class="swatch" style="background:var(--good)"></i> F1</span>
+  </div>
+</div>
+
+<div class="note" id="advice"></div>
+
+<footer id="prov"></footer>
+</div>
+
+<script>
+const DATA = /*__DATA__*/;
+
+/* ── metric sweep ─────────────────────────────────────────────────────────
+   One pass down the scores, descending. Every distinct score becomes one
+   operating point: the confusion matrix you get by calling everything at or
+   above it a click. This is exactly what sklearn's roc_curve does, and every
+   number on the page is derived from it — nothing is precomputed server-side,
+   so switching sets recomputes honestly.                                     */
+function sweep(y, p) {
+  const n = y.length;
+  const idx = Array.from({length: n}, (_, i) => i).sort((a, b) => p[b] - p[a]);
+  const P = y.reduce((s, v) => s + v, 0), N = n - P;
+  const pts = [];
+  let tp = 0, fp = 0, i = 0;
+  const push = (thr) => {
+    const fn = P - tp, tn = N - fp;
+    const rec  = P ? tp / P : 0;
+    const prec = (tp + fp) ? tp / (tp + fp) : 1;
+    const spec = N ? tn / N : 0;
+    const f1   = (prec + rec) ? 2 * prec * rec / (prec + rec) : 0;
+    const den  = Math.sqrt((tp+fp) * (tp+fn) * (tn+fp) * (tn+fn));
+    pts.push({ thr, tp, fp, fn, tn, rec, prec, spec, f1,
+               j: rec + spec - 1,
+               acc: (tp + tn) / n,
+               mcc: den ? (tp*tn - fp*fn) / den : 0,
+               fpr: N ? fp / N : 0 });
+  };
+  push(Infinity);
+  while (i < n) {
+    const t = p[idx[i]];
+    while (i < n && p[idx[i]] === t) { y[idx[i]] === 1 ? tp++ : fp++; i++; }
+    push(t);
+  }
+  return { pts, P, N, n };
+}
+
+const SETS = {};
+for (const k of ['A', 'B']) {
+  const s = DATA.sets[k];
+  SETS[k] = Object.assign({ meta: s }, sweep(s.y, s.p));
+}
+
+let curSet = 'A', curIdx = 0;
+
+/* preset operating points — each is a rule someone might actually want */
+function presets(S) {
+  const out = [];
+  const best = (score) => S.pts.reduce((b, q, i) =>
+      score(q) > score(S.pts[b]) ? i : b, 0);
+  const recTarget = (t) => {
+    let bi = null;
+    S.pts.forEach((q, i) => {
+      if (q.rec >= t && (bi === null || q.fpr < S.pts[bi].fpr)) bi = i;
+    });
+    return bi;
+  };
+  const preTarget = (t) => {
+    let bi = null;
+    S.pts.forEach((q, i) => {
+      if (q.prec >= t && (bi === null || q.rec > S.pts[bi].rec)) bi = i;
+    });
+    return bi;
+  };
+  const near = (v) => S.pts.reduce((b, q, i) =>
+      Math.abs(q.thr - v) < Math.abs(S.pts[b].thr - v) ? i : b, 0);
+  out.push(['Max F1',        best(q => q.f1)]);
+  out.push(['Max MCC',       best(q => q.mcc)]);
+  out.push(['Max Youden J',  best(q => q.j)]);
+  out.push(['Recall ≥ 0.95', recTarget(0.95)]);
+  out.push(['Recall ≥ 0.90', recTarget(0.90)]);
+  out.push(['Recall ≥ 0.80', recTarget(0.80)]);
+  out.push(['Precision ≥ 0.60', preTarget(0.60)]);
+  out.push(['Threshold 0.50', near(0.5)]);
+  return out.filter(([, i]) => i !== null && i !== undefined);
+}
+
+const NS = 'http://www.w3.org/2000/svg';
+const el = (t, a) => { const e = document.createElementNS(NS, t);
+  for (const k in a) e.setAttribute(k, a[k]); return e; };
+const f3 = (v) => (v === null || Number.isNaN(v)) ? '—' : v.toFixed(3);
+
+/* ── ROC chart ─────────────────────────────────────────────────────────── */
+const M = { l: 52, r: 16, t: 16, b: 46 }, RW = 460, RH = 420;
+const px = (fpr) => M.l + fpr * (RW - M.l - M.r);
+const py = (tpr) => RH - M.b - tpr * (RH - M.t - M.b);
+
+function drawROC() {
+  const S = SETS[curSet], svg = document.getElementById('roc');
+  svg.textContent = '';
+  for (let g = 0; g <= 10; g += 2) {
+    const v = g / 10;
+    svg.appendChild(el('line', {class:'gridl', x1:px(v), y1:py(0), x2:px(v), y2:py(1)}));
+    svg.appendChild(el('line', {class:'gridl', x1:px(0), y1:py(v), x2:px(1), y2:py(v)}));
+    const tx = el('text', {class:'tick', x:px(v), y:RH - M.b + 15, 'text-anchor':'middle'});
+    tx.textContent = v.toFixed(1); svg.appendChild(tx);
+    const ty = el('text', {class:'tick', x:M.l - 8, y:py(v) + 3, 'text-anchor':'end'});
+    ty.textContent = v.toFixed(1); svg.appendChild(ty);
+  }
+  svg.appendChild(el('line', {class:'chance', x1:px(0), y1:py(0), x2:px(1), y2:py(1)}));
+
+  const pts = S.pts.slice().sort((a, b) => a.fpr - b.fpr || a.rec - b.rec);
+  const d = pts.map((q, i) => `${i ? 'L' : 'M'}${px(q.fpr).toFixed(2)},${py(q.rec).toFixed(2)}`).join('');
+  svg.appendChild(el('path', {class:'curve-fill',
+    d: d + `L${px(1)},${py(0)}L${px(0)},${py(0)}Z`}));
+  svg.appendChild(el('path', {class:'curve', d}));
+
+  const q = S.pts[curIdx];
+  svg.appendChild(el('line', {class:'cursor-line', x1:px(q.fpr), y1:py(0), x2:px(q.fpr), y2:py(q.rec)}));
+  svg.appendChild(el('line', {class:'cursor-line', x1:px(0), y1:py(q.rec), x2:px(q.fpr), y2:py(q.rec)}));
+  svg.appendChild(el('circle', {class:'op-halo', cx:px(q.fpr), cy:py(q.rec), r:11}));
+  svg.appendChild(el('circle', {class:'op-dot',  cx:px(q.fpr), cy:py(q.rec), r:5.5}));
+
+  const xl = el('text', {class:'axlabel', x:(px(0)+px(1))/2, y:RH - 8, 'text-anchor':'middle'});
+  xl.textContent = 'false positive rate'; svg.appendChild(xl);
+  const yl = el('text', {class:'axlabel', x:14, y:(py(0)+py(1))/2,
+    'text-anchor':'middle', transform:`rotate(-90 14 ${(py(0)+py(1))/2})`});
+  yl.textContent = 'recall (true positive rate)'; svg.appendChild(yl);
+}
+
+/* ── precision / recall / F1 versus threshold ──────────────────────────── */
+const PW = 940, PH = 260, PM = { l: 46, r: 14, t: 14, b: 40 };
+function drawPR() {
+  const S = SETS[curSet], svg = document.getElementById('pr');
+  svg.textContent = '';
+  const pts = S.pts.filter(q => Number.isFinite(q.thr)).sort((a, b) => a.thr - b.thr);
+  const qx = (t) => PM.l + t * (PW - PM.l - PM.r);
+  const qy = (v) => PH - PM.b - v * (PH - PM.t - PM.b);
+  for (let g = 0; g <= 10; g += 2) {
+    const v = g / 10;
+    svg.appendChild(el('line', {class:'gridl', x1:qx(0), y1:qy(v), x2:qx(1), y2:qy(v)}));
+    const ty = el('text', {class:'tick', x:PM.l - 8, y:qy(v)+3, 'text-anchor':'end'});
+    ty.textContent = v.toFixed(1); svg.appendChild(ty);
+    const tx = el('text', {class:'tick', x:qx(v), y:PH - PM.b + 15, 'text-anchor':'middle'});
+    tx.textContent = v.toFixed(1); svg.appendChild(tx);
+  }
+  const line = (key, cls) => svg.appendChild(el('path', {class:cls,
+    d: pts.map((q,i) => `${i?'L':'M'}${qx(q.thr).toFixed(2)},${qy(q[key]).toFixed(2)}`).join('')}));
+  line('rec','pr-recall'); line('prec','pr-prec'); line('f1','pr-f1');
+
+  const q = S.pts[curIdx];
+  if (Number.isFinite(q.thr)) {
+    svg.appendChild(el('line', {class:'cursor-line', x1:qx(q.thr), y1:qy(0), x2:qx(q.thr), y2:qy(1)}));
+    svg.appendChild(el('circle', {class:'op-dot', cx:qx(q.thr), cy:qy(q.f1), r:4.5}));
+  }
+  const xl = el('text', {class:'axlabel', x:(qx(0)+qx(1))/2, y:PH-6, 'text-anchor':'middle'});
+  xl.textContent = 'decision threshold'; svg.appendChild(xl);
+}
+
+/* ── readouts ──────────────────────────────────────────────────────────── */
+function render() {
+  const S = SETS[curSet], q = S.pts[curIdx];
+  document.getElementById('c-tp').textContent = q.tp;
+  document.getElementById('c-fp').textContent = q.fp;
+  document.getElementById('c-fn').textContent = q.fn;
+  document.getElementById('c-tn').textContent = q.tn;
+  document.getElementById('m-rec').textContent  = f3(q.rec);
+  document.getElementById('m-pre').textContent  = f3(q.prec);
+  document.getElementById('m-f1').textContent   = f3(q.f1);
+  document.getElementById('m-spec').textContent = f3(q.spec);
+  document.getElementById('m-j').textContent    = f3(q.j);
+  document.getElementById('m-mcc').textContent  = f3(q.mcc);
+  document.getElementById('thr-val').textContent =
+    Number.isFinite(q.thr) ? q.thr.toFixed(3) : '1.000+';
+  document.getElementById('thr-note').textContent =
+    q.tp === 0 ? 'nothing is classified as a click' :
+    q.fp === S.N ? 'everything is classified as a click' :
+    `${q.tp} of ${S.P} clicks detected · ${q.fp} false positives to review · ` +
+    `${q.fn} missed`;
+  document.getElementById('cm-sub').textContent =
+    `${S.n} rows · ${S.P} clicks · ${S.N} noise`;
+
+  const m = S.meta;
+  document.getElementById('setmeta').innerHTML =
+    `<b>${S.n}</b> rows · <b>${S.P}</b> clicks · <b>${S.N}</b> noise · ` +
+    `${m.sessions} session${m.sessions === 1 ? '' : 's'} · AUC <b>${m.auc.toFixed(4)}</b>`;
+  document.getElementById('roc-sub').textContent =
+    `${m.name} — AUC ${m.auc.toFixed(4)}. The curve is fixed; only your position on it moves.`;
+
+  document.getElementById('slider').value = curIdx;
+  document.querySelectorAll('.chip').forEach(c =>
+    c.setAttribute('aria-pressed', String(+c.dataset.idx === curIdx)));
+
+  const f1best = S.pts.reduce((b, x) => x.f1 > b.f1 ? x : b, S.pts[0]);
+  document.getElementById('advice').innerHTML =
+    `<b>Reading this.</b> Every point on the curve is the same model — same features, same ` +
+    `hyperparameters, same AUC of <b>${m.auc.toFixed(4)}</b>. Moving the point cannot make the ` +
+    `model better; it only decides which kind of error you would rather have. ` +
+    `On this set F1 peaks at <b>${f1best.f1.toFixed(3)}</b> ` +
+    `(threshold ${f1best.thr.toFixed(3)}, recall ${f1best.rec.toFixed(3)}, ` +
+    `precision ${f1best.prec.toFixed(3)}). To train at a chosen rule rather than reading it off ` +
+    `here, pass <code>--threshold-metric f1</code>, <code>youden</code>, or ` +
+    `<code>precision-target --precision-target 0.6</code>.`;
+
+  drawROC(); drawPR();
+}
+
+/* ── interaction ───────────────────────────────────────────────────────── */
+function setIdx(i) {
+  const S = SETS[curSet];
+  curIdx = Math.max(0, Math.min(S.pts.length - 1, i));
+  render();
+}
+function nearestOnCurve(evt) {
+  const svg = document.getElementById('roc'), r = svg.getBoundingClientRect();
+  const sx = (evt.clientX - r.left) / r.width * RW;
+  const sy = (evt.clientY - r.top) / r.height * RH;
+  const S = SETS[curSet];
+  let bi = 0, bd = Infinity;
+  S.pts.forEach((q, i) => {
+    const dx = px(q.fpr) - sx, dy = py(q.rec) - sy, d = dx*dx + dy*dy;
+    if (d < bd) { bd = d; bi = i; }
+  });
+  setIdx(bi);
+}
+const roc = document.getElementById('roc');
+let dragging = false;
+roc.addEventListener('pointerdown', e => {
+  dragging = true; roc.setPointerCapture(e.pointerId); nearestOnCurve(e); });
+roc.addEventListener('pointermove', e => { if (dragging) nearestOnCurve(e); });
+roc.addEventListener('pointerup',   e => { dragging = false; });
+roc.addEventListener('pointercancel', () => { dragging = false; });
+
+const slider = document.getElementById('slider');
+slider.addEventListener('input', () => setIdx(+slider.value));
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft')  { setIdx(curIdx - 1); e.preventDefault(); }
+  if (e.key === 'ArrowRight') { setIdx(curIdx + 1); e.preventDefault(); }
+});
+
+function buildChips() {
+  const box = document.getElementById('chips');
+  box.textContent = '';
+  presets(SETS[curSet]).forEach(([name, i]) => {
+    const b = document.createElement('button');
+    b.className = 'chip'; b.textContent = name; b.dataset.idx = i;
+    b.setAttribute('aria-pressed', 'false');
+    b.addEventListener('click', () => setIdx(i));
+    box.appendChild(b);
+  });
+}
+function selectSet(k) {
+  curSet = k;
+  document.getElementById('btnA').setAttribute('aria-pressed', String(k === 'A'));
+  document.getElementById('btnB').setAttribute('aria-pressed', String(k === 'B'));
+  const S = SETS[k];
+  slider.max = S.pts.length - 1;
+  buildChips();
+  const f1i = S.pts.reduce((b, q, i) => q.f1 > S.pts[b].f1 ? i : b, 0);
+  setIdx(f1i);
+}
+document.getElementById('btnA').addEventListener('click', () => selectSet('A'));
+document.getElementById('btnB').addEventListener('click', () => selectSet('B'));
+
+document.getElementById('prov').textContent =
+  `model: SVC ${DATA.model.kernel} · C=${DATA.model.C} · gamma=${DATA.model.gamma} · ` +
+  `scale=${DATA.model.scale} · nan_policy=${DATA.model.nan_policy} · ` +
+  `${DATA.model.features.length} features (${DATA.model.features.join(', ')}) · ` +
+  `source ${DATA.model.source}`;
+
+selectSet('A');
+</script>

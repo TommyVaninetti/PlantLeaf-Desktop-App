@@ -38,7 +38,7 @@ from PySide6.QtGui import QAction, QFont, QColor
 from PySide6 import QtCore
 
 from core.replay_base_window import ReplayBaseWindow
-from plotting.plot_manager import BasePlotWidget
+from plotting.plot_manager import BasePlotWidget, TimeAxisItem
 from core.audio_trim_export import AudioTrimExporter
 from core.click_pipeline_v5 import (
     reconstruct_frame_v5,
@@ -348,11 +348,15 @@ class IFFTWindow(QDialog):
         y_peak *= 1.25   # margine
 
         # Crea il widget del grafico con il range corretto e auto-range per l'asse Y
+        # unit_x is deliberately None: a seconds unit makes pyqtgraph print
+        # kiloseconds on a long recording. TimeAxisItem prints H:MM:SS.ss instead,
+        # matching the playback clock and the click table.
         self.plot_widget = BasePlotWidget(
-            x_label="Time", y_label="Amplitude",
+            x_label="Time (h:mm:ss)", y_label="Amplitude",
             x_range=(x_min_val, x_max_val), y_range=(-y_peak, y_peak),
             x_min=x_min_val, x_max=x_max_val, y_min=-1.7, y_max=1.7,
-            unit_x="s", unit_y="V", parent=self
+            unit_x=None, unit_y="V", parent=self,
+            x_axis_item=TimeAxisItem(orientation='bottom')
         )
         
         # ✅ COLORE DAL TEMA (accent color)
@@ -1535,25 +1539,41 @@ class ReplayWindowAudio(ReplayBaseWindow):
             freq_axis, display_mags = self._compute_fft_for_display(frame_index)
             self.fft_curve.setData(freq_axis, display_mags)
 
-            # Color: darker accent for normalized, theme accent for raw
-            if getattr(self, '_using_normalized_means', True):
-                self.fft_curve.setPen({'color': self.theme_manager.get_darker_accent_color(), 'width': 2})
-            else:
-                if hasattr(self, 'theme_manager'):
+            # Color: darker accent for normalized, theme accent for raw.
+            # Re-applied only when the normalization MODE changes. This used to run
+            # on every tick, and get_darker_accent_color() opens and regexes the
+            # theme CSS from disk on each call — 60 file reads a second, plus a
+            # setPen() that invalidates the whole curve, to set an unchanged colour.
+            _norm = bool(getattr(self, '_using_normalized_means', True))
+            if _norm != getattr(self, '_fft_pen_mode', None):
+                self._fft_pen_mode = _norm
+                if _norm:
+                    self.fft_curve.setPen(
+                        {'color': self.theme_manager.get_darker_accent_color(),
+                         'width': 2})
+                elif hasattr(self, 'theme_manager'):
                     self.theme_manager.apply_theme_to_plot(
                         plot_widget_name=self.plot_widget_fft.plot_widget,
                         plot_instance=self.fft_curve
                     )
-        
+
         # UPDATE TIME DOMAIN
+        # Push data only when it has actually CHANGED. During playback this curve is
+        # static — the position line moves and the x-range scrolls — but it used to
+        # be handed the full array on every tick (66 000 overview points for a
+        # 110-minute recording), forcing a re-upload and a bounds recompute 60 times
+        # a second for identical data.
         if self.data_manager.contains_streaming_time(current_time_sec):
-            stream_x, stream_y = self.data_manager.get_streaming_data()
-            if len(stream_x) > 0:
-                self.time_curve.setData(stream_x, stream_y)
+            _src = 'stream'
+            _sx, _sy = self.data_manager.get_streaming_data()
         else:
-            overview_x, overview_y = self.data_manager.get_overview_data()
-            if len(overview_x) > 0:
-                self.time_curve.setData(overview_x, overview_y)
+            _src = 'overview'
+            _sx, _sy = self.data_manager.get_overview_data()
+        if len(_sx) > 0:
+            _token = (_src, id(_sx), len(_sx))
+            if _token != getattr(self, '_time_curve_token', None):
+                self._time_curve_token = _token
+                self.time_curve.setData(_sx, _sy)
         
         # UPDATE POSITION LINE
         if hasattr(self, 'time_position_line'):
@@ -1594,9 +1614,12 @@ class ReplayWindowAudio(ReplayBaseWindow):
     
     def _setup_metadata(self):
         """Setup metadati per playback"""
-        estimated_fft_rate = 390.0
+        # EXACTLY fs / fft_size — see the note in audio_load_progress.py. The old
+        # hardcoded 390.0 ran 0.16 % slow and drifted away from the exported CSVs.
         if self.data_manager.frame_duration_ms == 0:
-            self.data_manager.frame_duration_ms = 1000.0 / estimated_fft_rate
+            _fs  = self.data_manager.header_info.get('fs', 200_000) or 200_000
+            _n   = self.data_manager.header_info.get('fft_size', 512) or 512
+            self.data_manager.frame_duration_ms = 1000.0 * _n / _fs
         if self.data_manager.total_frames > 0:
             self.data_manager.total_duration_sec = (
                 self.data_manager.total_frames * self.data_manager.frame_duration_ms / 1000.0
@@ -1650,38 +1673,50 @@ class ReplayWindowAudio(ReplayBaseWindow):
         start_time = max(0, center_time_sec - window_size/2)
         end_time = min(self.data_manager.total_duration_sec, start_time + window_size)
         
+        # ── EARLY-OUT: the window did not actually move ───────────────────────
+        # Without this the buffer is rebuilt on EVERY playback tick for the first
+        # and last ~5 s of a recording. _check_streaming_buffer_update fires when
+        # the position is within 5 s of a buffer edge, and re-centring is supposed
+        # to clear that — but near t=0 `start_time` clamps to 0 and near the end
+        # `end_time` clamps to the duration, so the window CANNOT move and the
+        # trigger stays satisfied. Measured: rebuilt on 63 % of ticks over the
+        # first 8 s, each rebuild looping over 7812 frames in Python and handing
+        # pyqtgraph a brand-new array to re-upload. That is the playback stutter.
+        # Rebuild only when the new window would actually REVEAL data the buffer
+        # does not already hold. A window that merely slides its own left edge
+        # forward, dropping samples and adding none, is pure cost.
+        if (self.data_manager.streaming_x is not None
+                and len(self.data_manager.streaming_x) > 0
+                and start_time >= self.data_manager.streaming_start_time - 1e-9
+                and end_time <= self.data_manager.streaming_end_time + 1e-9):
+            return
+
         # Calcola frame range
         start_frame = int((start_time * 1000) / self.data_manager.frame_duration_ms)
         end_frame = int((end_time * 1000) / self.data_manager.frame_duration_ms)
         end_frame = min(end_frame, self.data_manager.total_frames)
+        start_frame = max(0, min(start_frame, end_frame))
         
         # ✅ MODIFICA CRITICA: USA TUTTE LE FFT (390 FPS) per non perdere click
         # Ogni click di 0.1-0.5ms è contenuto in UNA SINGOLA FFT
         # Se skippiamo anche solo 1 FFT, rischiamo di perdere il click!
-        frame_step = 1  # NON saltare nessuna FFT
-        
-        stream_x = []
-        stream_y = []
-        
-        for frame_idx in range(start_frame, end_frame, frame_step):
-            if frame_idx >= self.data_manager.total_frames:
-                break
-            
-            frame_time = (frame_idx * self.data_manager.frame_duration_ms) / 1000.0
+        # (Vettorializzato: identico al loop Python, ~90x piu veloce.)
+        idx = np.arange(start_frame, end_frame)
+        stream_x = idx * (self.data_manager.frame_duration_ms / 1000.0)
 
-            # Use pre-computed normalized fft_means when available (fast path).
-            # fft_means are pre-computed in precompute_fft_means using normalized magnitudes.
-            if frame_idx < len(self.data_manager.fft_means):
-                signal_sample = float(self.data_manager.fft_means[frame_idx])
-            else:
-                signal_sample = float(np.mean(np.abs(self.data_manager.fft_data[frame_idx])))
-            
-            stream_x.append(frame_time)
-            stream_y.append(signal_sample)
-        
+        # Use pre-computed normalized fft_means when available (fast path).
+        means = self.data_manager.fft_means
+        if means is not None and len(means) >= end_frame:
+            stream_y = np.asarray(means[start_frame:end_frame], dtype=np.float64)
+        else:
+            stream_y = np.array(
+                [float(np.mean(np.abs(self.data_manager.fft_data[i]))) for i in idx],
+                dtype=np.float64,
+            )
+
         # Update streaming buffer
-        self.data_manager.streaming_x = np.array(stream_x)
-        self.data_manager.streaming_y = np.array(stream_y)
+        self.data_manager.streaming_x = stream_x
+        self.data_manager.streaming_y = stream_y
         self.data_manager.streaming_start_time = start_time
         self.data_manager.streaming_end_time = end_time
         
@@ -1860,16 +1895,26 @@ class ReplayWindowAudio(ReplayBaseWindow):
         time_layout.addWidget(self.time_info_label)
         
         self.plot_widget_time = BasePlotWidget(
-            x_label="Time", y_label="Mean FFT Energy",
+            x_label="Time (h:mm:ss)", y_label="Mean FFT Energy",
             x_range=(0, 20), y_range=(0.00000005, 0.0000002),
             x_min=0, x_max=None, y_min=0, y_max=1e-4,
-            unit_x="s", unit_y="V²", parent=self
+            unit_x=None, unit_y="V²", parent=self,
+            x_axis_item=TimeAxisItem(orientation='bottom')
         )
         
         self.time_curve = self.plot_widget_time.plot_widget.plot(
             name="Average Amplitude Signal", pen={'color': 'blue', 'width': 1}
         )
         
+        # Bound the rendering cost by what is VISIBLE, not by array length. The view
+        # is limited to a 20 s window (setLimits below) while the overview curve
+        # spans the whole recording — 66 000 points for 110 minutes. Without
+        # clipToView pyqtgraph hands Qt every one of them on each repaint in order
+        # to draw the ~200 that are on screen. 'peak' downsampling is the right
+        # method here: it preserves spikes, and spikes are the click candidates.
+        self.time_curve.setClipToView(True)
+        self.time_curve.setDownsampling(auto=True, method='peak')
+
         # Position line
         self.time_position_line = self.plot_widget_time.plot_widget.addLine(
             x=0, pen={'color': 'red', 'width': 2, 'style': QtCore.Qt.DashLine}
@@ -2438,12 +2483,17 @@ class ReplayWindowAudio(ReplayBaseWindow):
         self.btn_detect_clicks.setEnabled(True)
         self.btn_export_detections.setEnabled(bool(self._v5_detections))
 
-        from core.click_pipeline_v5 import stage_summary
+        from core.click_pipeline_v5 import STAGE_BLOCKED_STAGE2, stage_summary
         counts = stage_summary(self._v5_detections)
+
+        # Sum every Stage-2 verdict rather than the two v5 ones: under the v6
+        # gates R2 and SPR are ~always zero, so adding just those reported
+        # "gates 0" on runs where the SNR/nseg/crest/harm gates did the work.
+        n_gates = sum(counts[v] for v in STAGE_BLOCKED_STAGE2)
 
         self.label_detect_status.setText(
             f"{counts['total']} candidates → {counts['confirmed']} confirmed  "
-            f"(gates {counts['Stage2_R2'] + counts['Stage2_SPR']}, "
+            f"(gates {n_gates}, "
             f"SVM {counts['Stage3_SVM']}, dedup {counts['Stage4_dedup']})"
         )
 
@@ -2465,13 +2515,18 @@ class ReplayWindowAudio(ReplayBaseWindow):
         self.detection_table.setRowCount(len(visible))
 
         # Tint per verdict, so the blocked rows read at a glance in 'All candidates'.
-        tints = {
+        # Every Stage-2 verdict shares the same grey: the distinction a reader
+        # wants at a glance is "gate / SVM / dedup", and the exact gate is already
+        # spelled out in the verdict column. Built from STAGE_BLOCKED_STAGE2 so a
+        # new gate cannot end up as the one untinted row in the table.
+        from core.click_pipeline_v5 import STAGE_BLOCKED_STAGE2
+        _GATE_GREY = QColor(120, 120, 120, 45)
+        tints = {v: _GATE_GREY for v in STAGE_BLOCKED_STAGE2}
+        tints.update({
             '':             QColor(46, 125, 50, 60),    # confirmed — green
-            'Stage2_R2':    QColor(120, 120, 120, 45),  # invalid fit — grey
-            'Stage2_SPR':   QColor(120, 120, 120, 45),
             'Stage3_SVM':   QColor(211, 47, 47, 45),    # SVM said noise — red
             'Stage4_dedup': QColor(255, 152, 0, 45),    # duplicate — amber
-        }
+        })
 
         for r, det in enumerate(visible):
             verdict = det.get('stage_blocked', '')
@@ -2545,34 +2600,100 @@ class ReplayWindowAudio(ReplayBaseWindow):
 
         try:
             import csv
-            from components.data_collection_dialog_v5 import CSV_COLUMNS, FEATURE_NAMES
+            from components.data_collection_dialog_v5 import (
+                CSV_COLUMNS, CandidateData, FEATURE_NAMES, FEATURE_NAMES_V6,
+                QUALITY_COLUMNS, STAGE1_COLUMNS, HARMONIC_COLUMNS,
+            )
+            from core.click_pipeline_v5 import (
+                STAGE1_MODE, PEAK_REFRACTORY_R, LOCAL_CREST_C, STAGE2_MODE,
+            )
+
+            k_used = self.PeakThresholdSpinBox.value()
+            stage1_params = (f'{STAGE1_MODE};k={k_used:.2f};'
+                             f'R={PEAK_REFRACTORY_R};C={LOCAL_CREST_C}')
+
+            # Detection ran through ClickDetectionWorker without a stage2_mode
+            # override, so the module default is what actually produced these
+            # verdicts. Recording it keeps replay exports comparable with the
+            # Data Collection dialog's, which has always filled this column.
+            stage2_mode_used = STAGE2_MODE
+
+            # STAGE1_COLUMNS is imported to be CHECKED, not iterated: the five
+            # fields below are passed explicitly because they are not all the
+            # same type (run_crest is a float, the rest are ints) and the Data
+            # Collection dialog writes them the same explicit way. The guard is
+            # what makes that safe — a column added to STAGE1_COLUMNS later fails
+            # loudly here instead of being written empty, which is the exact
+            # regression described in the comment below.
+            _stage1_passed = {
+                'run_id', 'run_length', 'run_crest', 'pos_in_run', 'would_pass_v5',
+            }
+            _stage1_missing = [c for c in STAGE1_COLUMNS if c not in _stage1_passed]
+            if _stage1_missing:
+                raise RuntimeError(
+                    f"replay export does not fill Stage 1 column(s) "
+                    f"{_stage1_missing}; add them to the CandidateData call below."
+                )
+
+            # Build a real CandidateData and let IT write the row.
+            #
+            # This exporter used to assemble the dict by hand, listing the columns it
+            # knew about. The header came from CSV_COLUMNS, so when the schema grew
+            # from 24 to 52 the header grew with it and the hand-written body did not:
+            # the v6 features, the quality flags and the Stage 1 diagnostics were
+            # emitted as ~24 permanently empty columns, silently. Going through
+            # to_csv_dict() means there is ONE row writer for both exporters — same
+            # columns, same per-column rounding, same NaN handling — and a column
+            # added later cannot be forgotten here.
+            def _f(det, name, default=float('nan')):
+                v = det.get(name, default)
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return default
+
+            def _i(det, name, default=0):
+                try:
+                    return int(det.get(name, default))
+                except (TypeError, ValueError):
+                    return default
 
             with open(path, 'w', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
                 writer.writeheader()
 
                 for det in rows:
-                    row = {
-                        'file': stem,
-                        'frame_idx': det.get('frame_idx', ''),
-                        'timestamp_s': round(det.get('timestamp_s', 0.0), 6),
-                        'noise_floor_mV': round(det.get('noise_floor', 0.0) * 1e3, 4),
-                        'std_noise_mV': round(det.get('std_noise', 0.0) * 1e3, 4),
-                        'E_hat_floor': round(det.get('E_hat_floor', 0.0), 6),
-                        'label': '',
-                        'svm_probability': (
-                            round(det['svm_probability'], 4)
-                            if det.get('svm_probability') is not None else ''
-                        ),
-                        'svm_prediction': (
-                            det['svm_prediction']
-                            if det.get('svm_prediction') is not None else ''
-                        ),
-                        'stage_blocked': det.get('stage_blocked', ''),
-                    }
-                    for name in FEATURE_NAMES:
-                        row[name] = det.get(name, '')
-                    writer.writerow(row)
+                    e_i, e_fl = det.get('E_i'), det.get('E_hat_floor')
+                    k_ratio = (float(e_i) / float(e_fl)
+                               if e_i is not None and e_fl else float('nan'))
+
+                    cd = CandidateData(
+                        file=stem,
+                        frame_idx=_i(det, 'frame_idx'),
+                        timestamp_s=_f(det, 'timestamp_s', 0.0),
+                        noise_floor=_f(det, 'noise_floor', 0.0),
+                        std_noise=_f(det, 'std_noise', 0.0),
+                        E_hat_floor=_f(det, 'E_hat_floor', 0.0),
+                        **{n: _f(det, n) for n in FEATURE_NAMES},
+                        **{n: _f(det, n) for n in FEATURE_NAMES_V6},
+                        **{n: _f(det, n) for n in HARMONIC_COLUMNS},
+                        **{n: _i(det, n) for n in QUALITY_COLUMNS},
+                        peak_abs=_i(det, 'peak_abs'),
+                        canonical_frame_idx=_i(det, 'canonical_frame_idx'),
+                        session_id=stem,
+                        stage1_params=stage1_params,
+                        stage2_mode=stage2_mode_used,
+                        k_ratio=k_ratio,
+                        run_id=_i(det, 'run_id', -1),
+                        run_length=_i(det, 'run_length'),
+                        run_crest=_f(det, 'run_crest'),
+                        pos_in_run=_i(det, 'pos_in_run'),
+                        would_pass_v5=_i(det, 'would_pass_v5'),
+                        svm_probability=det.get('svm_probability'),
+                        svm_prediction=det.get('svm_prediction'),
+                        stage_blocked=det.get('stage_blocked', ''),
+                    )
+                    writer.writerow(cd.to_csv_dict())
 
             QMessageBox.information(
                 self, "Exported", f"{len(rows)} row(s) written to:\n{path}"
@@ -2697,21 +2818,35 @@ class ReplayWindowAudio(ReplayBaseWindow):
         depending on _using_normalized_means.
         Always returns data in the analysis-band slice (len = freq_axis).
         """
-        raw_mags  = np.asarray(self.data_manager.fft_data[frame_index], dtype=np.float64)
-        freq_axis = np.array(self.data_manager.frequency_axis)
+        raw_mags = np.asarray(self.data_manager.fft_data[frame_index], dtype=np.float64)
+
+        # The frequency axis and the microphone gain curve are constant for a given
+        # file, but this ran on every playback tick: a full array copy plus an
+        # np.interp across the analysis band, 60 times a second, rebuilding
+        # identical numbers. Cached per (fs, fft_size).
+        fs       = self.data_manager.header_info.get('fs',       V5_FS)
+        fft_size = self.data_manager.header_info.get('fft_size', V5_FFT_SIZE)
+        key = (fs, fft_size, len(self.data_manager.frequency_axis))
+        if getattr(self, '_fft_disp_key', None) != key:
+            self._fft_disp_key  = key
+            self._fft_disp_axis = np.asarray(self.data_manager.frequency_axis,
+                                             dtype=np.float64)
+            _full_freq = np.arange(fft_size // 2) * (fs / fft_size)
+            # _normalize_fft is a pure per-bin multiply, so its result on a unit
+            # spectrum IS the gain vector and can be reused. Verified bit-exact.
+            self._fft_disp_gain  = _normalize_fft(np.ones(fft_size // 2), _full_freq)
+            self._fft_disp_nfull = fft_size // 2
+        freq_axis = self._fft_disp_axis
 
         if not getattr(self, '_using_normalized_means', True):
             # Raw — show as-is
             return freq_axis, raw_mags
 
         # Normalized — pad into full half-spectrum then apply mic correction
-        fs       = self.data_manager.header_info.get('fs',       V5_FS)
-        fft_size = self.data_manager.header_info.get('fft_size', V5_FFT_SIZE)
-        full_freq = np.arange(fft_size // 2) * (fs / fft_size)
-        full_mags = np.zeros(fft_size // 2, dtype=np.float64)
+        full_mags = np.zeros(self._fft_disp_nfull, dtype=np.float64)
         n_bins = min(len(raw_mags), V5_BIN_END - V5_BIN_START + 1)
         full_mags[V5_BIN_START : V5_BIN_START + n_bins] = raw_mags[:n_bins]
-        norm_mags = _normalize_fft(full_mags, full_freq)
+        norm_mags = full_mags * self._fft_disp_gain
         return freq_axis, norm_mags[V5_BIN_START : V5_BIN_START + len(freq_axis)]
 
     def _execute_trim_export(self, params):

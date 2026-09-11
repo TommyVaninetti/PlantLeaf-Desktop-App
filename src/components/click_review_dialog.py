@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QFileDialog, QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView,
     QSplitter, QScrollArea, QWidget, QMessageBox, QGroupBox, QSizePolicy,
+    QLineEdit, QFrame,
 )
 from PySide6.QtCore import Qt, QEvent
 from PySide6.QtGui import QPixmap, QColor, QFont
@@ -41,20 +42,76 @@ _N_COLS = 4
 # a feature footer at the bottom. Scaled down to fit a pane, that footer text is far too
 # small to read — so it is cropped away and the same numbers are shown in a real table
 # underneath instead (see _build_features_group).
-# Keep in step with the layout in data_collection_dialog_v5._render_candidate_screenshot.
-_CROP_TOP    = 40    # title strip
-_CROP_BOTTOM = 260   # feature footer
+# IMPORTED from the renderer, never duplicated. These were hand-tuned literals (40 /
+# 260) with only a comment asking future editors to keep them in step — so raising
+# the footer to fit the v6 features would have silently mis-cropped every screenshot,
+# with no error and no visible cause. Importing makes that impossible.
+from components.data_collection_dialog_v5 import (      # noqa: E402
+    SCREENSHOT_HEADER_H as _CROP_TOP,
+    SCREENSHOT_FOOTER_H as _CROP_BOTTOM,
+)
+# Same reasoning: the "region too short" banner is a threshold that lives in one
+# place, and a copy here would drift the day V6_MIN_NSEG moves.
+from core.spectral_analysis import V6_MIN_NSEG as _V6_MIN_NSEG   # noqa: E402
 
-# The 17 features in the order the v5 docs list them, each with a display precision.
+# Every feature the CSV may carry, each with a display precision. A name that is
+# absent from the CSV renders as "—" (see _update_features), so this list is safe
+# against both v5 (24-column) and v6 (51-column) files.
 _FEATURE_FMT = [
+    # ── v5, in the order the docs list them ──
     ('peak_SNR',     3), ('pre_SNR',    3), ('post_SNR',           3),
     ('rise_time_ms', 4), ('fall_time_ms', 4), ('asymmetry_integral', 4),
     ('ZCR_pre',      3), ('ZCR_click',  3), ('ZCR_post',           3),
     ('kurtosis',     2), ('centroid_shift_hz', 0),
     ('tau_ms',       4), ('R2',         4), ('fit_coverage',       3),
     ('SPR',          2), ('R_spectral', 3), ('FPE_hz',             0),
+    # ── v6 spectral family, computed on E[k] = max(0, P_region − P_noise) ──
+    ('spectral_entropy',       3), ('shape_novelty', 3),
+    ('spectral_tilt',          3), ('temporal_concentration', 3),
+    ('FPE_hz_region',          0), ('SPR_region',    2),
+    ('f_50_hz',                0), ('IQR_f',         0),
+    # ── Stage 1 v5.1 ──
+    # local_crest is a feature; the rest are diagnostics, shown because they are
+    # what a reviewer needs to judge a row that v5 would have deleted outright.
+    ('local_crest',            3), ('k_ratio',       2),
+    # harmonic_confinement: 0 = excess spread uniformly, >0 = confined to BOTH the
+    # fundamental and its second harmonic (an artificial ranging sensor / alarm),
+    # <0 = one of the two bands is empty. hc_f1_hz says which fundamental.
+    ('harmonic_confinement',   2), ('hc_f1_hz',      0),
+    ('hc_r_A',                 2), ('hc_r_B',        2),
+    ('run_length',             0), ('run_crest',     3),
+    ('pos_in_run',             0), ('would_pass_v5', 0),
 ]
-_FEATURE_COLS = 3    # number of name/value pairs laid side by side
+
+# ── Validity flags — shown SEPARATELY and first ──────────────────────────────
+# These are not features, they are the columns that say whether the features above
+# mean anything: a row with fit_valid = 0 has NaN τ/R²/coverage, and one with
+# b3_frames = 0 has no v6 features at all. Mixed in among 25 numbers they would be
+# missed, and a reviewer would judge a row on values that are not measurements.
+# `n_seg_valid` is NOT here: v6 has no such column, because it is exactly
+# `n_seg >= V6_MIN_NSEG`, and the banner below derives it rather than reading it.
+_QUALITY_FMT = [
+    ('fit_valid',   0), ('b3_frames',  0), ('n_seg',       0),
+    ('decay_len',   0), ('gibbs_fired', 0),
+]
+_FEATURE_COLS = 3    # name/value pairs side by side. History: 3 -> 5 -> 6 -> 4 -> 3.
+                     # Qt elides the NAME, not the number, so an over-wide grid fails
+                     # SILENTLY — a row reads "would_pass_v...: 1" and nothing says it
+                     # was cut. The grid must therefore fit at the dialog's MINIMUM
+                     # width, not at whatever size it happens to open at.
+                     #
+                     # Measured need for the 35-entry v6 table (widest name + a
+                     # "-48779.30" value cell, per column, + spacing):
+                     #     4 cols @ 11 pt -> ~1417 px   (what was cutting text)
+                     #     4 cols @  9 pt -> ~1239 px
+                     #     3 cols @ 11 pt -> ~1187 px
+                     #     3 cols @ 10 pt -> ~1094 px   <- fits under the 1100 minimum
+                     # 3 x 10 pt is the only combination that fits without the window
+                     # having to be widened, and it costs ~60 px of height (318 vs
+                     # 290) — spent against the height budget, not the width.
+_FEATURE_PT = 10     # explicit point size for the grid. The platform default (~13 on
+                     # macOS) is what made the names elide in the first place; the
+                     # numbers are what must stay readable and 10 pt keeps them so.
 
 
 def _to_float(value, default: float = float('nan')) -> float:
@@ -79,7 +136,20 @@ def _to_float(value, default: float = float('nan')) -> float:
 # Label values as they appear in the CSV
 LABEL_CLICK = '1'
 LABEL_NOISE = '0'
+LABEL_AMBIG = '2'   # genuinely uncertain: could be a click, could be noise
 LABEL_NONE  = ''
+
+#: The three values that mean "you have judged this row". AMBIGUOUS IS A LABEL,
+#: not a missing one — it must never show up under "Unlabelled only", and it must
+#: never be counted as click or noise.
+#:
+#: It exists because forcing a binary call on an uncertain event injects label
+#: noise into BOTH classes, and at ~100 positives a handful of wrongly-forced
+#: ones is a large fraction of the positive class. Recording the uncertainty
+#: keeps the decision reversible: it can be excluded, down-weighted, or treated
+#: as either class in a sensitivity check, and that is decided at training time
+#: rather than being baked in by the labeller.
+LABELS_DECIDED = (LABEL_CLICK, LABEL_NOISE, LABEL_AMBIG)
 
 # Row tint per verdict — a blocked candidate should be recognisable without reading.
 _VERDICT_TINT = {
@@ -134,10 +204,20 @@ class ClickReviewDialog(QDialog):
         self._pixmap = None           # the cropped screenshot (scaled on show/resize)
         self._png_index = None        # lower-cased name → path, built lazily
         self._click_names = None      # df row → 'click<sec>[_n].png', built lazily
+        self._note_row = None         # df row the note box is currently editing
+        # Must exist BEFORE _build_ui: the table's event filter is installed early
+        # in _build_ui, and any event arriving before the note box is constructed
+        # runs eventFilter, where a missing attribute raises inside a Qt virtual
+        # callback — which segfaults instead of raising.
+        self.note_edit = None
         self.screenshots_dir: Optional[Path] = None   # None → look beside the CSV
 
         self.setWindowTitle("Click Review — label candidates")
-        self.setMinimumSize(1100, 700)
+        # Minimum width is what the feature grid is sized against (see
+        # _FEATURE_COLS): the grid must not elide at the smallest the window can be,
+        # because elision is silent. Height covers the taller 3-column grid.
+        self.setMinimumSize(1100, 760)
+        self.resize(1280, 920)
 
         self._build_ui()
         self._apply_theme()
@@ -176,6 +256,9 @@ class ClickReviewDialog(QDialog):
             "Confirmed clicks",
             "Rejected by SVM (Stage3_SVM)",
             "Blocked by gates (Stage 2)",
+            # APPEND ONLY — _refresh_table branches on the raw index below.
+            "Needs review (v6 queue)",
+            "Ambiguous only",
         ])
         self.combo_filter.currentIndexChanged.connect(self._refresh_table)
         file_row.addWidget(self.combo_filter)
@@ -186,6 +269,8 @@ class ClickReviewDialog(QDialog):
             "P(click) — highest first",
             "P(click) — lowest first",
             "Frame order",
+            # APPEND ONLY — _refresh_table branches on the raw index below.
+            "Review queue (tier order)",
         ])
         self.combo_sort.currentIndexChanged.connect(self._refresh_table)
         file_row.addWidget(self.combo_sort)
@@ -209,14 +294,18 @@ class ClickReviewDialog(QDialog):
         # The table keeps focus while labelling, so it must forward our keys (see eventFilter).
         self.table.installEventFilter(self)
         hdr = self.table.horizontalHeader()
-        # Label is content-sized, never stretched: it is the column being edited, so it
-        # must always be fully visible. Verdict absorbs the slack instead — it holds the
-        # longest and most variable text ('Stage4_dedup'), and it is the one that can be
-        # clipped without costing the user anything.
-        for c in (_COL_TIME, _COL_PROB, _COL_LABEL):
+        # Label absorbs the slack. It is the column being edited and the one the eye
+        # returns to after every keystroke, so it gets the room; Verdict is
+        # content-sized instead. (This was the other way round, on the reasoning that
+        # Verdict holds the longest text — but 'Stage4_dedup' is a fixed vocabulary
+        # that ResizeToContents fits exactly, so stretching it only padded whitespace.)
+        for c in (_COL_TIME, _COL_PROB, _COL_VERDICT):
             hdr.setSectionResizeMode(c, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(_COL_VERDICT, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(_COL_LABEL, QHeaderView.Stretch)
         hdr.setStretchLastSection(False)   # otherwise it overrides the mode above
+        # NOTE: no setMinimumSectionSize here. It is a HEADER-wide floor, not a
+        # per-column one, so raising it to widen Label would pad Time / P(click) /
+        # Verdict to the same width and take back the slack Stretch just gave Label.
         self.table.setMinimumWidth(360)
         splitter.addWidget(self.table)
 
@@ -248,11 +337,33 @@ class ClickReviewDialog(QDialog):
         # ── Metrics ──
         root.addWidget(self._build_metrics_group())
 
+        # ── Note editor ──
+        # Free text per row, saved with the labels. Deliberately a single line and
+        # deliberately NOT in the table: it must be reachable without breaking the
+        # 1/0/Space rhythm, and a multi-line box would swallow Enter.
+        note_row = QHBoxLayout()
+        note_lbl = QLabel("Note:")
+        note_lbl.setStyleSheet("QLabel { font-weight: bold; }")
+        note_row.addWidget(note_lbl)
+        self.note_edit = QLineEdit()
+        self.note_edit.setPlaceholderText(
+            "free text for this row — Enter or Tab saves, Esc returns to the list"
+        )
+        self.note_edit.setClearButtonEnabled(True)
+        # Saved on Enter and on focus loss. Focus loss covers the case that actually
+        # loses work: typing a note and then clicking the next row without pressing
+        # Enter. _show_row also flushes before it moves, so keyboard navigation
+        # cannot drop one either.
+        self.note_edit.editingFinished.connect(self._commit_note)
+        self.note_edit.installEventFilter(self)
+        note_row.addWidget(self.note_edit, stretch=1)
+        root.addLayout(note_row)
+
         # ── Bottom bar ──
         bottom = QHBoxLayout()
         hint = QLabel(
-            "Keys:  1 = click   0 = noise   Backspace = clear   "
-            "Space / ↓ = next   ↑ = previous"
+            "Keys:  1 = click   0 = noise   2 = ambiguous   Backspace = clear   "
+            "Space / ↓ = next   ↑ = previous   N = note"
         )
         hint.setStyleSheet("QLabel { color: gray; font-style: italic; }")
         bottom.addWidget(hint)
@@ -265,6 +376,17 @@ class ClickReviewDialog(QDialog):
         self.btn_close.clicked.connect(self.accept)
         bottom.addWidget(self.btn_close)
         root.addLayout(bottom)
+
+        # NO default button anywhere in this dialog. Qt promotes the first
+        # autoDefault QPushButton it finds, so Return pressed in any line edit was
+        # activating whatever that happened to be — 'Close' in the note box's case,
+        # which shut the window mid-note, and 'Open CSV...' from anywhere else.
+        # Clearing the flag on every button kills the whole class of bug rather than
+        # the one instance of it. This dialog saves continuously and has no
+        # confirm-and-dismiss action, so it has nothing a default button is for.
+        for _btn in self.findChildren(QPushButton):
+            _btn.setAutoDefault(False)
+            _btn.setDefault(False)
 
     def _build_features_group(self):
         """
@@ -281,13 +403,25 @@ class ClickReviewDialog(QDialog):
 
         name_font = QFont()
         name_font.setBold(True)
+        name_font.setPointSize(_FEATURE_PT)
         value_font = QFont("Courier New")
+        value_font.setPointSize(_FEATURE_PT)
 
         self._feature_values = {}   # feature name → its value QLabel
 
+        # ── Validity banner — spans the grid, above everything ───────────────
+        # Plain text, red when anything is wrong. A reviewer must see "this row's
+        # numbers are not measurements" before reading the numbers, not after.
+        self.validity_lbl = QLabel("")
+        self.validity_lbl.setWordWrap(True)
+        vf = QFont(); vf.setBold(True)
+        self.validity_lbl.setFont(vf)
+        grid.addWidget(self.validity_lbl, 0, 0, 1, _FEATURE_COLS * 2)
+
+        row0 = 1
         n_rows = -(-len(_FEATURE_FMT) // _FEATURE_COLS)   # ceil
         for idx, (name, _prec) in enumerate(_FEATURE_FMT):
-            r = idx % n_rows
+            r = row0 + idx % n_rows
             c = idx // n_rows
 
             name_lbl = QLabel(f"{name}:")
@@ -301,6 +435,33 @@ class ClickReviewDialog(QDialog):
             grid.addWidget(value_lbl, r, c * 2 + 1)
             self._feature_values[name] = value_lbl
 
+        # ── Quality flags below the features, visually separated ──────────────
+        # WRAPPED at _FEATURE_COLS like the features above. They used to be laid on
+        # a single row, which was fine at 6 columns and silently wider than the whole
+        # feature grid at 4 — one over-long row stretches the QGroupBox and undoes
+        # the horizontal saving the narrower grid was made for.
+        # A real rule between the two, because the comment above used to claim
+        # "visually separated" while nothing separated them: the flags read as four
+        # more features, which is the opposite of the point. They are what say
+        # whether the numbers above are measurements at all.
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        grid.addWidget(sep, row0 + n_rows, 0, 1, _FEATURE_COLS * 2)
+
+        qrow0 = row0 + n_rows + 1
+        for idx, (name, _prec) in enumerate(_QUALITY_FMT):
+            r = qrow0 + idx // _FEATURE_COLS
+            c = idx % _FEATURE_COLS
+            name_lbl = QLabel(f"{name}:")
+            name_lbl.setFont(name_font)
+            value_lbl = QLabel("—")
+            value_lbl.setFont(value_font)
+            value_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            grid.addWidget(name_lbl,  r, c * 2)
+            grid.addWidget(value_lbl, r, c * 2 + 1)
+            self._feature_values[name] = value_lbl
+
         # Let the value columns take the slack, so the names stay tight against them.
         for c in range(_FEATURE_COLS):
             grid.setColumnStretch(c * 2 + 1, 1)
@@ -310,7 +471,8 @@ class ClickReviewDialog(QDialog):
 
     def _update_features(self, i: Optional[int]):
         """Refresh the feature panel for df row `i` (None → clear it)."""
-        for name, _prec in _FEATURE_FMT:
+        fmt = dict(_FEATURE_FMT + _QUALITY_FMT)
+        for name, _prec in _FEATURE_FMT + _QUALITY_FMT:
             label = self._feature_values[name]
 
             if i is None or self.df is None or name not in self.df.columns:
@@ -322,8 +484,63 @@ class ClickReviewDialog(QDialog):
                 label.setText("—")
                 continue
 
-            prec = dict(_FEATURE_FMT)[name]
-            label.setText(f"{value:.{prec}f}")
+            label.setText(f"{value:.{fmt[name]}f}")
+
+        self._load_note(i)
+        self._update_validity(i)
+
+    def _update_validity(self, i: Optional[int]):
+        """
+        Say plainly when the numbers above are not measurements.
+
+        A row with fit_valid = 0 carries NaN for τ / R² / fit_coverage; one with
+        b3_frames = 0 has no Buffer-3 estimate so every v6 feature is NaN; one with
+        n_seg below V6_MIN_NSEG has a region too short for the 12-band grid, which
+        biases entropy toward 1 (§4.3). Those rows are exactly review tier 4 — the
+        population that has never been labelled by anyone — so the warning has to
+        be impossible to miss rather than one "—" among twenty-five numbers.
+        """
+        if i is None or self.df is None:
+            self.validity_lbl.setText("")
+            return
+
+        def _flag(col, default=1.0):
+            if col not in self.df.columns:
+                return None
+            v = _to_float(self.df.at[i, col])
+            return default if v != v else v
+
+        warn = []
+        if _flag('fit_valid') == 0:
+            warn.append("FIT INVALID — τ / R² / fit_coverage are not meaningful")
+        if _flag('b3_frames') == 0:
+            warn.append("NO BUFFER-3 ESTIMATE — every v6 spectral feature is unavailable")
+        # Derived, not read: v6 has no n_seg_valid column. Development-era
+        # and older CSVs still carry it, so honour it when it is there and fall
+        # back to the definition when it is not.
+        n_seg_ok = _flag('n_seg_valid')
+        if n_seg_ok is None:
+            n_seg = _flag('n_seg', float('nan'))
+            n_seg_ok = 1 if (n_seg != n_seg or n_seg >= _V6_MIN_NSEG) else 0
+        if n_seg_ok == 0:
+            warn.append("REGION TOO SHORT — bands correlated, entropy biased high (§4.3)")
+        if _flag('gibbs_fired', 0.0) == 1:
+            warn.append("Gibbs fade fired — the noise subtraction is biased on this frame")
+
+        note = str(self.df.at[i, 'migration_note']) if 'migration_note' in self.df.columns else ''
+        tier = _flag('review_tier', float('nan'))
+
+        parts = []
+        if warn:
+            parts.append("⚠  " + "   ·   ".join(warn))
+        if tier == tier and tier:
+            parts.append(f"review tier {int(tier)}" + (f" — {note}" if note else ""))
+        elif note:
+            parts.append(note)
+
+        self.validity_lbl.setText("\n".join(parts))
+        self.validity_lbl.setStyleSheet(
+            "color: #d84343;" if warn else "color: #8a8a8a;")
 
     def _build_metrics_group(self):
         group = QGroupBox("Your labels vs. the algorithm")
@@ -393,6 +610,40 @@ class ClickReviewDialog(QDialog):
         if 'label' not in df.columns:
             df['label'] = LABEL_NONE
 
+        # Normalise the label spelling. The existing corpus is a documented mix of
+        # '1' / '1.0' / '0' / '0.0' / '' (migrate_labels_v6.py:100). A '1.0' here
+        # fails three ways at once and silently: the table cell renders blank, the
+        # row hides under "Unlabelled only", and the metrics count it as neither
+        # class — so a labelled click looks unlabelled and is labelled again.
+        def _norm_label(v):
+            s = str(v).strip().replace(',', '.')
+            if not s:
+                return LABEL_NONE
+            try:
+                f = float(s)
+            except ValueError:
+                return LABEL_NONE
+            if f == 1.0:
+                return LABEL_CLICK
+            if f == 0.0:
+                return LABEL_NOISE
+            if f == 2.0:
+                return LABEL_AMBIG
+            # ⚠️ Anything else becomes UNLABELLED, which is destructive: reopening
+            # the file would erase the judgement. That is exactly what would have
+            # happened to every '2' before it was added above — the feature would
+            # have quietly deleted its own data on the next load. Any future label
+            # value must be added here FIRST.
+            return LABEL_NONE
+
+        df['label'] = df['label'].map(_norm_label)
+        # Older CSVs predate the note column. Create it rather than disabling the
+        # editor, so a file exported before notes existed can still be annotated —
+        # the column is simply written on the next save.
+        if 'note' not in df.columns:
+            df['note'] = ''
+
+        self._note_row = None     # the previous file's row index means nothing here
         self.df = df
         self.csv_path = path
         self._png_index = None    # new folder → rebuild the screenshot index lazily
@@ -433,6 +684,16 @@ class ClickReviewDialog(QDialog):
             rows = [i for i in rows if self._verdict(i) == 'Stage3_SVM']
         elif mode == 4 and self._is_classified():
             rows = [i for i in rows if self._verdict(i).startswith('Stage2')]
+        elif mode == 5 and 'needs_review' in self.df.columns:
+            # The v6 review queue produced by scripts/migrate_labels_v6.py. Rows
+            # whose label migrated cleanly are already settled and are not here.
+            rows = [i for i in rows
+                    if _to_float(self.df.at[i, 'needs_review'], 0.0) == 1]
+        elif mode == 6:
+            # Your own uncertainty, collected in one place — so a second pass can
+            # revisit them together once you have seen the whole recording and know
+            # what its clicks actually look like.
+            rows = [i for i in rows if self.df.at[i, 'label'] == LABEL_AMBIG]
 
         # ── Sort ──
         sort_mode = self.combo_sort.currentIndex()
@@ -440,6 +701,26 @@ class ClickReviewDialog(QDialog):
             rows.sort(key=self._prob, reverse=True)
         elif sort_mode == 1:
             rows.sort(key=self._prob)
+        elif sort_mode == 3 and 'review_tier' in self.df.columns:
+            # Tier order, then click-likeness within a tier. Tier 1 (ambiguous
+            # migrations, including outright contradictions) must be adjudicated
+            # first because everything downstream inherits those decisions.
+            # Unflagged rows sort last rather than being hidden.
+            #
+            # ⚠️ ASCENDING on clicklike_rank, and the sign matters. The rank is a
+            # Euclidean z-distance to the positive centroid, so SMALLER = MORE
+            # click-like (migrate_labels_v6.positive_envelope). This read
+            # `-_to_float(...)`, which put the LEAST click-like rows first — in the
+            # one queue whose whole purpose is to surface the most promising
+            # unlabelled rows. The migration writer sorts ascending
+            # (migrate_labels_v6.py, the new_rows.sort near the end); the two must
+            # agree, and verify_review_layout.py now asserts that they do.
+            rows.sort(key=lambda i: (
+                _to_float(self.df.at[i, 'review_tier'], 99.0) or 99.0,
+                _to_float(self.df.at[i, 'clicklike_rank'], 0.0)
+                if 'clicklike_rank' in self.df.columns else 0.0,
+                _to_float(self.df.at[i, 'frame_idx'], 0.0),
+            ))
         else:
             rows.sort(key=lambda i: _to_float(self.df.at[i, 'frame_idx'], 0.0))
 
@@ -460,7 +741,7 @@ class ClickReviewDialog(QDialog):
                 f"{ts:.3f}" if ts == ts else '—',   # NaN-safe
                 f"{prob:.3f}" if prob >= 0 else '—',
                 ('CLICK' if verdict == '' else verdict) if self._is_classified() else '—',
-                {LABEL_CLICK: 'click', LABEL_NOISE: 'noise'}.get(
+                {LABEL_CLICK: 'click', LABEL_NOISE: 'noise', LABEL_AMBIG: 'ambiguous'}.get(
                     self.df.at[i, 'label'], ''),
             ]
 
@@ -487,8 +768,57 @@ class ClickReviewDialog(QDialog):
         return self.visible_rows[r]
 
     def _search_root(self) -> Path:
-        """Where to look for screenshots: the chosen folder, else beside the CSV."""
-        return self.screenshots_dir or self.csv_path.parent
+        """The single best root, kept for callers that want one path to show."""
+        roots = self._search_roots()
+        return roots[0] if roots else self.csv_path.parent
+
+    def _search_roots(self) -> list:
+        """
+        Every directory worth searching for this CSV's screenshots, best first.
+
+        The export writes ONE FOLDER PER RECORDING under two sibling trees:
+
+            <out>/CSVs/<stem>/<stem>_candidates.csv
+            <out>/screenshots/<stem>/<stem>_<frame>.png
+
+        so the screenshots are NOT under the CSV's own folder, nor under its
+        parent — searching `csv_path.parent` alone (which is what this did) finds
+        nothing at all under that layout. Walk up instead, and take any
+        `screenshots` tree found on the way, so the older flat layout
+        (`<out>/<stem>_candidates.csv` beside `<out>/screenshots/`) keeps working
+        without a migration.
+
+        An explicitly chosen folder always wins and is used alone: if the user
+        picked a directory, second-guessing them with inferred ones would show a
+        screenshot from somewhere they did not ask for.
+        """
+        if self.screenshots_dir:
+            return [self.screenshots_dir]
+        if self.csv_path is None:
+            return []
+
+        roots, seen = [], set()
+
+        def _add(p: Path):
+            try:
+                rp = p.resolve()
+            except OSError:
+                return
+            if rp not in seen and p.is_dir():
+                seen.add(rp)
+                roots.append(p)
+
+        here = self.csv_path.parent
+        # Up to three levels: <stem>/ -> CSVs/ -> <out>/. Bounded deliberately —
+        # an unbounded walk to / would index the whole disk on a stray CSV.
+        for up in (here, here.parent, here.parent.parent):
+            shots = up / SCREENSHOTS_FOLDER
+            if shots.is_dir():
+                # Prefer this recording's own sub-folder when it exists.
+                _add(shots / self.csv_path.stem.replace('_candidates', ''))
+                _add(shots)
+        _add(here)
+        return roots
 
     def _png_lookup(self):
         """
@@ -500,8 +830,11 @@ class ClickReviewDialog(QDialog):
         """
         if self._png_index is None:
             self._png_index = {}
-            for png in self._search_root().rglob('*.png'):
-                self._png_index.setdefault(png.name.lower(), png)
+            for root in self._search_roots():
+                for png in root.rglob('*.png'):
+                    # setdefault, not assignment: _search_roots is ordered
+                    # best-first, so the first root to supply a name wins.
+                    self._png_index.setdefault(png.name.lower(), png)
         return self._png_index
 
     def _click_ordinals(self) -> dict:
@@ -556,12 +889,16 @@ class ClickReviewDialog(QDialog):
         2. The user's CLICK<second> convention (see _click_ordinals), for screenshots
            kept from an earlier analysis.
         """
-        root = self._search_root()
-
         standard = f"{stem}_{frame:06d}.png"
-        direct = root / SCREENSHOTS_FOLDER / standard
-        if direct.exists():
-            return direct
+        # Fast path: try the exact places the export writes to, so the common case
+        # costs a couple of stat() calls and never builds the whole index.
+        for root in self._search_roots():
+            for direct in (root / standard,
+                           root / stem / standard,
+                           root / SCREENSHOTS_FOLDER / standard,
+                           root / SCREENSHOTS_FOLDER / stem / standard):
+                if direct.exists():
+                    return direct
 
         index = self._png_lookup()
 
@@ -598,7 +935,11 @@ class ClickReviewDialog(QDialog):
             self.image_label.setText(
                 f"No screenshot found for frame {frame}\n\n"
                 f"Looked for {tried}\n"
-                f"under {self._search_root()} (including sub-folders)"
+                # Every root, not just the first: with the per-recording layout
+                # there are several, and naming one of them would send the user
+                # to check a directory that was never the problem.
+                + "under:\n" + "\n".join(f"  {r}" for r in self._search_roots())
+                + "\n(including sub-folders)"
             )
             return
 
@@ -646,6 +987,25 @@ class ClickReviewDialog(QDialog):
         keyPressEvent on the dialog alone never fires. Filtering the table's events is
         the only way 1/0 reach us.
         """
+        # While the note box has focus, EVERY key belongs to it — '1' and '0' are
+        # ordinary characters in a note, and routing them to the labeller would
+        # silently relabel the row the user is annotating. Only Escape is taken,
+        # to hand focus back to the list.
+        if self.note_edit is not None and obj is self.note_edit \
+                and event.type() == QEvent.KeyPress:
+            # Return/Enter in a QLineEdit propagates to the dialog's default button,
+            # which closed the whole review window mid-note. Commit and swallow it:
+            # in this dialog Enter means "save this note", never "I am done here".
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                self._commit_note()
+                self.table.setFocus()
+                return True
+            if event.key() == Qt.Key_Escape:
+                self._commit_note()
+                self.table.setFocus()
+                return True
+            return False
+
         if obj is self.table and event.type() == QEvent.KeyPress:
             if self._handle_label_key(event.key()):
                 return True   # consumed — don't let the table also act on it
@@ -661,10 +1021,17 @@ class ClickReviewDialog(QDialog):
             self._set_label(LABEL_CLICK, advance=True)
         elif key == Qt.Key_0:
             self._set_label(LABEL_NOISE, advance=True)
+        elif key == Qt.Key_2:
+            # Ambiguous. Advances like 1/0 because it IS a decision — the whole
+            # point is that you can move on without inventing certainty.
+            self._set_label(LABEL_AMBIG, advance=True)
         elif key in (Qt.Key_Backspace, Qt.Key_Delete):
             self._set_label(LABEL_NONE, advance=False)
         elif key == Qt.Key_Space:
             self._advance()
+        elif key == Qt.Key_N:
+            self.note_edit.setFocus()
+            self.note_edit.selectAll()
         else:
             return False
         return True
@@ -682,7 +1049,7 @@ class ClickReviewDialog(QDialog):
 
         # Reflect it in the table without rebuilding (which would move the cursor).
         r = self.table.currentRow()
-        text = {LABEL_CLICK: 'click', LABEL_NOISE: 'noise'}.get(value, '')
+        text = {LABEL_CLICK: 'click', LABEL_NOISE: 'noise', LABEL_AMBIG: 'ambiguous'}.get(value, '')
         self.table.item(r, _COL_LABEL).setText(text)
 
         self._save()
@@ -690,6 +1057,37 @@ class ClickReviewDialog(QDialog):
 
         if advance:
             self._advance()
+
+    def _commit_note(self):
+        """
+        Write the note box back to the row it was opened on.
+
+        Keyed to `self._note_row`, NOT to the current selection: editingFinished
+        fires on focus loss, which can arrive after the user has already clicked a
+        different row, and writing to the current row would put the note on the
+        wrong candidate.
+        """
+        i = self._note_row
+        if i is None or self.df is None or 'note' not in self.df.columns:
+            return
+        new = self.note_edit.text()
+        if str(self.df.at[i, 'note']) == new:
+            return                      # nothing changed — don't rewrite the CSV
+        self.df.at[i, 'note'] = new
+        self._save()
+
+    def _load_note(self, i):
+        """Point the note box at row i, flushing whatever was in it first."""
+        if self._note_row is not None and self._note_row != i:
+            self._commit_note()
+        self._note_row = i
+        if self.df is None or i is None or 'note' not in self.df.columns:
+            self.note_edit.clear()
+            self.note_edit.setEnabled(False)
+            return
+        self.note_edit.setEnabled(True)
+        v = self.df.at[i, 'note']
+        self.note_edit.setText('' if v != v else str(v))   # NaN -> ''
 
     def _advance(self):
         r = self.table.currentRow()
@@ -704,7 +1102,23 @@ class ClickReviewDialog(QDialog):
         session is far more expensive than a rewrite, so there is no explicit Save.
         """
         try:
-            self.df.to_csv(self.csv_path, index=False)
+            # Write to a sibling temp file and rename over the original. to_csv()
+            # truncates in place, so a crash or a full disk mid-write used to leave
+            # a half-written CSV and lose every label in it — and this runs after
+            # EVERY keystroke. os.replace is atomic on the same filesystem.
+            import os
+            import tempfile
+            fd, tmp = tempfile.mkstemp(dir=str(self.csv_path.parent),
+                                       prefix='.' + self.csv_path.name + '.',
+                                       suffix='.tmp')
+            os.close(fd)
+            try:
+                self.df.to_csv(tmp, index=False)
+                os.replace(tmp, self.csv_path)
+            except BaseException:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+                raise
         except Exception as e:
             QMessageBox.warning(
                 self, "Could not save",
@@ -720,19 +1134,26 @@ class ClickReviewDialog(QDialog):
         total = len(self.df)
         n_click = int((self.df['label'] == LABEL_CLICK).sum())
         n_noise = int((self.df['label'] == LABEL_NOISE).sum())
-        labelled = n_click + n_noise
+        n_ambig = int((self.df['label'] == LABEL_AMBIG).sum())
+        # Ambiguous counts as PROGRESS (you have judged the row) but as neither
+        # class. Counting it as unlabelled would make the bar never finish; counting
+        # it as a class would be the binary forcing the label exists to avoid.
+        labelled = n_click + n_noise + n_ambig
 
         # Your own tally, from the label column alone. It must never depend on the
         # verdict column: these are your labels, and they are just as real on a CSV
         # exported without Stages 2-4 as on one exported with them.
         self.label_progress.setText(
             f"{labelled} / {total} labelled   —   {n_click} click, {n_noise} noise"
+            + (f", {n_ambig} ambiguous" if n_ambig else "")
         )
 
         if not self._is_classified():
             # No verdicts to compare against, but the counts above are still yours to see.
             self.label_confusion.setText(
-                f"You marked {n_click} click / {n_noise} noise of {total} candidates.\n"
+                f"You marked {n_click} click / {n_noise} noise"
+                + (f" / {n_ambig} ambiguous" if n_ambig else "")
+                + f" of {total} candidates.\n"
                 f"No algorithm verdicts in this CSV — re-export with 'Run Stages 2-4' "
                 f"enabled to compare them."
             )
@@ -740,10 +1161,14 @@ class ClickReviewDialog(QDialog):
             return
 
         # Confusion of the user's labels against the pipeline's confirmed clicks.
+        # AMBIGUOUS IS EXCLUDED, explicitly: it has no true class, so it belongs in
+        # none of the four cells and would corrupt recall/precision if forced into
+        # one. It was already excluded by falling through both branches below, but
+        # silently — stated here so a future edit cannot "fix" it into a class.
         tp = fp = fn = tn = 0
         for i in range(total):
             lab = self.df.at[i, 'label']
-            if lab == LABEL_NONE:
+            if lab in (LABEL_NONE, LABEL_AMBIG):
                 continue
             predicted_click = self._verdict(i) == ''
             if lab == LABEL_CLICK:
@@ -755,6 +1180,7 @@ class ClickReviewDialog(QDialog):
 
         self.label_confusion.setText(
             f"TP={tp}   FP={fp}   FN={fn}   TN={tn}"
+            + (f"      ({n_ambig} ambiguous, excluded)" if n_ambig else "")
         )
 
         if tp + fn == 0 and tp + fp == 0:

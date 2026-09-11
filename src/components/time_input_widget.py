@@ -21,6 +21,32 @@ from PySide6.QtGui import QValidator, QDoubleValidator
 import re
 
 
+def format_hms(seconds: float) -> str:
+    """
+    Seconds -> "H:MM:SS.ss".
+
+    Hours are always shown so the field never changes width mid-playback, which
+    would make the label jitter. Two decimals keep sub-second position visible:
+    a frame is 2.56 ms, and clicks are located to the frame.
+    """
+    try:
+        total = float(seconds)
+    except (TypeError, ValueError):
+        total = 0.0
+    if total < 0 or total != total:          # negative or NaN
+        total = 0.0
+    hours, rem = divmod(total, 3600.0)
+    minutes, secs = divmod(rem, 60.0)
+    # Guard the 59.995 -> "60.00" carry that would print e.g. 0:01:60.00
+    if round(secs, 2) >= 60.0:
+        secs = 0.0
+        minutes += 1
+        if minutes >= 60:
+            minutes = 0
+            hours += 1
+    return f"{int(hours)}:{int(minutes):02d}:{secs:05.2f}"
+
+
 class TimeInputWidget(QLineEdit):
     """
     Widget per input/display del tempo corrente.
@@ -37,12 +63,17 @@ class TimeInputWidget(QLineEdit):
         self.is_editing = False
         
         # ✅ FIX: Dimensione ridotta e allineamento
-        self.setFixedWidth(180)
+        # Width and max length sized for the H:MM:SS.ss/H:MM:SS.ss readout, which is
+        # 21 characters ("0:20:34.56/1:50:00.00"). The previous 20-character cap was
+        # set for the old "1234.56/6600.00s" form and silently TRUNCATED the new one,
+        # dropping the last digit of the total duration.
+        self.setFixedWidth(210)
         self.setAlignment(Qt.AlignCenter)
-        self.setPlaceholderText("0.00/0.00s")
-        
+        self.setPlaceholderText("0:00:00.00/0:00:00.00")
+
         # Validatore permissivo (accetta numeri, ":", ".")
-        self.setMaxLength(20)
+        # Generous enough for the display string plus a hand-typed value.
+        self.setMaxLength(32)
         
         # Connessioni
         self.editingFinished.connect(self._on_editing_finished)
@@ -67,7 +98,8 @@ class TimeInputWidget(QLineEdit):
         if total_sec is not None:
             self.total_duration_sec = total_sec
         
-        display_text = f"{current_sec:.2f}/{self.total_duration_sec:.2f}s"
+        display_text = (f"{format_hms(current_sec)}"
+                        f"/{format_hms(self.total_duration_sec)}")
         self.blockSignals(True)
         self.setText(display_text)
         self.blockSignals(False)
@@ -87,7 +119,7 @@ class TimeInputWidget(QLineEdit):
         
         # Mostra solo la parte editabile (prima della /)
         self.blockSignals(True)
-        self.setText(f"{self.current_time_sec:.2f}")
+        self.setText(format_hms(self.current_time_sec))
         self.selectAll()  # Seleziona tutto per facilitare sovrascrittura
         self.blockSignals(False)
         
@@ -173,33 +205,48 @@ class TimeInputWidget(QLineEdit):
     
     def _parse_time_input(self, text: str) -> float:
         """
-        Parse intelligente di input tempo.
-        Supporta:
-        - "123.45" → 123.45s
-        - "1:30" → 90s
-        - "1:30.5" → 90.5s
-        - "90s" → 90s
+        Parse a time input into seconds, accepting every reasonable spelling.
+
+            "90"          -> 90.0        plain seconds
+            "90.5"        -> 90.5
+            "1:30"        -> 90.0        M:SS
+            "1:30.5"      -> 90.5
+            "0:01:30"     -> 90.0        H:MM:SS
+            "1:49:36.42"  -> 6576.42     H:MM:SS.ss  (the display format)
+
+        A single dot is always a decimal fraction, never a field separator, so
+        "1:30.5" is unambiguously 90.5 s. That is why H:MM.SS is NOT accepted:
+        it cannot be told apart from M:SS.s without guessing.
+
+        The display uses H:MM:SS.ss, but typing plain seconds has always worked and
+        that habit is preserved deliberately. Returns None on anything unparseable,
+        which the caller renders as the invalid style.
         """
         text = text.strip().lower().replace('s', '')
-        
+        if not text:
+            return None
+
         try:
-            # Formato MM:SS o MM:SS.ms
             if ':' in text:
                 parts = text.split(':')
-                if len(parts) != 2:
-                    return None
-                
-                minutes = float(parts[0])
-                seconds = float(parts[1])
-                
-                return minutes * 60 + seconds
-            
-            # Formato semplice: secondi
+                if len(parts) == 2:
+                    minutes, seconds = float(parts[0]), float(parts[1])
+                    if seconds >= 60:
+                        return None
+                    return minutes * 60.0 + seconds
+                if len(parts) == 3:
+                    hours, minutes = float(parts[0]), float(parts[1])
+                    seconds = float(parts[2])
+                    if minutes >= 60 or seconds >= 60:
+                        return None
+                    return hours * 3600.0 + minutes * 60.0 + seconds
+                return None
+
             return float(text)
-        
+
         except ValueError:
             return None
-    
+
     def _set_normal_style(self):
         """Stile normale (solo display) - ✅ INHERIT FONT DA TOOLBAR"""
         self.setReadOnly(False)

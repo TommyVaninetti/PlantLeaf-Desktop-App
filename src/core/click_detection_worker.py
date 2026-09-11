@@ -54,7 +54,8 @@ class ClickDetectionWorker(QObject):
     error    = Signal(str)
 
     def __init__(self, fft_data, phase_data, fs, fft_size, frame_duration_ms,
-                 model_path=None, k=None, threshold=None, dm=None):
+                 model_path=None, k=None, threshold=None, dm=None,
+                 stage2_mode=None):
         super().__init__()
         self.fft_data          = fft_data
         self.phase_data        = phase_data
@@ -69,6 +70,9 @@ class ClickDetectionWorker(QObject):
         # recomputing Stage 1 and the path every candidate CSV (and hence the trained
         # model) came from. Without it we fall back to run_stage1_v5.
         self.dm                = dm
+        # None → the module default (conservative). The aggressive tier costs a
+        # measured 2.1 % of clicks, so it is never chosen implicitly.
+        self.stage2_mode       = stage2_mode
         self._stop_requested   = False
 
     def request_stop(self):
@@ -83,6 +87,7 @@ class ClickDetectionWorker(QObject):
                 reconstruct_frame_v5,
                 build_click_context, resolve_click, click_event_key,
                 compute_features_v5, load_svm_model, K_STAGE1_DEFAULT,
+                p_noise_at, p_noise_frames_at,
             )
             from ml import default_model_path
 
@@ -148,19 +153,41 @@ class ClickDetectionWorker(QObject):
 
                     ctx      = build_click_context(prev_sig, curr_sig, next_sig)
                     resolved = resolve_click(ctx, cand['noise_floor'], cand['std_noise'])
+                    # p_noise_psd is what SWITCHES THE v6 FAMILY ON. Without it
+                    # _feat_v6_spectral returns its NaN skeleton, so every v6 feature
+                    # was NaN here while the identical call in the Data Collection
+                    # export produced real values — the two paths silently disagreed.
+                    # It needs the data manager's Buffer-3 snapshots, so it is None
+                    # (and the v6 features honestly NaN) when the caller had no dm.
+                    p_noise = p_noise_at(self.dm, fi) if self.dm is not None else None
                     features = compute_features_v5(
                         ctx, resolved,
                         fd['fft_norm'], fd['freq_axis'],
                         cand['noise_floor'], cand['std_noise'], self.fs,
+                        p_noise_psd=p_noise,
                     )
                     peak_abs, canonical_frame_idx = click_event_key(ctx, resolved, fi)
 
+                    # The three quality columns that are NOT features and therefore do
+                    # not come out of compute_features_v5. Same definitions as
+                    # data_collection_dialog_v5, deliberately: a row exported from the
+                    # replay window and one exported from the collection dialog must
+                    # be the same row.
+                    d0 = int(resolved.get('decay_start', 0))
+                    d1 = int(resolved.get('decay_end', 0))
                     candidates.append({
                         **cand, **features,
                         'peak_amp': resolved['peak_amp'],
                         'peak_abs': peak_abs,
                         'canonical_frame_idx': canonical_frame_idx,
                         'timestamp_s': fi * self.frame_duration_ms / 1000.0,
+                        'decay_len': max(0, d1 - d0),
+                        'b3_frames': (p_noise_frames_at(self.dm, fi)
+                                      if self.dm is not None else 0),
+                        # suppress_edge_artifacts' signature: its fade's first
+                        # coefficient is exactly 0, and nothing else in the chain
+                        # produces a hard zero at sample 0.
+                        'gibbs_fired': int(len(curr_sig) > 0 and curr_sig[0] == 0.0),
                     })
 
                 except Exception as e:  # noqa: BLE001
@@ -173,7 +200,8 @@ class ClickDetectionWorker(QObject):
             self.progress.emit(total, total)
 
             annotated = run_stages234_annotated(
-                candidates, svm_model, threshold=self.threshold
+                candidates, svm_model, threshold=self.threshold,
+                stage2_mode=self.stage2_mode,
             )
             self.finished.emit(annotated)
 

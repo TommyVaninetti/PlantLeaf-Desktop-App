@@ -62,7 +62,10 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+# parents[2], not parent.parent: this file lives at scripts/dryad/, so the repo
+# root is two levels up. The move from scripts/ left the old expression pointing
+# at scripts/src and every one of these scripts died on "No module named hybrid".
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 REAL_CSV = "/Users/tommy/PlantLeaf_dev/Analisi/v5/SVM_Training/Dataset_20June2026.csv"
 
