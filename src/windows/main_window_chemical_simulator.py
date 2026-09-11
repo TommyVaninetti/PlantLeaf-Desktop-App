@@ -11,6 +11,7 @@ if _SIM_DIR not in sys.path:
     sys.path.insert(0, _SIM_DIR)
 
 import numpy as np
+from scipy.signal import hilbert
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QLabel, QPushButton, QDoubleSpinBox, QSlider, QGroupBox,
@@ -52,12 +53,14 @@ class SimulationWorker(QObject):
     error = Signal(str)
     progress = Signal(int)
 
-    def __init__(self, R0, P_inf, distance_m, tau_target_ms=None):
+    def __init__(self, R0, P_inf, distance_m, tau_target_ms=None, freq_target_hz=None, real_signal_for_fit=None):
         super().__init__()
         self.R0 = R0
         self.P_inf = P_inf
         self.distance_m = distance_m
         self.tau_target_ms = tau_target_ms
+        self.freq_target_hz = freq_target_hz
+        self.real_signal_for_fit = real_signal_for_fit
 
     def run(self):
         try:
@@ -67,7 +70,9 @@ class SimulationWorker(QObject):
                 R0=self.R0,
                 P_inf=self.P_inf,
                 distance_m=self.distance_m,
-                tau_target_ms=self.tau_target_ms
+                tau_target_ms=self.tau_target_ms,
+                freq_target_hz=self.freq_target_hz,
+                real_signal_for_fit=self.real_signal_for_fit
             )
             self.progress.emit(100)
             self.finished.emit(result)
@@ -248,7 +253,6 @@ class MainWindowChemicalSimulator(QMainWindow):
         phys_layout.setSpacing(8)
         phys_layout.setContentsMargins(0, 0, 0, 0)
 
-        # R0
         r0_row = QHBoxLayout()
         r0_lbl = QLabel("R0:")
         r0_lbl.setFixedWidth(35)
@@ -269,7 +273,6 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.r0_slider.valueChanged.connect(lambda v: self.r0_spinbox.setValue(float(v)))
         self.r0_spinbox.valueChanged.connect(lambda v: self.r0_slider.setValue(int(v)))
 
-        # P_inf
         pinf_row = QHBoxLayout()
         pinf_lbl = QLabel("P∞:")
         pinf_lbl.setFixedWidth(35)
@@ -290,7 +293,6 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.pinf_slider.valueChanged.connect(lambda v: self.pinf_spinbox.setValue(v / 100.0))
         self.pinf_spinbox.valueChanged.connect(lambda v: self.pinf_slider.setValue(int(v * 100)))
 
-        # Distance
         dist_row = QHBoxLayout()
         dist_lbl = QLabel("Dist:")
         dist_lbl.setFixedWidth(35)
@@ -834,6 +836,81 @@ class MainWindowChemicalSimulator(QMainWindow):
 
         self.curve_real_time.setData(t_full, sig_full / center_peak)
 
+    def _find_click_envelope_bounds(self, signal, level_fraction=0.1, guard=5, max_search=300):
+        """
+        Trova inizio, picco e fine di un click reale dentro un segnale
+        grezzo, usando una soglia sull'inviluppo di Hilbert (10% del
+        picco). Restituisce (start_idx, peak_idx, end_idx), o None.
+        """
+        if signal is None or len(signal) < 10:
+            return None
+        try:
+            envelope = np.abs(hilbert(signal))
+            peak_idx = int(np.argmax(envelope))
+            peak_amp = envelope[peak_idx]
+            if peak_amp <= 0:
+                return None
+            level = peak_amp * level_fraction
+
+            start_idx = max(peak_idx - max_search, 0)
+            for i in range(peak_idx - 1, max(peak_idx - max_search, -1), -1):
+                if envelope[i] < level:
+                    start_idx = i + 1
+                    break
+
+            end_idx = min(peak_idx + max_search, len(envelope) - 1)
+            for i in range(peak_idx + 1, end_idx + 1):
+                if envelope[i] < level:
+                    end_idx = i
+                    break
+
+            return start_idx, peak_idx, end_idx
+        except Exception:
+            return None
+
+    def _extract_click_dominant_frequency(self, click):
+        """
+        Estrae la frequenza dominante dal click reale selezionato tramite
+        conteggio degli attraversamenti dello zero (zero-crossing) sulla
+        porzione isolata del click. Per segmenti così brevi la FFT
+        soffre di spectral leakage; lo zero-crossing è più diretto e
+        affidabile.
+        """
+        if not self.paudio_data:
+            return None
+        try:
+            signal = self._reconstruct_ifft(click['frame_idx'])
+            if signal is None or len(signal) < 10:
+                return None
+
+            bounds = self._find_click_envelope_bounds(signal)
+            if bounds is None:
+                return None
+            start_idx, peak_idx, end_idx = bounds
+
+            segment = signal[start_idx:end_idx + 1]
+            if len(segment) < 4:
+                return None
+
+            signs = np.sign(segment)
+            signs[signs == 0] = 1
+            crossings = np.where(np.diff(signs) != 0)[0]
+            if len(crossings) < 2:
+                return None
+
+            n_cycles = len(crossings) / 2.0
+            fs = self.paudio_data['fs']
+            duration_s = len(segment) / fs
+            if duration_s <= 0:
+                return None
+
+            freq = n_cycles / duration_s
+            if freq < 20000 or freq > 80000:
+                return None
+            return float(freq)
+        except Exception:
+            return None
+
     def _run_simulation(self):
         R0 = self.r0_spinbox.value() * 1e-6
         P_inf = self.pinf_spinbox.value() * 1e6
@@ -841,10 +918,16 @@ class MainWindowChemicalSimulator(QMainWindow):
 
         rows_sel = self.click_table.selectedItems()
         tau_target = None
+        freq_target = None
+        real_signal_for_fit = None
         if rows_sel:
             row = self.click_table.currentRow()
             if row >= 0 and row < len(self.real_clicks):
-                tau_target = self.real_clicks[row].get('tau_ms', None)
+                click = self.real_clicks[row]
+                tau_target = click.get('tau_ms', None)
+                freq_target = self._extract_click_dominant_frequency(click)
+                if self.paudio_data:
+                    real_signal_for_fit = self._reconstruct_ifft(click['frame_idx'])
 
         self.progress_dialog = QProgressDialog("Running simulation...", None, 0, 100, self)
         self.progress_dialog.setWindowModality(Qt.WindowModal)
@@ -853,7 +936,7 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.progress_dialog.show()
 
         self.sim_thread = QThread(self)
-        self.sim_worker = SimulationWorker(R0, P_inf, distance_m, tau_target)
+        self.sim_worker = SimulationWorker(R0, P_inf, distance_m, tau_target, freq_target, real_signal_for_fit)
         self.sim_worker.moveToThread(self.sim_thread)
         self.sim_thread.started.connect(self.sim_worker.run)
         self.sim_worker.finished.connect(self._on_simulation_finished)
@@ -868,8 +951,27 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.sim_result = result
         self._update_plots(result)
         self._update_diagnostics(result)
+        self._handle_calibration_feedback(result)
         self.btn_pdf.setEnabled(True)
         print("Simulation completed")
+
+    def _handle_calibration_feedback(self, result):
+        calibration = result.get('calibration')
+        if calibration is None:
+            return
+
+        R0_used_um = result['bubble']['R0'] * 1e6
+
+        self.r0_spinbox.blockSignals(True)
+        self.r0_slider.blockSignals(True)
+        self.r0_spinbox.setValue(R0_used_um)
+        self.r0_slider.setValue(int(round(R0_used_um)))
+        self.r0_spinbox.blockSignals(False)
+        self.r0_slider.blockSignals(False)
+
+        note = calibration.get('note', '')
+        msg = f"R0 calibrato automaticamente a {R0_used_um:.1f} µm.\n\n{note}"
+        QMessageBox.information(self, "Calibrazione completata", msg)
 
     def _on_simulation_error(self, error_msg):
         self.progress_dialog.close()
@@ -896,14 +998,169 @@ class MainWindowChemicalSimulator(QMainWindow):
         R_um = bubble['R'] * 1e6
         self.curve_bubble.setData(t_sim, R_um)
 
+        # Allinea visivamente il click reale sul picco del click simulato,
+        # invece di mostrarlo alla sua posizione grezza dentro la finestra
+        # di 2.56ms catturata dal microfono (dove può trovarsi ovunque).
+        rows_sel = self.click_table.selectedItems()
+        if rows_sel and self.paudio_data:
+            row = self.click_table.currentRow()
+            if row >= 0 and row < len(self.real_clicks):
+                click = self.real_clicks[row]
+                real_signal = self._reconstruct_ifft(click['frame_idx'])
+                if real_signal is not None and len(real_signal) > 0:
+                    real_bounds = self._find_click_envelope_bounds(real_signal)
+                    sim_bounds = self._find_click_envelope_bounds(signal)
+                    if real_bounds is not None and sim_bounds is not None:
+                        _, real_peak, _ = real_bounds
+                        _, sim_peak, _ = sim_bounds
+                        fs = self.paudio_data['fs']
+                        dt_us = t[1] * 1e6 - t[0] * 1e6 if len(t) > 1 else (1.0 / fs) * 1e6
+                        real_t_us = (np.arange(len(real_signal)) - real_peak) * (1e6 / fs) + sim_peak * dt_us
+                        real_norm = real_signal / (np.max(np.abs(real_signal)) + 1e-30)
+                        self.curve_real_time.setData(real_t_us, real_norm)
+
+    def _compute_hilbert_envelope(self, signal):
+        """
+        Calcola l'inviluppo istantaneo del segnale usando la trasformata
+        di Hilbert. Implementazione identica a quella usata dall'algoritmo
+        di rilevamento click di PlantLeaf (replay_window_audio.py), in
+        numpy puro (no scipy) per coerenza e thread-safety.
+        """
+        N = len(signal)
+        Xf = np.fft.rfft(signal, n=N)
+        h = np.zeros(N // 2 + 1, dtype=np.float64)
+        h[0] = 1.0
+        if N % 2 == 0:
+            h[1:-1] = 2.0
+            h[-1] = 1.0
+        else:
+            h[1:] = 2.0
+        hilbert_part = np.fft.irfft(Xf * h, n=N)
+        return np.sqrt(signal ** 2 + hilbert_part ** 2)
+
+    def _compute_envelope_correlation(self, real_signal, sim_signal):
+        """
+        Confronta la FORMA DEL DECADIMENTO (inviluppo) tra click reale e
+        simulato, con una finestra di confronto proporzionale alla vera
+        durata di ciascun click (non una lunghezza fissa), individuata
+        tramite soglia sull'inviluppo — la stessa identica logica usata
+        da PlantLeaf per isolare un click dal resto del segnale. Una
+        finestra fissa troppo lunga rispetto a un click molto rapido
+        (es. τ=0.05ms) trascinerebbe dentro rumore/silenzio, diluendo
+        artificialmente la correlazione anche quando il decadimento
+        combacia bene.
+
+        Returns:
+            float: correlazione di Pearson tra i due inviluppi (-1..1)
+        """
+        try:
+            real_bounds = self._find_click_envelope_bounds(real_signal, max_search=500)
+            sim_bounds = self._find_click_envelope_bounds(sim_signal, max_search=500)
+            if real_bounds is None or sim_bounds is None:
+                return 0.0
+
+            real_start, real_peak, real_end = real_bounds
+            sim_start, sim_peak, sim_end = sim_bounds
+
+            pre = min(real_peak - real_start, sim_peak - sim_start)
+            post = min(real_end - real_peak, sim_end - sim_peak)
+            if post <= 3:
+                return 0.0
+
+            real_env = self._compute_hilbert_envelope(real_signal)
+            sim_env = self._compute_hilbert_envelope(sim_signal)
+
+            r_win = real_env[real_peak - pre: real_peak + post + 1]
+            s_win = sim_env[sim_peak - pre: sim_peak + post + 1]
+            n = min(len(r_win), len(s_win))
+            if n <= 6:
+                return 0.0
+            r_win = r_win[:n]
+            s_win = s_win[:n]
+
+            r_norm = r_win / (np.max(r_win) + 1e-30)
+            s_norm = s_win / (np.max(s_win) + 1e-30)
+
+            corr = np.corrcoef(r_norm, s_norm)[0, 1]
+            return float(corr) if np.isfinite(corr) else 0.0
+        except Exception: 
+            return 0.0
+
+
+    def _compute_best_correlation(self, real_signal, sim_signal, max_lag=60):
+        """
+        Calcola la correlazione tra il click reale e quello simulato
+        cercando lo sfasamento (lag) che la massimizza, invece di un
+        confronto a fase fissa allineata solo sui picchi.
+
+        Due oscillazioni con la stessa frequenza e lo stesso decadimento
+        possono avere una correlazione di Pearson vicina a zero se sono
+        sfasate (es. un coseno contro un seno) — la fase assoluta del
+        click reale dipende dall'istante esatto di nucleazione, che non
+        conosciamo né modelliamo. Cercare il miglior allineamento
+        temporale è la pratica standard per confrontare forme d'onda
+        oscillatorie di fase relativa sconosciuta, e riflette meglio se
+        la FORMA del click (non la fase arbitraria) combacia.
+
+        Returns:
+            float: la massima correlazione di Pearson trovata (-1..1)
+        """
+        try:
+            real_bounds = self._find_click_envelope_bounds(real_signal)
+            sim_bounds = self._find_click_envelope_bounds(sim_signal)
+            if real_bounds is None or sim_bounds is None:
+                return 0.0
+
+            _, real_peak, _ = real_bounds
+            _, sim_peak, _ = sim_bounds
+
+            pre = min(real_peak, sim_peak, 20)
+            post = min(len(real_signal) - real_peak, len(sim_signal) - sim_peak, 200) - 1
+            if post <= 5:
+                return 0.0
+
+            r_win = real_signal[real_peak - pre: real_peak + post]
+            s_win = sim_signal[sim_peak - pre: sim_peak + post]
+            n = min(len(r_win), len(s_win))
+            if n <= 10:
+                return 0.0
+            r_win = r_win[:n]
+            s_win = s_win[:n]
+
+            r_norm = r_win / (np.max(np.abs(r_win)) + 1e-30)
+            s_norm = s_win / (np.max(np.abs(s_win)) + 1e-30)
+
+            best_corr = 0.0
+            max_shift = min(max_lag, n // 2)
+            for shift in range(-max_shift, max_shift + 1):
+                if shift >= 0:
+                    a = r_norm[shift:]
+                    b = s_norm[:len(a)]
+                else:
+                    b = s_norm[-shift:]
+                    a = r_norm[:len(b)]
+                if len(a) < 10:
+                    continue
+                c = np.corrcoef(a, b)[0, 1]
+                if np.isfinite(c) and abs(c) > abs(best_corr):
+                    best_corr = c
+
+            return float(best_corr)
+        except Exception:
+            return 0.0
+
     def _update_diagnostics(self, result):
         diag   = result['diagnostics']
         bubble = result['bubble']
 
+        f0_val = bubble.get('f0', None)
+        extra_damping = bubble.get('extra_damping_rate', 0.0)
+
         rows = [
             ("R₀",         f"{bubble['R0']*1e6:.1f} µm"),
             ("P∞",         f"{bubble['P_inf']/1e6:.2f} MPa"),
-            ("Collapsed",  "Yes" if bubble['collapsed'] else "No"),
+            ("Freq. naturale (f₀)", f"{f0_val/1000:.1f} kHz" if f0_val else "N/A"),
+            ("Smorz. extra vaso (fit)", f"{extra_damping:.0f} 1/s" if extra_damping else "0 (nessun fitting)"),
             ("τ simulated", f"{diag['tau']*1000:.3f} ms" if diag['tau'] else "N/A"),
             ("SPR",        f"{diag['SPR']:.2f}" if diag['SPR'] else "N/A"),
             ("Asymmetry",  f"{diag['asymmetry']:.3f}" if diag['asymmetry'] else "N/A"),
@@ -935,18 +1192,18 @@ class MainWindowChemicalSimulator(QMainWindow):
 
             sim_signal = result['propagation']['signal']
             corr = 0.0
+            env_corr = 0.0
             if real_signal is not None and len(real_signal) > 0 and len(sim_signal) > 0:
-                n = min(len(real_signal), len(sim_signal))
-                r_norm = real_signal[:n] / (np.max(np.abs(real_signal[:n])) + 1e-30)
-                s_norm = sim_signal[:n]  / (np.max(np.abs(sim_signal[:n]))  + 1e-30)
-                corr = float(np.corrcoef(r_norm, s_norm)[0, 1])
+                corr = self._compute_best_correlation(real_signal, sim_signal)
+                env_corr = self._compute_envelope_correlation(real_signal, sim_signal)
 
-            self.correlation_label.setText(f"Correlation: {corr:.4f}")
+            self.correlation_label.setText(f"Envelope Correlation: {env_corr:.4f}")
 
             compare_rows = [
                 ("τ real (ms)",  f"{tau_real:.3f}" if tau_real > 0 else "N/A"),
                 ("τ sim (ms)",   f"{tau_sim:.3f}"),
-                ("Correlation",  f"{corr:.4f}"),
+                ("Correlation (onda)",  f"{corr:.4f}"),
+                ("Correlation (busta)", f"{env_corr:.4f}"),
                 ("Match τ",      "Yes" if tau_real > 0 and abs(tau_sim - tau_real) / tau_real < 0.2 else "No"),
             ]
             self.table_compare.setRowCount(len(compare_rows))

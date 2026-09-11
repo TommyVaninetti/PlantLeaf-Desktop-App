@@ -76,8 +76,15 @@ def apply_tissue_attenuation(p_source, t, distance_m):
     """
     Applica l'attenuazione viscoelastica del tessuto vegetale al segnale.
 
-    L'attenuazione dipende dalla frequenza: α [dB/cm/kHz].
-    Si lavora nel dominio della frequenza tramite FFT.
+    L'attenuazione dipende dalla frequenza: α [dB/cm/kHz]. Per un segnale
+    a banda stretta come una risonanza di bolla smorzata, filtrare
+    bin-per-bin nel dominio della frequenza attenuerebbe in modo
+    differenziale le componenti spettrali vicine attorno al picco di
+    risonanza, distorcendo artificialmente la forma del decadimento nel
+    tempo (allungando il tau misurato). Per evitarlo, si usa un singolo
+    fattore di attenuazione calcolato alla frequenza dominante del
+    segnale, applicato uniformemente — fisicamente corretto per una
+    sorgente essenzialmente monocromatica.
 
     Args:
         p_source   : array pressione sorgente [Pa]
@@ -90,26 +97,20 @@ def apply_tissue_attenuation(p_source, t, distance_m):
     n = len(p_source)
     dt = t[1] - t[0]
 
-    # FFT del segnale sorgente
     P_fft = np.fft.rfft(p_source)
-
-    # Asse frequenze corrispondente
     freq_hz = np.fft.rfftfreq(n, d=dt)
 
-    # Calcola fattore di attenuazione per ogni frequenza
-    # (solo attenuazione viscoelastica, senza decadimento geometrico)
+    if len(P_fft) > 1:
+        dominant_freq_hz = freq_hz[np.argmax(np.abs(P_fft[1:])) + 1]
+    else:
+        dominant_freq_hz = 0.0
+
     distance_cm = distance_m * 100.0
-    freq_khz = freq_hz / 1000.0
+    freq_khz = dominant_freq_hz / 1000.0
     attenuation_db = PropagationParameters.ATTENUATION_COEFF * freq_khz * distance_cm
     attenuation_linear = 10.0 ** (-attenuation_db / 20.0)
 
-    # Applica attenuazione nel dominio della frequenza
-    P_fft_attenuated = P_fft * attenuation_linear
-
-    # Torna nel dominio del tempo
-    signal_attenuated = np.fft.irfft(P_fft_attenuated, n=n)
-
-    return signal_attenuated
+    return p_source * attenuation_linear
 
 
 # =============================================================================
@@ -147,9 +148,14 @@ def apply_microphone_response(signal, t):
     """
     Applica la risposta in frequenza del microfono SPU0410LR5H al segnale.
 
-    La risposta del microfono viene applicata per convoluzione nel dominio
-    della frequenza — ogni componente spettrale viene moltiplicata per
-    il guadagno del microfono a quella frequenza.
+    Per un segnale a banda stretta (come una risonanza di bolla smorzata),
+    applicare la curva di risposta bin-per-bin nel dominio della frequenza
+    distorcerebbe artificialmente la forma del decadimento nel tempo,
+    esattamente come accadeva con l'attenuazione del tessuto (vedi
+    apply_tissue_attenuation). Si usa quindi un singolo guadagno,
+    valutato alla frequenza dominante del segnale, applicato
+    uniformemente — corretto per una sorgente essenzialmente
+    monocromatica.
 
     Args:
         signal : array del segnale in ingresso al microfono [Pa]
@@ -161,22 +167,17 @@ def apply_microphone_response(signal, t):
     n = len(signal)
     dt = t[1] - t[0]
 
-    # FFT del segnale
     S_fft = np.fft.rfft(signal)
-
-    # Asse frequenze
     freq_hz = np.fft.rfftfreq(n, d=dt)
 
-    # Risposta lineare del microfono interpolata sulle frequenze del segnale
-    mic_response = MicrophoneResponse.get_response_linear(freq_hz)
+    if len(S_fft) > 1:
+        dominant_freq_hz = freq_hz[np.argmax(np.abs(S_fft[1:])) + 1]
+    else:
+        dominant_freq_hz = 0.0
 
-    # Applica risposta microfono nel dominio della frequenza
-    S_fft_mic = S_fft * mic_response
+    mic_gain = MicrophoneResponse.get_response_linear(dominant_freq_hz)
 
-    # Torna nel dominio del tempo
-    signal_mic = np.fft.irfft(S_fft_mic, n=n)
-
-    return signal_mic
+    return signal * mic_gain
 
 
 # =============================================================================
