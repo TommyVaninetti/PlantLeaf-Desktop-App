@@ -1,3 +1,20 @@
+# Copyright (C) 2026 Tommaso Vaninetti
+#
+# This file is part of PlantLeaf.
+#
+# PlantLeaf is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# PlantLeaf is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with PlantLeaf. If not, see <https://www.gnu.org/licenses/>.
+
 """
 Finestra principale per il monitoraggio Audio
 """
@@ -128,9 +145,14 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         bin_start = int(self.freq_min / bin_freq)
         bin_end = int(self.freq_max / bin_freq)
         num_bins = bin_end - bin_start + 1
-        
-        # Crea array frequenze corretto
-        self.data_x = np.linspace(self.freq_min, self.freq_max, num_bins)
+
+        # X axis = the true FFT bin center frequencies transmitted by the
+        # firmware: (bin_start + k) * bin_freq for k = 0..num_bins-1, i.e.
+        # 19921.875 .. 79687.5 Hz in 390.625 Hz steps. A linspace between
+        # the nominal 20 kHz / 80 kHz band edges would skew every label by
+        # up to ~312 Hz at the top of the band, because the true bin grid
+        # neither starts at exactly 20 kHz nor is spaced 60 kHz/153.
+        self.data_x = np.arange(bin_start, bin_start + num_bins) * bin_freq
 
         # Variabili per click detection OTTIMIZZATE
         self.click_active = False
@@ -273,6 +295,12 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
 
     def check_for_clicks_optimized(self, max_amplitude, peak_bin, above_threshold):
         """Controlla se c'è un click basato sui dati FFT ricevuti"""
+
+        # Defense in depth: peak_bin comes from the serial stream. The reader
+        # validates frame framing, but a corrupted frame must never be able to
+        # crash the GUI thread with an IndexError here - drop it instead.
+        if not (0 <= peak_bin < len(self.data_x)):
+            return
 
         current_time_us = time.time() * 1_000_000
         peak_frequency = self.data_x[peak_bin]
@@ -473,10 +501,11 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
 
         # --- Selezione file ---
         if ask_filename:
+            start_dir = self.settings_manager.get_last_directory("save_audio")
             filename, _ = QFileDialog.getSaveFileName(
                 self,
                 "Save Audio Data",
-                f"audio_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.paudio",
+                os.path.join(start_dir, f"audio_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.paudio"),
                 "PlantLeaf Audio (*.paudio);;All Files (*)"
             )
             if not filename:
@@ -484,6 +513,7 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
             if not filename.endswith('.paudio'):
                 filename += '.paudio'
             self._last_saved_file = filename
+            self.settings_manager.set_last_directory("save_audio", filename)
             print(f"📁 File definitivo scelto: {filename}")
         else:
             if self._last_saved_file:

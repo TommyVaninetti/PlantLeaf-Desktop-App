@@ -228,10 +228,15 @@ def simulate_bubble_collapse(R0=None, P_inf=None, t_max=None, n_points=5000,
 
 def compute_radiated_pressure(R, V, t, R0):
     """
-    Calcola la pressione irradiata dalla bolla oscillante, usando
-    differenziazione numerica centrale (più accurata ai bordi rispetto
-    alla differenza in avanti, importante ora che il segnale parte da
-    una condizione perfettamente liscia).
+    Calcola la pressione irradiata dalla bolla in collasso.
+
+    La pressione irradiata è proporzionale alla seconda derivata
+    del volume della bolla nel tempo (sorgente monopolare). In forma semplificata:
+
+        p_source(t) ≈ ρ/r · (R²·R'' + 2·R·R'²)
+
+    dove r è la distanza dalla bolla (qui normalizzata a R0).
+    Unità risultanti: Pascal [Pa].
 
     Args:
         R  : array del raggio nel tempo [m]
@@ -248,30 +253,9 @@ def compute_radiated_pressure(R, V, t, R0):
     return p_source
 
 
-# =============================================================================
-# INVERSIONE: TROVA R0 DATO UN TARGET DI FREQUENZA O TAU (bisezione)
-# =============================================================================
-
-def solve_R0_for_freq(freq_target_hz, R0_bounds=None):
-    """
-    Trova l'R0 [m] per cui la frequenza di Minnaert è pari a
-    freq_target_hz, tramite bisezione (la relazione è monotona e
-    numericamente ben condizionata, sempre stabile).
-
-    Args:
-        freq_target_hz : frequenza target [Hz]
-        R0_bounds      : tupla (min, max) di R0 in metri per la ricerca.
-                          Default: range biologico esteso.
-
-    Returns:
-        float: R0 [m]
-    """
-    if R0_bounds is None:
-        R0_bounds = (5e-6, 500e-6)
-
-    def f(R0):
-        freq, _ = minnaert_frequency(R0)
-        return freq - freq_target_hz
+    # Pressione irradiata alla distanza R0 dalla bolla (sorgente monopolare):
+    # p = ρ/r · (R²·R'' + 2·R·V²) = ρ/R0 · R · (R·R'' + 2·V²)   [Pa]
+    p_source = rho * R * (R * dV_dt + 2.0 * V ** 2) / R0
 
     try:
         return brentq(f, R0_bounds[0], R0_bounds[1], xtol=1e-10)

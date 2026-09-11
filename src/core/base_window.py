@@ -1,3 +1,20 @@
+# Copyright (C) 2026 Tommaso Vaninetti
+#
+# This file is part of PlantLeaf.
+#
+# PlantLeaf is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# PlantLeaf is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with PlantLeaf. If not, see <https://www.gnu.org/licenses/>.
+
 """
 Classe base per tutte le finestre dell'applicazione PlantLeaf
 """
@@ -365,7 +382,7 @@ class BaseWindow(FileHandlerMixin, QMainWindow):
         msg.setIcon(QMessageBox.Information)
         msg.setWindowTitle("Version")
         msg.setText(
-            "The current version is 1.0.0 (Beta)."
+            "The current version is 1.1.0."
         )
         msg.setStyleSheet("""
             QMessageBox {

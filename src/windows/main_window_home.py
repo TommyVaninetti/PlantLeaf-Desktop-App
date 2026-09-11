@@ -1,3 +1,20 @@
+# Copyright (C) 2026 Tommaso Vaninetti
+#
+# This file is part of PlantLeaf.
+#
+# PlantLeaf is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# PlantLeaf is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with PlantLeaf. If not, see <https://www.gnu.org/licenses/>.
+
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFileDialog, QSpacerItem, QSizePolicy, QFrame, QMenuBar, QMenu, QMessageBox
@@ -29,8 +46,8 @@ class MainWindowHome(BaseWindow):
         self.actionWebSite = QAction("Website", self)
         self.actionLicense = QAction("License", self)
         self.actionOpenFile = QAction("Open File", self)
-        self.actionBatchScreenshots = QAction("Batch Screenshots (Multiple Files)…", self)
-        self.actionBatchClickCSV    = QAction("Batch Click Detection → CSV (Multiple Files)…", self)
+        self.actionDataCollection = QAction("Export Data Collection", self)
+        self.actionClickReview = QAction("Review && Label Clicks", self)
         self.actionDark = QAction("Dark", self)
         self.actionDark_Green = QAction("Dark Green", self)
         self.actionDark_Blue = QAction("Dark Blue", self)
@@ -77,10 +94,10 @@ class MainWindowHome(BaseWindow):
         menu_file.addAction(self.actionOpenFile)
         self.actionOpenFile.setShortcut("Ctrl+O")
         menu_file.addSeparator()
-        menu_file.addAction(self.actionBatchScreenshots)
-        self.actionBatchScreenshots.setShortcut("Ctrl+Shift+B")
-        menu_file.addAction(self.actionBatchClickCSV)
-        self.actionBatchClickCSV.setShortcut("Ctrl+Shift+D")
+        menu_file.addAction(self.actionDataCollection)
+        self.actionDataCollection.setShortcut("Ctrl+E")
+        menu_file.addAction(self.actionClickReview)
+        self.actionClickReview.setShortcut("Ctrl+R")
 
         # Menu Settings (solo temi e font)
         menu_settings = QMenu("Settings", self)
@@ -132,8 +149,8 @@ class MainWindowHome(BaseWindow):
             (self.actionWebSite, self.website_action),
             (self.actionLicense, self.license_action),
             (self.actionOpenFile, self.open_file_action),
-            (self.actionBatchScreenshots, self._launch_multi_file_batch_export),
-            (self.actionBatchClickCSV,    self._launch_batch_click_csv),
+            (self.actionDataCollection, self._on_open_data_collection_dialog),
+            (self.actionClickReview, self._on_open_click_review_dialog),
             (self.actionDark, lambda: self.update_style(theme_name="dark.css")),
             (self.actionDark_Green, lambda: self.update_style(theme_name="dark_green.css")),
             (self.actionDark_Blue, lambda: self.update_style(theme_name="dark_blue.css")),
@@ -206,11 +223,11 @@ class MainWindowHome(BaseWindow):
         # Create buttons
         btn_voltage = self.create_main_button("⚡ New Voltage Analysis", "Start a new voltage analysis")
         btn_audio = self.create_main_button("🔊 New Audio Analysis", "Start a new audio analysis")
+        btn_chemical = self.create_main_button("🧪 Bioacoustics Simulator", "Run the bioacoustics simulator")
         btn_open = self.create_main_button("📁 Open Existing File", "Open a previously saved analysis file")
-        btn_chemical = self.create_main_button("🧪 Audio Chemical Simulator", "Run the acoustic cavitation simulator")
-        
+
         # Add buttons to layout
-        for btn in (btn_voltage, btn_audio, btn_open, btn_chemical):
+        for btn in (btn_voltage, btn_audio, btn_chemical, btn_open):
             buttons_layout.addWidget(btn)
         
         # Center the buttons
@@ -235,7 +252,7 @@ class MainWindowHome(BaseWindow):
         main_layout.addSpacerItem(QSpacerItem(20, 15, QSizePolicy.Minimum, QSizePolicy.Expanding))
         
         # Footer
-        footer_label = QLabel("PlantLeaf v1.0 - Tommaso Vaninetti")
+        footer_label = QLabel("PlantLeaf v1.1.0 - Tommaso Vaninetti")
         footer_label.setAlignment(Qt.AlignCenter)
         footer_label.setObjectName("footerLabel")
         main_layout.addWidget(footer_label)
@@ -257,16 +274,6 @@ class MainWindowHome(BaseWindow):
 
     #AZIONI PULSANTI PRINCIPALI
 
-
-    def _launch_multi_file_batch_export(self):
-        """Open the multi-file batch screenshot export dialog."""
-        from components.multi_file_batch_export import launch_multi_file_batch_export
-        launch_multi_file_batch_export(self)
-
-    def _launch_batch_click_csv(self):
-        """Open the multi-file batch click detection → CSV export dialog."""
-        from components.batch_click_csv_export import launch_multi_file_batch_click_csv
-        launch_multi_file_batch_click_csv(self)
 
     def new_voltage_analysis(self):
         print("🔋 Starting new voltage analysis...")
@@ -332,5 +339,26 @@ class MainWindowHome(BaseWindow):
         msg.setIcon(QMessageBox.Critical)
         msg.addButton("OK", QMessageBox.AcceptRole)
         msg.exec()
+    
+    def _on_open_data_collection_dialog(self):
+        """Open data collection dialog for Phase 2."""
+        try:
+            from components.data_collection_dialog_v5 import DataCollectionDialogV5
+            dialog = DataCollectionDialogV5(parent=self)
+            dialog.exec()
+        except Exception as e:
+            self.show_error_dialog("Error", f"Failed to open data collection dialog: {e}")
+
+    def _on_open_click_review_dialog(self):
+        """Open the labelling dialog on a candidates CSV."""
+        try:
+            from components.click_review_dialog import ClickReviewDialog
+            dialog = ClickReviewDialog(
+                parent=self,
+                theme_manager=getattr(self, 'theme_manager', None),
+            )
+            dialog.exec()
+        except Exception as e:
+            self.show_error_dialog("Error", f"Failed to open click review dialog: {e}")
 
 

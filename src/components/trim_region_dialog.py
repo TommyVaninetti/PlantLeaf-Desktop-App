@@ -1,3 +1,20 @@
+# Copyright (C) 2026 Tommaso Vaninetti
+#
+# This file is part of PlantLeaf.
+#
+# PlantLeaf is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# PlantLeaf is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with PlantLeaf. If not, see <https://www.gnu.org/licenses/>.
+
 """
 Dialog per selezione e export di regioni trimmed da file .pvolt/.paudio
 """
@@ -8,6 +25,8 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
 import os
+
+from core.settings_manager import SettingsManager
 
 
 class TrimRegionDialog(QDialog):
@@ -25,7 +44,8 @@ class TrimRegionDialog(QDialog):
             total_duration_sec: Durata totale del file in secondi
         """
         super().__init__(parent)
-        
+
+        self.settings_manager = SettingsManager()
         self.parent_window = parent
         self.file_path = file_path
         self.file_type = file_type
@@ -386,19 +406,22 @@ class TrimRegionDialog(QDialog):
         if not default_path:
             self._generate_default_filename()
             default_path = getattr(self, '_full_output_path', '')
-        
+        if not os.path.dirname(default_path):
+            default_path = os.path.join(self.settings_manager.get_last_directory("trim_output"), default_path)
+
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Save Trimmed File",
             default_path,
             filter_str
         )
-        
+
         if filename:
             # Salva il path completo internamente
             self._full_output_path = filename
             # Mostra solo il nome del file
             self.output_path_edit.setText(os.path.basename(filename))
+            self.settings_manager.set_last_directory("trim_output", filename)
     
     def _on_export_clicked(self):
         """Handler per click sul pulsante Export"""

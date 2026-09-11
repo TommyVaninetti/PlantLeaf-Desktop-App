@@ -1,3 +1,20 @@
+# Copyright (C) 2026 Tommaso Vaninetti
+#
+# This file is part of PlantLeaf.
+#
+# PlantLeaf is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# PlantLeaf is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with PlantLeaf. If not, see <https://www.gnu.org/licenses/>.
+
 """
 Finestra principale per il monitoraggio Voltage
 """
@@ -665,10 +682,11 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
 
         # --- Selezione file ---
         if ask_filename:
+            start_dir = self.settings_manager.get_last_directory("save_voltage")
             filename, _ = QFileDialog.getSaveFileName(
                 self,
                 "Save Voltage Data",
-                f"voltage_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pvolt",
+                os.path.join(start_dir, f"voltage_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pvolt"),
                 "PlantLeaf Voltage (*.pvolt);;All Files (*)"
             )
             if not filename:
@@ -676,6 +694,7 @@ class MainWindowVoltage(BaseWindow, Ui_MainWindowVoltage):
             if not filename.endswith('.pvolt'):
                 filename += '.pvolt'
             self._last_saved_file = filename
+            self.settings_manager.set_last_directory("save_voltage", filename)
             print(f"📁 File definitivo scelto: {filename}")
         else:
             # Salvataggio automatico: usa il file definitivo se esiste
