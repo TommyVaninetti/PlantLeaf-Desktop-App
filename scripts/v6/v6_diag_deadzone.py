@@ -133,6 +133,13 @@ def read_paudio(path: Path, max_frames: int | None = None):
             "fs": struct.unpack("<I", head[34:38])[0],
             "fft_size": struct.unpack("<I", head[38:42])[0],
         }
+        if header["version"] >= 4.0:
+            # Event recording: the frames here are click candidates and their
+            # neighbours, not a continuous stream. Every diagnostic in this
+            # script assumes frame i is at time i * fft_size / fs.
+            raise ValueError(
+                f"{path.name}: v{header['version']:.1f} is an EVENT recording; "
+                "its frames are non-contiguous in time (see the EVNT footer)")
         blob = fh.read()
 
     # A trailing click section, if present, is not frame data.

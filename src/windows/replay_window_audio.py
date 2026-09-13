@@ -131,13 +131,191 @@ class AudioDataManager:
         self.noise_floor_arr = np.array([])  # noise_floor(i) [V] — per le feature v5
         self.std_noise_arr   = np.array([])  # std_noise(i) [V]   — per le feature v5
 
+        # ── REGISTRAZIONE A EVENTI (.paudio v4) ─────────────────────────────
+        # In un file a eventi il frame i del corpo NON e' l'i-esimo frame del
+        # segnale: sono stati trasmessi solo i candidati e i loro vicini. Dove
+        # ciascuno si trova davvero sta nel footer EVNT, insieme allo stato del
+        # rumore misurato a bordo — che l'host non puo' ricalcolare, perche'
+        # viene da uno stimatore di minimo sui frame QUIETI, quelli che la
+        # modalita' a eventi non manda.
+        self.is_event_recording = False
+        self.event_frame_idx   = np.array([], dtype=np.int64)
+        self.event_flags       = np.array([], dtype=np.uint8)
+        self.event_E_i         = np.array([])
+        self.event_E_hat_floor = np.array([])
+        self.event_noise_floor = np.array([])
+        self.event_std_noise   = np.array([])
+        #: Righe gia' analizzate salvate nel footer EVTR — cioe' quello che
+        #: l'operatore ha visto ED ETICHETTATO durante la registrazione. Vuoto
+        #: per ogni file salvato prima che EVTR esistesse.
+        self.saved_rows = []
+        self._row_of_frame = None      # mappa lazy frame di registrazione -> riga
+
         # Performance settings (adattivi)
         self.overview_fps = 10      # FPS per overview
         self.streaming_fps = 100    # FPS per streaming buffer
         self.memory_limit_mb = 200  # Limite memoria totale
 
+    # ── TEMPO ⟷ INDICE ──────────────────────────────────────────────────
+    #
+    # Ogni conversione passa di qui. Prima erano una quindicina di
+    # `round(pos_ms / frame_duration_ms)` e `i * frame_duration_ms / 1000`
+    # sparsi per la finestra, tutti corretti solo se il frame i e' davvero
+    # l'i-esimo del segnale. Per una registrazione continua questi metodi
+    # fanno esattamente quell'aritmetica, quindi il comportamento v3 non
+    # cambia per costruzione; per una a eventi leggono i tempi veri.
+
+    def recording_frame(self, row: int) -> int:
+        """Posizione del frame nella REGISTRAZIONE (non nell'array)."""
+        if self.is_event_recording and 0 <= row < len(self.event_frame_idx):
+            return int(self.event_frame_idx[row])
+        return int(row)
+
+    def time_of_frame(self, row: int) -> float:
+        """
+        Istante di inizio del frame, in secondi.
+
+        Legge fft_timestamps quando c'e': e' l'array su cui frame_at_time fa
+        la ricerca binaria, e ricalcolare il valore con un'altra espressione
+        (`i * frame_duration_ms / 1000` invece di `i * fft_size / fs`) dava
+        differenze all'ultimo bit — abbastanza perche' frame_at_time(
+        time_of_frame(i)) restituisse i-1 su certi frame.
+        """
+        ts = self.fft_timestamps
+        if ts is not None and 0 <= row < len(ts):
+            return float(ts[row])
+        return self.recording_frame(row) * self.frame_duration_ms / 1000.0
+
+    def frame_at_time(self, time_sec: float) -> int:
+        """
+        Riga che contiene quell'istante, oppure -1 se cade in un buco.
+
+        Il -1 e' il punto. Su un file a eventi quasi tutto il tempo NON ha un
+        frame, e restituire comunque il candidato piu' vicino significa
+        mostrare uno spettro registrato minuti prima come se fosse quello che
+        si sta guardando in quel momento.
+        """
+        if self.total_frames <= 0:
+            return -1
+        frame_sec = self.frame_duration_ms / 1000.0
+
+        if not self.is_event_recording:
+            row = int(round(time_sec * 1000.0 / self.frame_duration_ms))
+            return max(0, min(row, self.total_frames - 1))
+
+        ts = self.fft_timestamps
+        if ts is None or len(ts) == 0:
+            return -1
+        row = int(np.searchsorted(ts, time_sec, side='right')) - 1
+        if row < 0:
+            # Prima del primo frame trasmesso: mezza durata di tolleranza, cosi'
+            # un click all'inizio resta raggiungibile.
+            return 0 if abs(float(ts[0]) - time_sec) <= frame_sec else -1
+        if time_sec < float(ts[row]) + frame_sec:
+            return row
+        return -1
+
+    def nearest_frame_at_time(self, time_sec: float) -> int:
+        """Riga piu' vicina nel tempo, buco o no. Per la navigazione."""
+        if self.total_frames <= 0:
+            return -1
+        if not self.is_event_recording:
+            return self.frame_at_time(time_sec)
+        ts = self.fft_timestamps
+        if ts is None or len(ts) == 0:
+            return -1
+        i = int(np.searchsorted(ts, time_sec, side='left'))
+        if i <= 0:
+            return 0
+        if i >= len(ts):
+            return len(ts) - 1
+        return i if (ts[i] - time_sec) < (time_sec - ts[i - 1]) else i - 1
+
+    def row_of_recording_frame(self, frame_idx: int):
+        """Riga che contiene quel frame della registrazione, o None."""
+        if not self.is_event_recording:
+            idx = int(frame_idx)
+            return idx if 0 <= idx < self.total_frames else None
+        if self._row_of_frame is None:
+            self._row_of_frame = {int(f): r
+                                  for r, f in enumerate(self.event_frame_idx)}
+        return self._row_of_frame.get(int(frame_idx))
+
+    def neighbour_index(self, row: int, delta: int):
+        """
+        Riga del frame TEMPORALMENTE adiacente, o None se non e' stato trasmesso.
+
+        E' il metodo che impedisce il baco piu' pericoloso di questo file:
+        cucire fft_data[fi-1], fft_data[fi], fft_data[fi+1] dando per scontato
+        che vicini nell'array siano vicini nel tempo. Su un file a eventi la
+        riga precedente puo' essere un click di venti minuti prima, e
+        concatenarla non fallisce — produce un inviluppo, un onset e un decay
+        perfettamente plausibili e completamente sbagliati.
+        """
+        return self.row_of_recording_frame(self.recording_frame(row) + delta)
+
+    def apply_loader_result(self, data: dict, filename=None):
+        """
+        Copia TUTTO quello che AudioLoadWorker emette.
+
+        ⚠️ Esisteva in due copie scritte a mano (file_handler_mixin._on_finished
+        e data_collection_dialog_v5), e in entrambe qualcuno ha dimenticato
+        delle chiavi: prima le tre di Buffer 3 — con il risultato che tutte le
+        feature v6 uscivano NaN in silenzio, perche' NaN e' anche il valore
+        legittimo di "non ancora stimato" — e poi le otto del footer EVNT, lette
+        dal worker e buttate via qui. Una sola copia.
+        """
+        self.header_info          = data['header_info']
+        self.fft_data             = data['fft_data']
+        self.phase_data           = data.get('phase_data', [])
+        self.frequency_axis       = np.array(data['frequency_axis'])
+        self.total_frames         = data['total_frames']
+        self.frame_duration_ms    = data['frame_duration_ms']
+        self.total_duration_sec   = data['total_duration_sec']
+        self.click_events         = data['click_events']
+        self.overview_x           = np.array(data['overview_x'])
+        self.overview_y           = np.array(data['overview_y'])
+        self.overview_loaded      = True
+        self.streaming_x          = np.array(data['streaming_x'])
+        self.streaming_y          = np.array(data['streaming_y'])
+        self.streaming_start_time = data['streaming_start_time']
+        self.streaming_end_time   = data['streaming_end_time']
+
+        self.fft_means       = data['fft_means']
+        self.fft_timestamps  = data['fft_timestamps']
+        self.E_hat_floor_arr = data['E_hat_floor_arr']
+        self.noise_floor_arr = data['noise_floor_arr']
+        self.std_noise_arr   = data['std_noise_arr']
+        self.p_noise_snapshots = data.get('p_noise_snapshots')
+        self.p_noise_stride    = data.get('p_noise_stride')
+        self.p_noise_counts    = data.get('p_noise_counts')
+
+        self.is_event_recording = bool(data.get('is_event_recording', False))
+        self.event_frame_idx   = np.asarray(data.get('event_frame_idx', []))
+        self.event_flags       = np.asarray(data.get('event_flags', []))
+        self.event_E_i         = np.asarray(data.get('event_E_i', []))
+        self.event_E_hat_floor = np.asarray(data.get('event_E_hat_floor', []))
+        self.event_noise_floor = np.asarray(data.get('event_noise_floor', []))
+        self.event_std_noise   = np.asarray(data.get('event_std_noise', []))
+        self.saved_rows        = data.get('saved_rows', []) or []
+        self._row_of_frame     = None
+
+        # Alias attesi da click_pipeline_v5 (run_stage1_v5, reconstruct_frame_v5),
+        # che usano la nomenclatura fft_mags / phase_int8.
+        self.fft_mags   = self.fft_data
+        self.phase_int8 = self.phase_data
+        if filename is not None:
+            self.filename = filename
+
     def precompute_fft_means(self, progress_callback=None):
         """
+        ⚠️ NO-OP su una registrazione a eventi. I frame presenti sono solo i
+        candidati e i loro vicini: farci girare sopra AdaptiveNoiseEstimatorV5
+        costruirebbe un "fondo di rumore" fatto di click. I valori veri li ha
+        misurati la scheda sui frame quieti e stanno nel footer EVNT, gia'
+        caricati da apply_loader_result.
+
+        
         Pre-calcola le medie FFT normalizzate e le stime adattive del rumore per ogni frame.
 
         Viene chiamato una sola volta dopo il caricamento del file.
@@ -161,6 +339,13 @@ class AudioDataManager:
         n = self.total_frames
         fs       = self.header_info.get('fs',       V5_FS)
         fft_size = self.header_info.get('fft_size', V5_FFT_SIZE)
+
+        if self.is_event_recording:
+            # Nothing to estimate — see the docstring. Returning early is not a
+            # shortcut: running the estimator here would silently REPLACE the
+            # board's measurements with a floor computed from the clicks.
+            print("🔄 Registrazione a eventi: stime di rumore gia' dal footer EVNT")
+            return
 
         print(f"🔄 Precomputing normalized FFT means + adaptive noise for {n} frames...")
 
@@ -1078,6 +1263,16 @@ class IFFTWindow(QDialog):
         suppression), so the joins carry a mild seam — we return their positions
         so the dialog can draw them honestly rather than hiding them.
 
+        ⚠️ NEIGHBOURS ARE TEMPORAL, NOT POSITIONAL. This used to read
+        fft_data[fi-1] and fft_data[fi+1] directly, which is right only while
+        array position equals recording position. On an EVENT recording it is
+        not: the row before a candidate can be a click from twenty minutes
+        earlier, and concatenating it does not fail — it produces an envelope,
+        an onset and a decay fit that are perfectly plausible and completely
+        wrong. dm.neighbour_index resolves adjacency in the RECORDING and
+        returns None when the neighbour was never transmitted, which
+        build_click_context already handles by shortening the context.
+
         Returns
         -------
         dict or None:
@@ -1086,6 +1281,7 @@ class IFFTWindow(QDialog):
             'envelope' : Hilbert envelope of the stitched signal
             'origin'   : index, within `signal`, of sample 0 of the CURRENT frame
             'seams'    : absolute times of the frame joins [s]
+            'complete' : True when all three frames were available
             'fs', 'fft_size'
         """
         dm = getattr(self.parent, 'data_manager', None)
@@ -1097,7 +1293,7 @@ class IFFTWindow(QDialog):
         fft_size = dm.header_info.get('fft_size', V5_FFT_SIZE)
 
         def reco(idx):
-            if idx < 0 or idx >= dm.total_frames or idx >= len(dm.fft_data):
+            if idx is None or idx < 0 or idx >= dm.total_frames or idx >= len(dm.fft_data):
                 return None
             phases = dm.phase_data[idx] if idx < len(dm.phase_data) else np.array([], dtype=np.int8)
             fr = reconstruct_frame_v5(
@@ -1107,7 +1303,9 @@ class IFFTWindow(QDialog):
             )
             return fr['signal'] if fr is not None else None
 
-        prev_sig, cur_sig, next_sig = reco(fi - 1), reco(fi), reco(fi + 1)
+        prev_row = dm.neighbour_index(fi, -1)
+        next_row = dm.neighbour_index(fi, +1)
+        prev_sig, cur_sig, next_sig = reco(prev_row), reco(fi), reco(next_row)
         if cur_sig is None:
             return None
 
@@ -1118,8 +1316,11 @@ class IFFTWindow(QDialog):
         signal = ctx['signal']
         origin = ctx['origin']
 
-        # Absolute time: sample `origin` is the start of frame fi.
-        frame_start = fi * (fft_size / fs)
+        # Absolute time: sample `origin` is the start of frame fi. Through
+        # dm, so it is the frame's position in the RECORDING — the old
+        # `fi * (fft_size / fs)` was both a second formula for the same
+        # quantity and wrong on an event recording.
+        frame_start = dm.time_of_frame(fi)
         time = frame_start + (np.arange(len(signal)) - origin) / fs
 
         return {
@@ -1129,6 +1330,10 @@ class IFFTWindow(QDialog):
             'origin': origin,
             'n_frame': ctx['n_frame'],
             'seams': [float(time[i]) for i in ctx['seams'] if 0 <= i < len(time)],
+            # False when a neighbour was not transmitted: the features below are
+            # measured on two frames instead of three, and that is worth knowing
+            # before comparing them with a click that had a full context.
+            'complete': bool(prev_sig is not None and next_sig is not None),
             'fs': fs,
             'fft_size': fft_size,
         }
@@ -1530,11 +1735,16 @@ class ReplayWindowAudio(ReplayBaseWindow):
         
         current_time_sec = self.current_position_ms / 1000.0
         
-        # UPDATE FFT PLOT (FIX: use round() for consistent frame index calculation)
-        frame_index = int(round(self.current_position_ms / self.data_manager.frame_duration_ms))
-        frame_index = max(0, min(frame_index, self.data_manager.total_frames - 1))
-        
-        if frame_index < len(self.data_manager.fft_data):
+        # UPDATE FFT PLOT.
+        # -1 means the playhead is in a GAP. On an event recording most of
+        # the timeline has no frame at all, and drawing the nearest
+        # candidate would present a spectrum from minutes away as the one
+        # under the cursor.
+        frame_index = self.data_manager.frame_at_time(current_time_sec)
+
+        if frame_index < 0:
+            self.fft_curve.setData([], [])
+        elif frame_index < len(self.data_manager.fft_data):
             # Respect normalization state instead of always showing raw
             freq_axis, display_mags = self._compute_fft_for_display(frame_index)
             self.fft_curve.setData(freq_axis, display_mags)
@@ -1612,6 +1822,22 @@ class ReplayWindowAudio(ReplayBaseWindow):
     
     # === DATA LOADING METHODS ===
     
+    def _recording_duration_sec(self):
+        """
+        How long the session was, which is not how many frames are on disk.
+
+        An event recording holds only the transmitted frames, so
+        total_frames x frame_duration is its WIRE VOLUME: a 40-minute
+        session with 1 % of frames sent reads as 24 seconds, and every plot,
+        slider and seek built on it is wrong by the same factor. The last
+        frame's own position is the only thing that knows.
+        """
+        dm = self.data_manager
+        if dm.is_event_recording and len(dm.event_frame_idx):
+            return ((int(dm.event_frame_idx[-1]) + 1)
+                    * dm.frame_duration_ms / 1000.0)
+        return dm.total_frames * dm.frame_duration_ms / 1000.0
+
     def _setup_metadata(self):
         """Setup metadati per playback"""
         # EXACTLY fs / fft_size — see the note in audio_load_progress.py. The old
@@ -1622,7 +1848,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
             self.data_manager.frame_duration_ms = 1000.0 * _n / _fs
         if self.data_manager.total_frames > 0:
             self.data_manager.total_duration_sec = (
-                self.data_manager.total_frames * self.data_manager.frame_duration_ms / 1000.0
+                self._recording_duration_sec()
             )
         self.time_slider.setRange(0, int(self.data_manager.total_duration_sec * 1000))
         self.time_slider.setValue(0)
@@ -1646,7 +1872,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
         overview_y = []
         
         for i in range(0, self.data_manager.total_frames, frame_step):
-            frame_time = (i * self.data_manager.frame_duration_ms) / 1000.0
+            frame_time = self.data_manager.time_of_frame(i)
 
             # Use pre-computed normalized means (fast — already computed at load time)
             if i < len(self.data_manager.fft_means):
@@ -1692,8 +1918,11 @@ class ReplayWindowAudio(ReplayBaseWindow):
             return
 
         # Calcola frame range
-        start_frame = int((start_time * 1000) / self.data_manager.frame_duration_ms)
-        end_frame = int((end_time * 1000) / self.data_manager.frame_duration_ms)
+        # searchsorted, not division: on an event recording consecutive rows
+        # are not one frame apart, so a time window does not map to a slice.
+        _ts = np.asarray(self.data_manager.fft_timestamps, dtype=np.float64)
+        start_frame = int(np.searchsorted(_ts, start_time, 'left'))
+        end_frame = int(np.searchsorted(_ts, end_time, 'right'))
         end_frame = min(end_frame, self.data_manager.total_frames)
         start_frame = max(0, min(start_frame, end_frame))
         
@@ -1702,7 +1931,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
         # Se skippiamo anche solo 1 FFT, rischiamo di perdere il click!
         # (Vettorializzato: identico al loop Python, ~90x piu veloce.)
         idx = np.arange(start_frame, end_frame)
-        stream_x = idx * (self.data_manager.frame_duration_ms / 1000.0)
+        stream_x = _ts[start_frame:end_frame]
 
         # Use pre-computed normalized fft_means when available (fast path).
         means = self.data_manager.fft_means
@@ -1759,6 +1988,19 @@ class ReplayWindowAudio(ReplayBaseWindow):
         file_version = self.data_manager.header_info.get('version', 0)
         has_phases = (len(self.data_manager.phase_data) > 0)
 
+        if self.data_manager.is_event_recording:
+            # Il taglio lavora per offset di byte: 128 + frame * 770, e un
+            # intervallo in secondi diventa un intervallo di frame. Regge solo
+            # se i frame sono contigui. AudioTrimExporter solleva gia' su un
+            # file v4, ma scoprirlo con un'eccezione dopo aver scelto la
+            # regione e' peggio che trovare la voce disabilitata.
+            if hasattr(self, 'actionExportTrimmed'):
+                self.actionExportTrimmed.setEnabled(False)
+                self.actionExportTrimmed.setToolTip(
+                    "Non disponibile su una registrazione a eventi: i frame non "
+                    "sono contigui nel tempo, quindi un taglio in secondi non "
+                    "corrisponde a un intervallo di frame.")
+
         # Aggiorna UI
         if hasattr(self, 'actionIFFTGraph'):
             self.actionIFFTGraph.setEnabled(has_phases)
@@ -1769,6 +2011,10 @@ class ReplayWindowAudio(ReplayBaseWindow):
         
         # Popola tabella click
         self._populate_click_table()
+        # E le righe gia' analizzate salvate nel file, se ci sono: aprendo un
+        # file si vede subito quello che l'operatore ha visto ed etichettato,
+        # senza dover rilanciare il rilevatore.
+        self._load_saved_rows()
         
         # Mostra lo STREAMING BUFFER iniziale
         stream_x, stream_y = self.data_manager.get_streaming_data()
@@ -2018,44 +2264,36 @@ class ReplayWindowAudio(ReplayBaseWindow):
         # TERZA TABELLA: i click confermati dall'algoritmo v5 (stage 1 → 2 → 3 → 4).
         # Le altre due tabelle mostrano ciò che il firmware ha registrato e ciò che
         # supera una soglia: questa mostra il verdetto del modello.
-        self.detection_table = QTableWidget()
-        self.detection_table.setColumnCount(8)
-        self.detection_table.setHorizontalHeaderLabels([
-            "Timestamp", "Frame", "P(click)", "τ (ms)", "R²",
-            "Peak SNR", "FPE (kHz)", "Verdict",
-        ])
+        # The SAME widget the live window uses. Replay and live are meant to
+        # be compared row by row, which only means anything if they show the
+        # same columns with the same names — and it brings 0/1/2 labelling to
+        # the window where the labelling actually gets done.
+        from components.events_table import EventsTable
+        self.detection_table = EventsTable(
+            self.theme_manager,
+            settings_manager=getattr(self, 'settings_manager', None),
+        )
+        self.detection_table.eventSelected.connect(self._on_detection_selected)
 
-        self.detection_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.detection_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.detection_table.setAlternatingRowColors(True)
-
-        self.detection_table.itemDoubleClicked.connect(self._on_click_table_double_clicked)
-
-        # Right-click → open that frame in the iFFT window, which is where a click
-        # actually gets inspected.
+        # Right-click → open that frame in the iFFT window, which is where a
+        # click actually gets inspected.
         self.detection_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.detection_table.customContextMenuRequested.connect(
             self._on_detection_table_context_menu
         )
 
-        det_header = self.detection_table.horizontalHeader()
-        for _c in range(7):
-            det_header.setSectionResizeMode(_c, QHeaderView.ResizeToContents)
-        det_header.setSectionResizeMode(7, QHeaderView.Stretch)
-
-        self.detection_table.verticalHeader().setVisible(False)
-
-        self.detection_table.setToolTip(
-            "Double-click a row to jump to that detection.\n"
-            "Right-click to open the frame in the iFFT window."
-        )
-
-        self.click_tab_widget.addTab(self.detection_table, "Detected Clicks (v5)")
+        self.click_tab_widget.addTab(self.detection_table, "Detected Clicks")
 
         # Holds the last full detection run (every Stage 1 candidate, annotated), so
         # switching between 'confirmed only' and 'all candidates' is a re-filter of
         # results already computed rather than a second pass over the recording.
         self._v5_detections = []
+        #: Le righe lette dal footer EVTR: quello che l'operatore ha visto ED
+        #: ETICHETTATO quando ha registrato. Vuoto per i file salvati prima.
+        self._saved_rows = []
+        self._detection_source = ''
+        self._detect_funnel_text = ''
+        self._detection_drift = ''
 
         # ── Control row for the v5 detector ──
         detect_layout = QHBoxLayout()
@@ -2071,7 +2309,9 @@ class ReplayWindowAudio(ReplayBaseWindow):
         detect_layout.addWidget(QLabel("Show:"))
         from components.wide_combo_box import WideComboBox
         self.combo_detect_show = WideComboBox()
-        self.combo_detect_show.addItems(["Confirmed only", "All candidates"])
+        # Same three views as the live window, same order of usefulness.
+        self.combo_detect_show.addItems(
+            ["Confirmed only", "Reached the SVM", "All candidates"])
         self.combo_detect_show.setToolTip(
             "Confirmed = survived all four stages.\n"
             "All candidates = every Stage 1 hit, with the stage that rejected it."
@@ -2162,14 +2402,18 @@ class ReplayWindowAudio(ReplayBaseWindow):
             return
 
         # 1. Calcola l'indice del frame corrente in modo preciso
-        current_frame_index = int(round(self.current_position_ms / self.data_manager.frame_duration_ms))
+        current_frame_index = self.data_manager.nearest_frame_at_time(
+            self.current_position_ms / 1000.0)
 
         # 2. Calcola il nuovo indice con controllo dei limiti
         new_frame_index = current_frame_index + direction
         new_frame_index = max(0, min(new_frame_index, self.data_manager.total_frames - 1))
 
         # 3. Calcola la nuova posizione in millisecondi DAL NUOVO INDICE
-        new_position_ms = new_frame_index * self.data_manager.frame_duration_ms
+        # Stepping moves to the next TRANSMITTED frame, which on an event
+        # recording may be minutes away. Advancing by a fixed 2.56 ms would
+        # walk into a gap and show nothing, over and over.
+        new_position_ms = self.data_manager.time_of_frame(new_frame_index) * 1000.0
 
         # 4. Aggiorna lo stato e l'interfaccia usando i metodi esistenti
         self._on_position_changed(new_position_ms)
@@ -2188,10 +2432,13 @@ class ReplayWindowAudio(ReplayBaseWindow):
             QMessageBox.warning(self, "No Data", "No FFT data available for analysis.")
             return
 
-        frame_index = int(round(self.current_position_ms / self.data_manager.frame_duration_ms))
-        frame_index = max(0, min(frame_index, self.data_manager.total_frames - 1))
+        # nearest_ rather than frame_at_time: this is an explicit "show me
+        # the frame here" request, so land on the closest transmitted frame
+        # instead of refusing because the cursor sits between two clusters.
+        frame_index = self.data_manager.nearest_frame_at_time(
+            self.current_position_ms / 1000.0)
 
-        if frame_index >= len(self.data_manager.fft_data):
+        if frame_index < 0 or frame_index >= len(self.data_manager.fft_data):
             QMessageBox.warning(self, "Error", f"Invalid frame index: {frame_index}")
             return
 
@@ -2245,7 +2492,8 @@ class ReplayWindowAudio(ReplayBaseWindow):
                                 "iFFT requires phase information (file version ≥ 3.0).")
             return
 
-        fi = int(round(self.current_position_ms / self.data_manager.frame_duration_ms))
+        fi = self.data_manager.nearest_frame_at_time(
+            self.current_position_ms / 1000.0)
         fi = max(0, min(fi, self.data_manager.total_frames - 1))
 
         fs       = self.data_manager.header_info.get('fs',       V5_FS)
@@ -2352,18 +2600,9 @@ class ReplayWindowAudio(ReplayBaseWindow):
             event_amp = float(amp_item.text().replace(' mV', '')) if amp_item else 0
             event_type = "Auto-detected Peak"
 
-        # ✅ CASO 3: Click su tabella "Detected Clicks (v5)"
-        elif sender_table is self.detection_table:
-            det = self._detection_for_row(row)
-            if det is None:
-                print(f"⚠️ Invalid detection_table row: {row}")
-                return
-
-            target_timestamp_sec = float(det.get('timestamp_s', 0.0))
-            event_freq = float(det.get('FPE_hz', 0.0))       # dominant frequency
-            event_amp  = float(det.get('peak_amp', 0.0))
-            event_type = "v5 Detection"
-
+        # La tabella degli eventi non passa piu' di qui: ora e' la SELEZIONE a
+        # navigare (_on_detection_selected), perche' le colonne label e note
+        # sono editabili e un doppio clic su di esse apre l'editor.
         else:
             print("⚠️ Unknown table sender")
             return
@@ -2401,18 +2640,38 @@ class ReplayWindowAudio(ReplayBaseWindow):
 
     def _visible_detections(self):
         """The detections the table is currently showing, in display order."""
-        if self.combo_detect_show.currentIndex() == 0:
-            rows = [d for d in self._v5_detections if d.get('stage_blocked') == '']
-        else:
-            rows = list(self._v5_detections)
-        return sorted(rows, key=lambda d: d.get('frame_idx', 0))
+        return self.detection_table.visible_events()
 
     def _detection_for_row(self, row: int):
         """Map a table row back to its detection dict."""
-        visible = self._visible_detections()
-        if row < 0 or row >= len(visible):
-            return None
-        return visible[row]
+        return self.detection_table.event_at(row)
+
+    def _on_detection_selected(self, row: int):
+        """
+        Selecting a row moves the playhead to that click.
+
+        Single click, not double: the table is now editable (labels and notes),
+        and a double-click on those columns opens an editor. Making selection
+        the navigation gesture also matches the live window, where selecting a
+        row is what renders it.
+        """
+        det = self._detection_for_row(row)
+        if det is None:
+            return
+        timestamp = det.get('timestamp_s')
+        if timestamp is None:
+            return
+        self._seek_to_time(float(timestamp))
+
+    def _seek_to_time(self, time_sec: float):
+        """Move the playhead and re-centre the time plot on it."""
+        position_ms = max(0.0, time_sec * 1000.0)
+        self._on_position_changed(position_ms)
+        if hasattr(self, 'time_slider'):
+            self.time_slider.setValue(int(position_ms))
+        if hasattr(self, 'plot_widget_time'):
+            self.plot_widget_time.set_x_limits(
+                max(0.0, time_sec - 10.0), time_sec + 10.0)
 
     def _on_detect_clicks(self):
         """Run the v5 pipeline over the loaded recording in a background thread."""
@@ -2491,12 +2750,21 @@ class ReplayWindowAudio(ReplayBaseWindow):
         # "gates 0" on runs where the SNR/nseg/crest/harm gates did the work.
         n_gates = sum(counts[v] for v in STAGE_BLOCKED_STAGE2)
 
-        self.label_detect_status.setText(
+        self._detect_funnel_text = (
             f"{counts['total']} candidates → {counts['confirmed']} confirmed  "
             f"(gates {n_gates}, "
             f"SVM {counts['Stage3_SVM']}, dedup {counts['Stage4_dedup']})"
         )
 
+        # Sorted by position in the RECORDING: the table keeps insertion order
+        # deliberately, because that is the only order in which stepping through
+        # the iFFT sequence makes sense.
+        self._detection_source = 're-analysed now'
+        # Before set_events: it carries the saved labels onto the fresh rows,
+        # and the table snapshots each dict as it is added.
+        self._compare_with_saved_rows()
+        self.detection_table.set_events(
+            sorted(self._v5_detections, key=lambda d: d.get('frame_idx', 0)))
         self._refresh_detection_table()
         self.click_tab_widget.setCurrentWidget(self.detection_table)
 
@@ -2508,48 +2776,119 @@ class ReplayWindowAudio(ReplayBaseWindow):
         self.label_detect_status.setText("Detection failed")
         QMessageBox.critical(self, "Click detection failed", msg)
 
+    #: combo index → EventsTable filter mode. Named because the two lists
+    #: have to stay in step and neither is obviously the other's order.
+    _SHOW_MODES = ('confirmed', 'stage2', 'all')
+
     def _refresh_detection_table(self):
-        """Populate the table from the last run — no re-detection."""
-        visible = self._visible_detections()
+        """Re-apply the view filter. The rows are already in the table."""
+        idx = max(0, min(self.combo_detect_show.currentIndex(),
+                         len(self._SHOW_MODES) - 1))
+        self.detection_table.set_filter_mode(self._SHOW_MODES[idx])
+        self._update_detection_status()
 
-        self.detection_table.setRowCount(len(visible))
+    def _update_detection_status(self):
+        """The funnel, what the filter is hiding, and where the rows came from."""
+        if not hasattr(self, 'label_detect_status'):
+            return
+        table = self.detection_table
+        total = table.rowCount()
+        if total == 0:
+            return
+        parts = [getattr(self, '_detect_funnel_text', '')
+                 or f"{total} candidates"]
+        shown = table.visible_count()
+        if shown != total:
+            parts.append(f"{shown} shown")
+        source = getattr(self, '_detection_source', '')
+        if source:
+            parts.append(source)
+        drift = getattr(self, '_detection_drift', '')
+        if drift:
+            parts.append(drift)
+        self.label_detect_status.setText("  ·  ".join(parts))
 
-        # Tint per verdict, so the blocked rows read at a glance in 'All candidates'.
-        # Every Stage-2 verdict shares the same grey: the distinction a reader
-        # wants at a glance is "gate / SVM / dedup", and the exact gate is already
-        # spelled out in the verdict column. Built from STAGE_BLOCKED_STAGE2 so a
-        # new gate cannot end up as the one untinted row in the table.
-        from core.click_pipeline_v5 import STAGE_BLOCKED_STAGE2
-        _GATE_GREY = QColor(120, 120, 120, 45)
-        tints = {v: _GATE_GREY for v in STAGE_BLOCKED_STAGE2}
-        tints.update({
-            '':             QColor(46, 125, 50, 60),    # confirmed — green
-            'Stage3_SVM':   QColor(211, 47, 47, 45),    # SVM said noise — red
-            'Stage4_dedup': QColor(255, 152, 0, 45),    # duplicate — amber
-        })
+    def _load_saved_rows(self):
+        """
+        Show the rows the file was saved with, before anything is re-analysed.
 
-        for r, det in enumerate(visible):
-            verdict = det.get('stage_blocked', '')
-            prob    = det.get('svm_probability')
-            tau     = det.get('tau_ms', -1.0)
+        This is what the operator actually saw and LABELLED while recording. It
+        is not the same thing as re-analysing the file: the model may have been
+        retrained since, or the pipeline changed. So it is shown as-is and
+        marked as coming from the file, and re-running the detector replaces it
+        and reports any disagreement.
+        """
+        rows = list(getattr(self.data_manager, 'saved_rows', []) or [])
+        if not rows:
+            return
+        self._saved_rows = rows
+        self._detection_source = 'from the file, as recorded'
+        self._detect_funnel_text = ''
+        self._detection_drift = ''
+        self.detection_table.set_events(
+            sorted(rows, key=lambda d: d.get('frame_idx', 0) or 0))
+        self.btn_export_detections.setEnabled(True)
+        self._refresh_detection_table()
 
-            cells = [
-                f"{det.get('timestamp_s', 0.0):.3f}s",
-                str(det.get('frame_idx', '')),
-                f"{prob:.3f}" if prob is not None else "—",
-                f"{tau:.4f}" if tau and tau > 0 else "—",
-                f"{det.get('R2', 0.0):.3f}",
-                f"{det.get('peak_SNR', 0.0):.2f}",
-                f"{det.get('FPE_hz', 0.0) / 1000.0:.1f}",
-                "CLICK" if verdict == '' else verdict,
-            ]
+    def _compare_with_saved_rows(self):
+        """
+        Did re-analysis reproduce what was recorded?
 
-            for c, text in enumerate(cells):
-                item = QTableWidgetItem(text)
-                tint = tints.get(verdict)
-                if tint is not None:
-                    item.setBackground(tint)
-                self.detection_table.setItem(r, c, item)
+        The rows in the file were computed by the SAME function this run just
+        called (core.candidate_analysis.analyse_candidate), so a difference is
+        not a rounding artefact — it means something else changed: a different
+        SVM model, a different Stage 2 mode, a different k. Worth saying out
+        loud, because the numbers on screen and the numbers a reviewer labelled
+        would otherwise silently disagree.
+        """
+        self._detection_drift = ''
+        saved = {int(r['frame_idx']): r
+                 for r in getattr(self, '_saved_rows', []) or []
+                 if r.get('frame_idx') is not None}
+        if not saved:
+            return
+
+        fresh = {int(r['frame_idx']): r for r in self._v5_detections
+                 if r.get('frame_idx') is not None}
+        common = set(saved) & set(fresh)
+        if not common:
+            self._detection_drift = "no row in common with the saved ones"
+            return
+
+        n_verdict = sum(1 for f in common
+                        if saved[f].get('stage_blocked') != fresh[f].get('stage_blocked'))
+        n_prob = 0
+        for f in common:
+            a, b = saved[f].get('svm_probability'), fresh[f].get('svm_probability')
+            if a is None or b is None:
+                continue
+            if abs(float(a) - float(b)) > 1e-9:
+                n_prob += 1
+
+        missing = len(saved) - len(common)
+        bits = []
+        if n_verdict:
+            bits.append(f"{n_verdict} verdicts differ")
+        if n_prob:
+            bits.append(f"{n_prob} probabilities differ")
+        if missing:
+            bits.append(f"{missing} saved rows not found")
+        self._detection_drift = ("matches the saved rows" if not bits
+                                 else "⚠ " + ", ".join(bits))
+
+        # Labels are the one thing re-analysis cannot regenerate: they are a
+        # human judgement. Carry them across so a re-run does not wipe them.
+        carried = 0
+        for f in common:
+            label = str(saved[f].get('label', '') or '').strip()
+            if label and not str(fresh[f].get('label', '') or '').strip():
+                fresh[f]['label'] = label
+                carried += 1
+            note = str(saved[f].get('note', '') or '').strip()
+            if note and not str(fresh[f].get('note', '') or '').strip():
+                fresh[f]['note'] = note
+        if carried:
+            print(f"🏷️ {carried} etichette riportate dalle righe salvate")
 
     def _on_detection_table_context_menu(self, pos):
         """Right-click → inspect this frame in the iFFT window."""
@@ -2570,7 +2909,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
         try:
             # show_ifft_window() derives the frame from current_position_ms, so the
             # playhead has to move first.
-            position_ms = frame_idx * self.data_manager.frame_duration_ms
+            position_ms = self.data_manager.time_of_frame(frame_idx) * 1000.0
             self._on_position_changed(position_ms)
             self.time_slider.setValue(int(position_ms))
             self.show_ifft_window()
@@ -2733,15 +3072,23 @@ class ReplayWindowAudio(ReplayBaseWindow):
         """
         Raggruppa picchi consecutivi in eventi singoli.
         max_gap_frames: gap massimo tra picchi per considerarli stesso evento
+
+        ⚠️ Il gap si misura sui frame della REGISTRAZIONE, non sulle posizioni
+        nell'array. Su un file a eventi due righe adiacenti possono distare
+        minuti: confrontando gli indici dell'array, due cluster di click
+        separati da mezz'ora finivano nello stesso "evento".
         """
         if len(indices) == 0:
             return []
-        
+
+        dm = self.data_manager
         groups = []
         current_group = [indices[0]]
-        
+
         for i in range(1, len(indices)):
-            if indices[i] - indices[i-1] <= max_gap_frames:
+            gap = (dm.recording_frame(int(indices[i]))
+                   - dm.recording_frame(int(indices[i - 1])))
+            if gap <= max_gap_frames:
                 current_group.append(indices[i])
             else:
                 groups.append(current_group)
@@ -2930,10 +3277,11 @@ class ReplayWindowAudio(ReplayBaseWindow):
         # Re-map streaming Y to the current fft_means values
         if len(self.data_manager.fft_timestamps) > 0:
             # Rebuild streaming Y from fft_means (which are already per-frame)
-            start_frame = int(self.data_manager.streaming_start_time * 1000
-                              / self.data_manager.frame_duration_ms)
-            end_frame   = int(self.data_manager.streaming_end_time   * 1000
-                              / self.data_manager.frame_duration_ms)
+            _ts = np.asarray(self.data_manager.fft_timestamps, dtype=np.float64)
+            start_frame = int(np.searchsorted(
+                _ts, self.data_manager.streaming_start_time, 'left'))
+            end_frame   = int(np.searchsorted(
+                _ts, self.data_manager.streaming_end_time, 'right'))
             end_frame   = min(end_frame, self.data_manager.total_frames)
             new_y = self.data_manager.fft_means[start_frame:end_frame]
             new_x = self.data_manager.fft_timestamps[start_frame:end_frame]

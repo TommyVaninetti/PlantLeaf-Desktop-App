@@ -1989,51 +1989,19 @@ class DataCollectionWorkerV5(QThread):
 
             data = result['data']
 
-            # Populate AudioDataManager (mirrors file_handler_mixin._on_finished)
+            # Populate AudioDataManager. One call: the mapping from the
+            # worker's dict lives in AudioDataManager.apply_loader_result, and
+            # this used to be a hand-written second copy of it that fell behind
+            # twice — see the note there.
             dm = AudioDataManager()
-            dm.header_info          = data['header_info']
-            dm.fft_data             = data['fft_data']
-            dm.phase_data           = data.get('phase_data', [])
-            dm.frequency_axis       = np.array(data['frequency_axis'])
-            dm.total_frames         = data['total_frames']
-            dm.frame_duration_ms    = data['frame_duration_ms']
-            dm.total_duration_sec   = data['total_duration_sec']
-            dm.click_events         = data['click_events']
-            dm.overview_x           = np.array(data['overview_x'])
-            dm.overview_y           = np.array(data['overview_y'])
-            dm.overview_loaded      = True
-            dm.streaming_x          = np.array(data['streaming_x'])
-            dm.streaming_y          = np.array(data['streaming_y'])
-            dm.streaming_start_time = data['streaming_start_time']
-            dm.streaming_end_time   = data['streaming_end_time']
-            dm.filename             = paudio_path.stem
+            dm.apply_loader_result(data, filename=paudio_path.stem)
 
-            # Aliases expected by click_pipeline_v5 (run_stage1_v5,
-            # reconstruct_frame_v5) which use fft_mags/phase_int8 naming.
-            dm.fft_mags   = dm.fft_data    # same list, pipeline-compatible alias
-            dm.phase_int8 = dm.phase_data  # same list, pipeline-compatible alias
-
-            # Use pre-computed noise arrays from worker if available;
-            # otherwise compute them now (required by run_stage1_v5).
+            # Fallback for files the worker did not pre-compute. It builds no
+            # Buffer 3, so the v6 features are genuinely unavailable here and
+            # must stay NaN — b3_frames = 0 records that honestly rather than
+            # letting a stale estimate leak in.
             fft_means = data.get('fft_means')
-            if fft_means is not None and len(fft_means) > 0:
-                dm.fft_means       = data['fft_means']
-                dm.fft_timestamps  = data['fft_timestamps']
-                dm.E_hat_floor_arr = data['E_hat_floor_arr']
-                dm.noise_floor_arr = data['noise_floor_arr']
-                dm.std_noise_arr   = data['std_noise_arr']
-                # v6 Buffer 3. Without these three, p_noise_at() returns None for
-                # every frame and all eight v6 features export as NaN — which is
-                # exactly what happened on the first real export. .get() keeps a
-                # dict from an older worker loadable.
-                dm.p_noise_snapshots = data.get('p_noise_snapshots')
-                dm.p_noise_stride    = data.get('p_noise_stride')
-                dm.p_noise_counts    = data.get('p_noise_counts')
-            else:
-                # Fallback for files the worker did not pre-compute. It builds no
-                # Buffer 3, so the v6 features are genuinely unavailable here and
-                # must stay NaN — b3_frames = 0 records that honestly rather than
-                # letting a stale estimate leak in.
+            if fft_means is None or len(fft_means) == 0:
                 dm.precompute_fft_means()
                 dm.p_noise_snapshots = None
                 dm.p_noise_stride    = None

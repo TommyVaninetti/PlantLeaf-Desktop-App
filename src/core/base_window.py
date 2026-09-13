@@ -132,6 +132,40 @@ class BaseWindow(FileHandlerMixin, QMainWindow):
 
 
 
+    def _apply_action_icon(self, action):
+        """
+        Applica a `action` l'icona assets/icons/<objectName>.png, generando anche
+        la variante disabilitata (semitrasparente).
+
+        ✅ FIX WINDOWS: senza una QPixmap esplicita per QIcon.Disabled, Windows
+        non disegna nulla quando l'azione è disabilitata.
+
+        L'icona è risolta PER NOME OGGETTO: un'azione nuova prende la sua icona
+        senza toccare questo metodo, basta che il PNG si chiami come lei.
+        Se il file non esiste l'azione resta senza icona, senza errori.
+        """
+        icon_path = os.path.join(AppConfig.ICON_DIR, action.objectName() + ".png")
+        if not os.path.exists(icon_path):
+            return
+
+        from PySide6.QtGui import QPixmap, QPainter
+        from PySide6.QtCore import Qt
+
+        icon = QIcon(icon_path)
+
+        pixmap = QPixmap(icon_path)
+        disabled_pixmap = QPixmap(pixmap.size())
+        disabled_pixmap.fill(Qt.transparent)
+
+        painter = QPainter(disabled_pixmap)
+        painter.setOpacity(0.4)  # 40% di opacità
+        painter.drawPixmap(0, 0, pixmap)
+        painter.end()
+
+        icon.addPixmap(disabled_pixmap, QIcon.Disabled)
+        action.setIcon(icon)
+
+
     #AZIONI TOOLBAR (da chiamare nelle window figlie)
     def setup_toolbar_actions(self):
         """Collega le azioni della toolbar ai rispettivi metodi"""
@@ -153,53 +187,22 @@ class BaseWindow(FileHandlerMixin, QMainWindow):
                 pass
             action.triggered.connect(slot)
 
-        # ✅ FIX WINDOWS: Applica icone con stato disabilitato generato automaticamente
         for action, _ in actions:
-            icon_path = os.path.join(AppConfig.ICON_DIR, action.objectName() + ".png")
-            if os.path.exists(icon_path):
-                icon = QIcon(icon_path)
-                
-                # ✅ Genera automaticamente l'icona disabilitata (semitrasparente)
-                from PySide6.QtGui import QPixmap, QPainter
-                from PySide6.QtCore import Qt
-                
-                pixmap = QPixmap(icon_path)
-                disabled_pixmap = QPixmap(pixmap.size())
-                disabled_pixmap.fill(Qt.transparent)
-                
-                painter = QPainter(disabled_pixmap)
-                painter.setOpacity(0.4)  # 40% di opacità
-                painter.drawPixmap(0, 0, pixmap)
-                painter.end()
-                
-                # Aggiungi la versione disabilitata all'icona
-                icon.addPixmap(disabled_pixmap, QIcon.Disabled)
-                
-                action.setIcon(icon)
+            self._apply_action_icon(action)
 
         ###SEPARATO PER UPDATE TIME WINDOW
         if hasattr(self, 'actionUpdatedTimeWindow'):
             self.actionUpdatedTimeWindow.triggered.connect(self.toggle_time_window)
-            
-            # ✅ Applica lo stesso fix per questa icona
-            icon_path = os.path.join(AppConfig.ICON_DIR, self.actionUpdatedTimeWindow.objectName() + ".png")
-            if os.path.exists(icon_path):
-                icon = QIcon(icon_path)
-                
-                from PySide6.QtGui import QPixmap, QPainter
-                from PySide6.QtCore import Qt
-                
-                pixmap = QPixmap(icon_path)
-                disabled_pixmap = QPixmap(pixmap.size())
-                disabled_pixmap.fill(Qt.transparent)
-                
-                painter = QPainter(disabled_pixmap)
-                painter.setOpacity(0.4)
-                painter.drawPixmap(0, 0, pixmap)
-                painter.end()
-                
-                icon.addPixmap(disabled_pixmap, QIcon.Disabled)
-                self.actionUpdatedTimeWindow.setIcon(icon)
+            self._apply_action_icon(self.actionUpdatedTimeWindow)
+
+        ###SEPARATO PER SELEZIONE MODELLO SVM (solo main window audio)
+        # Non può stare nella lista qui sopra: quella è condivisa con le finestre
+        # voltage e chemical, che non hanno questa azione.
+        if hasattr(self, 'actionSVM'):
+            self.actionSVM.triggered.connect(self.svm_model_action)
+            self._apply_action_icon(self.actionSVM)
+        if hasattr(self, 'actionResetSVM'):
+            self.actionResetSVM.triggered.connect(self.reset_svm_model_action)
 
 
 

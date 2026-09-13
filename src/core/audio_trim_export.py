@@ -51,10 +51,24 @@ class AudioTrimExporter:
             parent: ReplayWindowAudio instance
             file_path: Path del file .paudio
             metadata: Dict con header info
+
+        Raises:
+            ValueError: on an EVENT recording (v4). Every offset in this class
+                is frame_index x 770 bytes and every time is frame_index x
+                frame_duration, which is only true when the frames are
+                contiguous. In a v4 file they are not - a trim asked for in
+                seconds would cut somewhere else entirely, and the output would
+                still be a perfectly well-formed .paudio.
         """
         self.parent = parent
         self.file_path = file_path
         self.metadata = metadata
+
+        if float(metadata.get('version', 3.0)) >= 4.0:
+            raise ValueError(
+                "Trimming an event recording (.paudio v4) is not supported: its "
+                "frames are not contiguous in time, so a cut in seconds does not "
+                "map to a range of frames.")
         
         # Parametri FFT
         self.fs = metadata.get('fs', 200000)

@@ -286,6 +286,17 @@ def read_frames(path: str | Path, start_frame: int = 0, count: int | None = None
             f"{Path(path).name}: version {header['version']} is magnitude-only; "
             "phase is required for resynthesis"
         )
+    if header["version"] >= 4.0:
+        # An EVENT recording. Its frames are not contiguous in time - only click
+        # candidates and their neighbours were transmitted, and where each one
+        # sits is in the EVNT footer this reader knows nothing about. Reading it
+        # as a continuous stream gives a plausible, wrong answer, which is worse
+        # than refusing.
+        raise ValueError(
+            f"{Path(path).name}: version {header['version']} is an EVENT "
+            "recording; its frames are non-contiguous in time. Use "
+            "AudioLoadWorker, which reads the EVNT footer."
+        )
 
     total = header["total_frames"]
     if start_frame < 0 or start_frame >= total:

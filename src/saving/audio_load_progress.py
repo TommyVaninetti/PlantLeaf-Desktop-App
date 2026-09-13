@@ -21,6 +21,7 @@ import struct
 import json
 import zlib
 import os
+from core import paudio_format as pf
 from core.click_pipeline_v5 import (  #keep functions and constants in sync with click_pipeline_v5.py
     _normalize_fft,
     reconstruct_frame_v5,
@@ -84,14 +85,13 @@ class AudioLoadWorker(QObject):
                 # STEP 2: Load FFT data
                 self.progress.emit(5)
                 remaining_data = f.read()
-                click_start = remaining_data.find(b'CLCK')
-                
-                if click_start >= 0:
-                    fft_bytes = remaining_data[:click_start]
-                    click_section = remaining_data[click_start:]
-                else:
-                    fft_bytes = remaining_data
-                    click_section = None
+                # The body ends at the FIRST footer marker, whichever it is. A
+                # v4 file always writes CLCK before EVNT precisely so that a
+                # reader looking only for CLCK still stops in the right place,
+                # but a file truncated between the two must not turn the
+                # remaining EVNT bytes into magnitudes.
+                (fft_bytes, click_payload, event_payload,
+                 row_payload) = pf.split_sections(remaining_data)
 
                 fft_data = []
                 phase_data = []
@@ -116,7 +116,10 @@ class AudioLoadWorker(QObject):
                             has_separators = True
                             print("📋 Rilevato formato v3.0 OLD (con separatori)")
                         else:
-                            print("📋 Rilevato formato v3.0 NEW (senza separatori)")
+                            kind = ("v4.0 a eventi"
+                                    if pf.is_event_recording(file_version)
+                                    else "v3.0 NEW")
+                            print(f"📋 Rilevato formato {kind} (senza separatori)")
                     
                     # === PARSING ADATTIVO ===
                     offset = 0
@@ -247,21 +250,28 @@ class AudioLoadWorker(QObject):
                 # CHECKPOINT 59%
                 self.progress.emit(59)
                 
-                click_events = []
-                try:
-                    if click_section and len(click_section) >= 8:
-                        marker = click_section[0:4]
-                        if marker == b'CLCK':
-                            click_length = struct.unpack('<I', click_section[4:8])[0]
-                            if len(click_section) >= 8 + click_length:
-                                compressed_data = click_section[8:8+click_length]
-                                try:
-                                    decompressed = zlib.decompress(compressed_data)
-                                    click_events = json.loads(decompressed.decode('utf-8'))
-                                except:
-                                    click_events = []
-                except:
-                    click_events = []
+                click_events = pf.parse_click_payload(click_payload)
+                # The analysed rows as the operator saw and labelled them. Empty
+                # for any file saved before EVTR existed, which is why every
+                # consumer has to treat this as an addition to what it computes
+                # rather than as the source of truth.
+                saved_rows = pf.parse_row_payload(row_payload)
+
+                # ── EVENT RECORDINGS (v4) ────────────────────────────────────
+                # In a v4 file body frame i is NOT the i-th frame of the signal:
+                # only click candidates and their neighbours were transmitted.
+                # The EVNT footer says where each one actually sits, and carries
+                # the noise state the board measured at that moment — which the
+                # host cannot recompute, because it comes from a
+                # minimum-statistics estimator over the quiet frames that were
+                # never sent.
+                event_meta = pf.parse_event_payload(event_payload)
+                is_event_file = pf.is_event_recording(file_version)
+                if is_event_file and len(event_meta['frame_idx']) != len(fft_data):
+                    print(f"⚠️ EVNT: {len(event_meta['frame_idx'])} record per "
+                          f"{len(fft_data)} frame — footer ignorato")
+                    event_meta = pf.parse_event_payload(b'')
+                    is_event_file = False
 
                 # STEP 4: Metadata and timing calculations
                                 
@@ -284,7 +294,17 @@ class AudioLoadWorker(QObject):
                 frame_duration_ms = (1000.0
                                      * header_info.get('fft_size', V5_FFT_SIZE)
                                      / header_info.get('fs', V5_FS))
-                total_duration_sec = (total_frames * frame_duration_ms / 1000.0)
+                if is_event_file and len(event_meta['frame_idx']):
+                    # An event recording holds only the transmitted frames, so
+                    # frame count x frame duration is its WIRE VOLUME, not its
+                    # length: a 40-minute session with 1 % of frames sent would
+                    # report as 24 seconds. The last frame's own position is the
+                    # only thing that knows how long the session was.
+                    total_duration_sec = (
+                        (int(event_meta['frame_idx'][-1]) + 1)
+                        * frame_duration_ms / 1000.0)
+                else:
+                    total_duration_sec = (total_frames * frame_duration_ms / 1000.0)
 
             # NEW STEP 4.5: Precompute FFT means + adaptive noise  (was in main thread)
             # Runs in the worker thread so the UI never freezes.
@@ -321,99 +341,146 @@ class AudioLoadWorker(QObject):
             std_noises      = np.empty(n, dtype=np.float64)
             fft_timestamps  = np.empty(n, dtype=np.float64)
 
-            estimator = AdaptiveNoiseEstimatorV5()
+            if is_event_file:
+                # ── EVENT RECORDING ──────────────────────────────────────────
+                # Nothing to estimate. Running AdaptiveNoiseEstimatorV5 over
+                # these frames would build a "noise floor" out of clicks: they
+                # are the only frames that were transmitted. The board measured
+                # the real values over the quiet frames as they went past and
+                # put them in the EVNT footer, and those were verified against
+                # this pipeline's own reference to ~1e-7 on hardware.
+                #
+                # This also makes an event recording load in milliseconds rather
+                # than doing an iFFT and a Hilbert transform per frame.
+                fft_timestamps = pf.event_timestamps(
+                    event_meta['frame_idx'], fs_h, fft_size_h)
+                fft_means_arr = np.asarray(event_meta['E_i'], dtype=np.float64)
+                E_hat_floors = np.asarray(event_meta['E_hat_floor'], dtype=np.float64)
+                noise_floors = np.asarray(event_meta['noise_floor'], dtype=np.float64)
+                std_noises = np.asarray(event_meta['std_noise'], dtype=np.float64)
+                # Buffer 3 stays empty, so p_noise_at() returns None and the v6
+                # spectral family comes back NaN — the same honest gap the live
+                # pipeline has, for the same reason: B3 is a rolling mean over
+                # 750 ACCEPTED frames and its input is the quiet ones.
+                self.progress.emit(92)
+            else:
+                estimator = AdaptiveNoiseEstimatorV5()
 
-            for i in range(n):
-                if self._cancelled:
-                    return
+                for i in range(n):
+                    if self._cancelled:
+                        return
 
-                fft_frame = fft_data[i]
-                fft_timestamps[i] = i * frame_duration_ms / 1000.0
+                    fft_frame = fft_data[i]
+                    fft_timestamps[i] = i * frame_duration_ms / 1000.0
 
-                # Pad into full half-spectrum and normalize
-                full_mags = np.zeros(fft_size_h // 2, dtype=np.float64)
-                mags_raw  = np.asarray(fft_frame, dtype=np.float64)
-                n_bins = min(len(mags_raw), V5_BIN_END - V5_BIN_START + 1)
-                full_mags[V5_BIN_START : V5_BIN_START + n_bins] = mags_raw[:n_bins]
-                fft_norm = _normalize_fft(full_mags, full_freq_axis)
+                    # Pad into full half-spectrum and normalize
+                    full_mags = np.zeros(fft_size_h // 2, dtype=np.float64)
+                    mags_raw  = np.asarray(fft_frame, dtype=np.float64)
+                    n_bins = min(len(mags_raw), V5_BIN_END - V5_BIN_START + 1)
+                    full_mags[V5_BIN_START : V5_BIN_START + n_bins] = mags_raw[:n_bins]
+                    fft_norm = _normalize_fft(full_mags, full_freq_axis)
 
-                # FIX: compute energy [V²] FIRST, store it in fft_means_arr
-                # (previously stored mean amplitude [V] → mismatch with E_hat_floors [V²])
-                E_i = float(_compute_fft_energy_v5(fft_norm[V5_BIN_START : V5_BIN_END + 1]))
-                fft_means_arr[i] = E_i   # [V²] — now matches E_hat_floor_arr units
+                    # FIX: compute energy [V²] FIRST, store it in fft_means_arr
+                    # (previously stored mean amplitude [V] → mismatch with E_hat_floors [V²])
+                    E_i = float(_compute_fft_energy_v5(fft_norm[V5_BIN_START : V5_BIN_END + 1]))
+                    fft_means_arr[i] = E_i   # [V²] — now matches E_hat_floor_arr units
 
-                # iFFT + Hilbert for B2 buffer
-                if i < len(phase_data):
-                    frame_data_r = reconstruct_frame_v5(
-                        mags_raw, phase_data[i], fs_h, fft_size_h, normalize=True
-                    )
-                else:
-                    frame_data_r = None
+                    # iFFT + Hilbert for B2 buffer
+                    if i < len(phase_data):
+                        frame_data_r = reconstruct_frame_v5(
+                            mags_raw, phase_data[i], fs_h, fft_size_h, normalize=True
+                        )
+                    else:
+                        frame_data_r = None
 
-                if frame_data_r is not None:
-                    env        = compute_hilbert_envelope(frame_data_r['signal'])
-                    env_mean_i = float(np.mean(env))
-                    env_std_i  = float(np.std(env))
-                else:
-                    # FIX: fallback must pass amplitude [V], not energy [V²]
-                    env_mean_i = float(np.sqrt(max(E_i, 0.0)))
-                    env_std_i  = 0.0
+                    if frame_data_r is not None:
+                        env        = compute_hilbert_envelope(frame_data_r['signal'])
+                        env_mean_i = float(np.mean(env))
+                        env_std_i  = float(np.std(env))
+                    else:
+                        # FIX: fallback must pass amplitude [V], not energy [V²]
+                        env_mean_i = float(np.sqrt(max(E_i, 0.0)))
+                        env_std_i  = 0.0
 
-                # mags_norm feeds Buffer 3 (v6 §2). It MUST be the mic-normalised
-                # band slice — trap (b) of §4.4; raw magnitudes would corrupt every
-                # v6 feature silently. Passing it does not change any v5 output
-                # (asserted in test_scripts/verify_v6_buffer3.py §1).
-                noise = estimator.update(
-                    E_i, env_mean_i, env_std_i,
-                    mags_norm=fft_norm[V5_BIN_START : V5_BIN_END + 1],
-                    fs=fs_h, fft_size=fft_size_h)
-                E_hat_floors[i] = noise['E_hat_floor']
-                noise_floors[i] = noise['noise_floor']
-                std_noises[i]   = noise['std_noise']
+                    # mags_norm feeds Buffer 3 (v6 §2). It MUST be the mic-normalised
+                    # band slice — trap (b) of §4.4; raw magnitudes would corrupt every
+                    # v6 feature silently. Passing it does not change any v5 output
+                    # (asserted in test_scripts/verify_v6_buffer3.py §1).
+                    noise = estimator.update(
+                        E_i, env_mean_i, env_std_i,
+                        mags_norm=fft_norm[V5_BIN_START : V5_BIN_END + 1],
+                        fs=fs_h, fft_size=fft_size_h)
+                    E_hat_floors[i] = noise['E_hat_floor']
+                    noise_floors[i] = noise['noise_floor']
+                    std_noises[i]   = noise['std_noise']
 
-                if i % _p_stride == 0:
-                    _pn = estimator.p_noise_psd()
-                    if _pn is not None:
-                        p_noise_snapshots[i // _p_stride] = _pn
-                        p_noise_counts[i // _p_stride]    = estimator.b3_window_frames
+                    if i % _p_stride == 0:
+                        _pn = estimator.p_noise_psd()
+                        if _pn is not None:
+                            p_noise_snapshots[i // _p_stride] = _pn
+                            p_noise_counts[i // _p_stride]    = estimator.b3_window_frames
 
-                # Report progress: map i/n → 60..92 %
-                if i % 500 == 0:
-                    pct = 60 + int((i / n) * 32)
-                    self.progress.emit(pct)
+                    # Report progress: map i/n → 60..92 %
+                    if i % 500 == 0:
+                        pct = 60 + int((i / n) * 32)
+                        self.progress.emit(pct)
 
             self.progress.emit(93)
 
             # STEP 5: Overview — now instant (reads fft_means_arr)
             self.progress.emit(94)
-            overview_fps    = 10
-            overview_points = int(total_duration_sec * overview_fps)
-            frame_step      = max(1, total_frames // overview_points)
-            overview_x = []
-            overview_y = []
-            for i in range(0, total_frames, frame_step):
-                if self._cancelled:
-                    return
-                overview_x.append(i * frame_duration_ms / 1000.0)
-                overview_y.append(float(fft_means_arr[i]))
-            overview_x = np.array(overview_x)
-            overview_y = np.array(overview_y)
+            if is_event_file:
+                # No decimation: an event recording transmits a small fraction
+                # of its frames, so every one of them fits in the overview and
+                # dropping any would hide a click. What it DOES need is the gaps
+                # — plotted as a plain series, pyqtgraph would draw a straight
+                # line from the last frame of one cluster to the first of the
+                # next, a slope across forty minutes of silence that looks
+                # exactly like data.
+                overview_x, overview_y = pf.gapped_series(
+                    fft_timestamps, fft_means_arr, frame_duration_ms / 1000.0)
+            else:
+                overview_fps    = 10
+                # max(1, ...) on BOTH: a recording shorter than 100 ms gives
+                # overview_points == 0, and total_frames // 0 raised
+                # ZeroDivisionError before any of this was reached — the file
+                # simply refused to open.
+                overview_points = max(1, int(total_duration_sec * overview_fps))
+                frame_step      = max(1, total_frames // overview_points)
+                overview_x = []
+                overview_y = []
+                for i in range(0, total_frames, frame_step):
+                    if self._cancelled:
+                        return
+                    overview_x.append(i * frame_duration_ms / 1000.0)
+                    overview_y.append(float(fft_means_arr[i]))
+                overview_x = np.array(overview_x)
+                overview_y = np.array(overview_y)
 
             # STEP 6: Streaming buffer — also instant
             self.progress.emit(96)
             start_time  = 0.0
             end_time    = min(total_duration_sec, 20.0)
-            start_frame = 0
-            end_frame   = min(int(end_time * 1000 / frame_duration_ms), total_frames)
-            stream_x = []
-            stream_y = []
-            for frame_idx in range(start_frame, end_frame):
-                if self._cancelled:
-                    return
-                stream_x.append(frame_idx * frame_duration_ms / 1000.0)
-                stream_y.append(float(fft_means_arr[frame_idx]))
-            streaming_x = np.array(stream_x)
-            streaming_y = np.array(stream_y)
+            if is_event_file:
+                # A time window is a SEARCH over the real timestamps, not a
+                # slice: rows are not one frame apart.
+                lo = int(np.searchsorted(fft_timestamps, start_time, 'left'))
+                hi = int(np.searchsorted(fft_timestamps, end_time, 'right'))
+                streaming_x, streaming_y = pf.gapped_series(
+                    fft_timestamps[lo:hi], fft_means_arr[lo:hi],
+                    frame_duration_ms / 1000.0)
+            else:
+                start_frame = 0
+                end_frame   = min(int(end_time * 1000 / frame_duration_ms), total_frames)
+                stream_x = []
+                stream_y = []
+                for frame_idx in range(start_frame, end_frame):
+                    if self._cancelled:
+                        return
+                    stream_x.append(frame_idx * frame_duration_ms / 1000.0)
+                    stream_y.append(float(fft_means_arr[frame_idx]))
+                streaming_x = np.array(stream_x)
+                streaming_y = np.array(stream_y)
 
             # STEP 7: Emit result
             self.progress.emit(98)
@@ -443,6 +510,21 @@ class AudioLoadWorker(QObject):
                 'p_noise_snapshots'    : p_noise_snapshots,
                 'p_noise_stride'       : _p_stride,
                 'p_noise_counts'       : p_noise_counts,
+                # v4 only; empty arrays and False for a continuous recording, so
+                # a caller can read these unconditionally.
+                'saved_rows'           : saved_rows,
+                'is_event_recording'   : is_event_file,
+                'event_frame_idx'      : event_meta['frame_idx'],
+                'event_flags'          : event_meta['flags'],
+                'event_E_i'            : event_meta['E_i'],
+                'event_E_hat_floor'    : event_meta['E_hat_floor'],
+                'event_noise_floor'    : event_meta['noise_floor'],
+                'event_std_noise'      : event_meta['std_noise'],
+                # Where each transmitted frame really sits, in seconds. For a
+                # continuous file this is just frame index x frame duration.
+                'event_timestamps'     : (
+                    pf.event_timestamps(event_meta['frame_idx'], fs, fft_size)
+                    if is_event_file else np.array([], dtype=np.float64)),
             }
 
             self.finished.emit(data_dict)
