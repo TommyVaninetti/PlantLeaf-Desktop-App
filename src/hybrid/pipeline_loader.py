@@ -155,6 +155,13 @@ class FrameDataManager:
         self.E_hat_floor_arr = None
         self.noise_floor_arr = None
         self.std_noise_arr = None
+        # v6 Buffer 3. Named exactly as AudioLoadWorker names them, because
+        # click_pipeline_v5.p_noise_at()/p_noise_frames_at() read them off the
+        # data manager by getattr — matching the names is what lets the hybrid
+        # path reuse those helpers instead of growing a second implementation.
+        self.p_noise_snapshots = None
+        self.p_noise_stride = None
+        self.p_noise_counts = None
 
     def attach_stage1_arrays(self, arrays: dict) -> "FrameDataManager":
         """Attach the per-frame arrays from `compute_stage1_arrays`. Chainable."""
@@ -162,6 +169,9 @@ class FrameDataManager:
         self.E_hat_floor_arr = arrays["E_hat_floor_arr"]
         self.noise_floor_arr = arrays["noise_floor_arr"]
         self.std_noise_arr = arrays["std_noise_arr"]
+        self.p_noise_snapshots = arrays.get("p_noise_snapshots")
+        self.p_noise_stride = arrays.get("p_noise_stride")
+        self.p_noise_counts = arrays.get("p_noise_counts")
         return self
 
 
@@ -181,6 +191,24 @@ def compute_stage1_arrays(mags, phases, fs: int = 200_000, fft_size: int = 512) 
     One pass, not two: the arrays feed `run_stage1_v5_precomputed` for the
     threshold test *and* carry the noise floor at every frame, so there is no
     need to re-walk the recording to read the floor at a particular point.
+
+    Buffer 3 (v6)
+    -------------
+    `mags_norm` is passed to `est.update()` so the per-bin noise PSD actually
+    fills. Without it `est.p_noise_psd()` returns None for the whole recording,
+    `compute_features_v5` takes its `p_noise_psd is None` early return, and every
+    v6 region feature — `harmonic_confinement` included — comes out NaN. Since
+    `_stage2_reason` treats NaN as *pass*, that failure is silent: the v6 gates
+    would simply never fire and the pass rate would look better than it is.
+
+    The slice handed over is the mic-normalized analysis band, the same one E_i
+    is computed from — trap (b) of v6 §4.4; raw magnitudes would corrupt every v6
+    feature without any visible symptom.
+
+    B3 is sampled on a stride rather than stored per frame, exactly as
+    AudioLoadWorker does it (`SUBWINDOW_SIZE`, float32), so that
+    `cp.p_noise_at(dm, i)` reads it back unchanged. Staleness is bounded: between
+    two snapshots at most SUBWINDOW_SIZE of W_NOISE = 750 entries rotate.
     """
     import numpy as np
 
@@ -194,6 +222,11 @@ def compute_stage1_arrays(mags, phases, fs: int = 200_000, fft_size: int = 512) 
     env_mean = np.zeros(n, dtype=np.float64)
     env_std = np.zeros(n, dtype=np.float64)
 
+    stride = int(cp.SUBWINDOW_SIZE)
+    n_snap = (n + stride - 1) // stride
+    p_noise_snapshots = np.full((n_snap, cp._K_BINS), np.nan, dtype=np.float32)
+    p_noise_counts = np.zeros(n_snap, dtype=np.int32)
+
     est = cp.AdaptiveNoiseEstimatorV5()
     last = {"E_hat_floor": 0.0, "noise_floor": 0.0, "std_noise": 0.0}
 
@@ -205,16 +238,23 @@ def compute_stage1_arrays(mags, phases, fs: int = 200_000, fft_size: int = 512) 
                 last["E_hat_floor"], last["noise_floor"], last["std_noise"])
             continue
 
-        e_i = cp.compute_fft_energy(frame["fft_norm"][cp._BIN_START:cp._BIN_END + 1])
+        band = frame["fft_norm"][cp._BIN_START:cp._BIN_END + 1]
+        e_i = cp.compute_fft_energy(band)
         envelope = cp.compute_hilbert_envelope(frame["signal"])
         m, s = float(np.mean(envelope)), float(np.std(envelope))
 
-        last = est.update(e_i, m, s)
+        last = est.update(e_i, m, s, mags_norm=band, fs=fs, fft_size=fft_size)
         fft_means[i] = e_i
         env_mean[i], env_std[i] = m, s
         e_hat[i] = last["E_hat_floor"]
         noise_floor[i] = last["noise_floor"]
         std_noise[i] = last["std_noise"]
+
+        if i % stride == 0:
+            pn = est.p_noise_psd()
+            if pn is not None:
+                p_noise_snapshots[i // stride] = pn
+                p_noise_counts[i // stride] = est.b3_window_frames
 
     return {
         "fft_means": fft_means,
@@ -223,5 +263,8 @@ def compute_stage1_arrays(mags, phases, fs: int = 200_000, fft_size: int = 512) 
         "std_noise_arr": std_noise,
         "envelopes_mean": env_mean,
         "envelopes_std": env_std,
+        "p_noise_snapshots": p_noise_snapshots,
+        "p_noise_stride": stride,
+        "p_noise_counts": p_noise_counts,
         "final": last,
     }

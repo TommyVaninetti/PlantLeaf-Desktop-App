@@ -559,6 +559,113 @@ def check_tau_resample_agreement(clips):
           f"{100 * np.mean(np.abs(deltas) < 20):.0f} % of {len(deltas)} clips")
 
 
+def check_v6_gate_inputs(clips):
+    """
+    Do v6's Stage-2 gates actually receive their inputs on the injection path?
+
+    This is a plumbing test, not a physics test, and it exists because the
+    failure it guards is SILENT. `_stage2_reason` treats NaN and missing keys as
+    PASS, so a gate whose input never arrives does not error out — it quietly
+    stops gating, and the pass rate comes out flatteringly high. Two of the four
+    v6 gates are fed from outside `compute_features_v5`:
+
+        local_crest           <- _stage1_select, merged in by _analyse_injection
+        harmonic_confinement  <- needs p_noise_psd, i.e. Buffer 3 must be fed
+
+    A SYNTHETIC Gaussian bed is used deliberately: the question is whether the
+    numbers arrive, and that must be answerable with no external drive mounted.
+    It is not a PlantLeaf noise bed and no pass rate measured here means anything.
+    """
+    print("\n10. v6 Stage 2 gate inputs reach the injection path")
+    from hybrid import dryad_io as dio
+    from hybrid import injector as inj
+    from hybrid import noise_bed as nb
+    from hybrid.pipeline_loader import FrameDataManager, compute_stage1_arrays
+
+    cp = load_pipeline()
+    rng = np.random.default_rng(20260913)
+    n_clicks, warmup, spacing_s = 8, 750, 1.0
+
+    n_frames = warmup + int(np.ceil(n_clicks * spacing_s * fe.FS / fe.FFT_SIZE)) + 400
+    sig = rng.normal(0.0, 3.0e-3, n_frames * fe.FFT_SIZE)
+    mags, phases = fe.frames_from_signal(sig)
+    arrays = compute_stage1_arrays(mags, phases, fs=fe.FS, fft_size=fe.FFT_SIZE)
+
+    snaps = arrays.get("p_noise_snapshots")
+    finite = 0 if snaps is None else int(np.sum(np.all(np.isfinite(snaps), axis=1)))
+    check("Buffer 3 fills (mags_norm reaches est.update)", finite > 0,
+          f"{finite}/{0 if snaps is None else len(snaps)} finite snapshots, "
+          f"stride {arrays.get('p_noise_stride')}")
+
+    dm = FrameDataManager(mags, phases, fs=fe.FS, fft_size=fe.FFT_SIZE)
+    dm.attach_stage1_arrays(arrays)
+    check("p_noise_at reads B3 back off the shim",
+          cp.p_noise_at(dm, n_frames - 10) is not None,
+          "attribute names match AudioLoadWorker's")
+
+    bed = nb.BedWindow(
+        bed_id="synthetic", source_path="<synthetic>", session_id="synthetic",
+        room="synthetic", start_frame=0, n_frames=n_frames, warmup_frames=warmup,
+        signal=sig,
+        noise_floor=float(np.median(arrays["noise_floor_arr"][warmup:])),
+        std_noise=float(np.median(arrays["std_noise_arr"][warmup:])),
+        e_hat_floor=float(np.median(arrays["E_hat_floor_arr"][warmup:])),
+        candidate_rate=0.0, regime="synthetic")
+
+    pool = [c for c in clips if c.is_click]
+    picked = [pool[i] for i in rng.choice(len(pool), n_clicks, replace=False)]
+    _, _, results = inj.inject_batch(
+        bed, [dio.read_clip(c) for c in picked], rng,
+        amplitude_mode=inj.AMPLITUDE_FIXED_SNR,
+        target_peak_snr=inj.PLANTLEAF_MEDIAN_PEAK_SNR,
+        spacing_s=spacing_s, keep_render_payload=False)
+
+    det = [r for r in results if r.detected]
+    check("injected clicks trip Stage 1 (precondition)", len(det) == len(results),
+          f"{len(det)}/{len(results)}")
+
+    def n_bad(key):
+        return sum(1 for r in det
+                   if r.features.get(key) is None or r.features[key] != r.features[key])
+
+    for key in ("peak_SNR", "n_seg", "local_crest"):
+        bad = n_bad(key)
+        check(f"{key} finite on every detected click", bad == 0,
+              "gate active" if bad == 0 else f"{bad}/{len(det)} NaN -> GATE SILENTLY PASSES")
+
+    b3 = [r.features.get("b3_frames", 0) for r in det]
+    check("Buffer 3 is warm at the click frames", min(b3) >= 0.9 * cp.W_NOISE,
+          f"min {int(min(b3))} of W_NOISE={cp.W_NOISE} accepted frames")
+
+    # harmonic_confinement is NaN in two DEFINED cases (m == 0, maximally
+    # unconfined; n_B == 0, second harmonic off-band). Those are honest NaNs and
+    # passing the gate is correct. A missing p_noise_psd looks different: f1_hz
+    # goes NaN too, because it is set before any band arithmetic happens.
+    undefined = [r for r in det
+                 if r.features.get("harmonic_confinement", float("nan"))
+                 != r.features.get("harmonic_confinement", float("nan"))]
+    blind = [r for r in undefined
+             if r.features.get("hc_f1_hz", float("nan"))
+             != r.features.get("hc_f1_hz", float("nan"))]
+    check("harmonic_confinement NaNs are defined, not a missing p_noise_psd",
+          not blind,
+          f"{len(undefined)}/{len(det)} undefined, {len(blind)} of them blind "
+          f"(f1_hz also NaN)")
+
+    modes = {(r.stage2_reason_v5, r.stage2_reason_v6) for r in det}
+    check("both Stage 2 modes are evaluated on one feature vector",
+          all(isinstance(a, str) and isinstance(b, str) for a, b in modes),
+          f"{len(modes)} distinct (v5, v6) verdict pairs over {len(det)} clicks")
+
+    prov = results[0].provenance()
+    wanted = ("stage2_reason_v5", "stage2_reason_v6", "stage2_pass_v5",
+              "stage2_pass_v6", "feat_local_crest", "feat_harmonic_confinement",
+              "feat_b3_frames")
+    check("provenance() exports the paired verdict columns",
+          all(k in prov for k in wanted),
+          ", ".join(k for k in wanted if k not in prov) or "all present")
+
+
 def main() -> int:
     print("=" * 72)
     print("Dryad hybrid channel model - verification suite")
@@ -573,6 +680,7 @@ def main() -> int:
     clips = check_dryad_corpus()
     check_injection(clips)
     check_tau_resample_agreement(clips)
+    check_v6_gate_inputs(clips)
 
     failed = [name for name, ok, _ in _RESULTS if not ok]
     print("\n" + "=" * 72)

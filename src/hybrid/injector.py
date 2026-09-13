@@ -185,6 +185,13 @@ class InjectionResult:
     noise_floor: float
     std_noise: float
     features: dict = field(default_factory=dict)
+    # Stage 2 evaluated under BOTH gate sets on this one feature vector. Priority
+    # 1 of the Khait action plan is a paired comparison, and pairing it here —
+    # rather than against a pass rate measured in an earlier run — means the bed
+    # pool, the injection gain and the feature code are identical in both arms,
+    # so the difference is attributable to the gate redesign and nothing else.
+    stage2_reason_v5: str = ""
+    stage2_reason_v6: str = ""
     # payload kept only when the caller asks (rendering); never serialised
     render: dict | None = field(default=None, repr=False)
 
@@ -210,6 +217,10 @@ class InjectionResult:
             "detected": self.detected,
             "measured_peak_snr": self.measured_peak_snr,
             "noise_floor_V": self.noise_floor, "std_noise_V": self.std_noise,
+            "stage2_reason_v5": self.stage2_reason_v5,
+            "stage2_reason_v6": self.stage2_reason_v6,
+            "stage2_pass_v5": int(self.stage2_reason_v5 == ""),
+            "stage2_pass_v6": int(self.stage2_reason_v6 == ""),
         }
         out.update({f"feat_{k}": v for k, v in self.features.items()})
         return out
@@ -442,6 +453,7 @@ def inject_batch(bed: BedWindow, clips: Sequence[ClipAudio],
             amplitude_mode=amplitude_mode, stratum=stratum,
             template=template if keep_render_payload else None,
             native=audio.samples if keep_render_payload else None,
+            dm=dm, cand=candidate_frames.get(anchor),
         )
         results.append(result)
 
@@ -451,7 +463,7 @@ def inject_batch(bed: BedWindow, clips: Sequence[ClipAudio],
 def _analyse_injection(cp, mags, phases, arrays, frame_idx: int, clip: DryadClip,
                        bed: BedWindow, *, t0: int, gain: float, target: float,
                        detected: bool, amplitude_mode: str, stratum: str,
-                       template, native) -> InjectionResult:
+                       template, native, dm=None, cand=None) -> InjectionResult:
     """
     Reconstruct the prev|curr|next context around `frame_idx` and extract features.
 
@@ -487,9 +499,32 @@ def _analyse_injection(cp, mags, phases, arrays, frame_idx: int, clip: DryadClip
     std_noise = float(arrays["std_noise_arr"][frame_idx])
 
     resolved = cp.resolve_click(ctx, noise_floor, std_noise)
+
+    # p_noise_psd is what switches the v6 region features on. Omit it and
+    # compute_features_v5 takes its `p_noise_psd is None` early return:
+    # harmonic_confinement comes back NaN, and because _stage2_reason treats NaN
+    # as *pass*, the v6 harmonic gate would silently never fire. Same helper the
+    # app uses, reading the strided snapshots off the data manager.
+    p_noise = cp.p_noise_at(dm, frame_idx) if dm is not None else None
     features = cp.compute_features_v5(
-        ctx, resolved, curr["fft_norm"], curr["freq_axis"], noise_floor, std_noise, fe.FS
+        ctx, resolved, curr["fft_norm"], curr["freq_axis"], noise_floor, std_noise,
+        fe.FS, p_noise_psd=p_noise,
     )
+    features["b3_frames"] = float(
+        cp.p_noise_frames_at(dm, frame_idx) if dm is not None else 0)
+
+    # local_crest is produced by _stage1_select, not by compute_features_v5, so
+    # without this merge the v6 crest gate has no value to read — and would also
+    # silently pass. run_id/run_length/pos_in_run come along because they explain
+    # a crest value when one looks wrong.
+    if cand is not None:
+        for key in ("local_crest", "run_id", "run_length", "run_crest",
+                    "pos_in_run", "would_pass_v5"):
+            if key in cand and cand[key] is not None:
+                try:
+                    features[key] = float(cand[key])
+                except (TypeError, ValueError):
+                    pass
 
     # Kept because decay_len explains most of the variation in tau and R2, and
     # short windows are exactly where Dryad clicks differ from PlantLeaf's
@@ -506,6 +541,15 @@ def _analyse_injection(cp, mags, phases, arrays, frame_idx: int, clip: DryadClip
             "noise_floor": noise_floor, "std_noise": std_noise,
         }
 
+    # Only a detected candidate has a Stage 2 verdict at all; an undetected clip
+    # never reached Stage 2, and scoring it here would quietly turn a Stage 1
+    # miss into a Stage 2 pass.
+    if detected:
+        reason_v5 = cp._stage2_reason(features, mode=cp.STAGE2_MODE_V5)
+        reason_v6 = cp._stage2_reason(features, mode=cp.STAGE2_MODE_CONSERVATIVE)
+    else:
+        reason_v5 = reason_v6 = "not_detected"
+
     return InjectionResult(
         clip_id=clip.clip_id, class_name=clip.class_name, species=clip.species,
         condition=clip.condition, is_click=clip.is_click, source_path=str(clip.path),
@@ -517,5 +561,6 @@ def _analyse_injection(cp, mags, phases, arrays, frame_idx: int, clip: DryadClip
         measured_peak_snr=float(features.get("peak_SNR", float("nan"))),
         noise_floor=noise_floor, std_noise=std_noise,
         features={k: float(v) for k, v in features.items()},
+        stage2_reason_v5=reason_v5, stage2_reason_v6=reason_v6,
         render=render,
     )
