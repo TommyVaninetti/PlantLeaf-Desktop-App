@@ -16,7 +16,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with PlantLeaf. If not, see <https://www.gnu.org/licenses/>.
 
-"""
+""" 
 Priority 1 of the Khait action plan: Stage 2 under v5's gates vs v6's gates.
 
 WHY THIS IS PAIRED IN-RUN RATHER THAN AGAINST THE OLD REPORT
