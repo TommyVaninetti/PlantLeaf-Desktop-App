@@ -11,6 +11,7 @@ if _SIM_DIR not in sys.path:
     sys.path.insert(0, _SIM_DIR)
 
 import numpy as np
+from scipy.signal import hilbert
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QLabel, QPushButton, QDoubleSpinBox, QSlider, QGroupBox,
@@ -29,15 +30,6 @@ from config.app_config import AppConfig
 from plotting.plot_manager import BasePlotWidget
 
 
-class _PaudioDM:
-    """Minimal adapter so run_stage1_v5 can consume raw paudio arrays."""
-    def __init__(self, fft_data, phase_data, fs, fft_size):
-        self.fft_data     = fft_data
-        self.phase_data   = phase_data
-        self.header_info  = {'fs': fs, 'fft_size': fft_size}
-        self.total_frames = len(fft_data)
-
-
 SLIDER_CSS = (
     "QSlider::groove:horizontal { background: #a5d6a7; height: 6px; border-radius: 3px; }"
     "QSlider::handle:horizontal { background: #5a7559; border: 2px solid #5a7559;"
@@ -52,12 +44,14 @@ class SimulationWorker(QObject):
     error = Signal(str)
     progress = Signal(int)
 
-    def __init__(self, R0, P_inf, distance_m, tau_target_ms=None):
+    def __init__(self, R0, P_inf, distance_m, tau_target_ms=None, freq_target_hz=None, real_signal_for_fit=None):
         super().__init__()
         self.R0 = R0
         self.P_inf = P_inf
         self.distance_m = distance_m
         self.tau_target_ms = tau_target_ms
+        self.freq_target_hz = freq_target_hz
+        self.real_signal_for_fit = real_signal_for_fit
 
     def run(self):
         try:
@@ -67,120 +61,12 @@ class SimulationWorker(QObject):
                 R0=self.R0,
                 P_inf=self.P_inf,
                 distance_m=self.distance_m,
-                tau_target_ms=self.tau_target_ms
+                tau_target_ms=self.tau_target_ms,
+                freq_target_hz=self.freq_target_hz,
+                real_signal_for_fit=self.real_signal_for_fit
             )
             self.progress.emit(100)
             self.finished.emit(result)
-        except Exception as e:
-            import traceback
-            self.error.emit(f"{str(e)}\n{traceback.format_exc()}")
-
-
-class ClickDetectorWorker(QObject):
-    finished = Signal(list)   # emits the raw click list on success
-    error    = Signal(str)
-
-    def __init__(self, fft_data, phase_data, fs, fft_size, frame_duration_ms):
-        super().__init__()
-        self.fft_data          = fft_data
-        self.phase_data        = phase_data
-        self.fs                = fs
-        self.fft_size          = fft_size
-        self.frame_duration_ms = frame_duration_ms
-
-    def run(self):
-        try:
-            from pathlib import Path
-            from core.click_pipeline_v5 import (
-                run_stage1_v5, run_stage2_v5, run_stage3_v5, run_stage4_v5,
-                reconstruct_frame_v5,
-                build_click_context, resolve_click, click_event_key,
-                compute_features_v5, load_svm_model,
-            )
-            from config.app_config import AppConfig
-
-            fft_data          = self.fft_data
-            phase_data        = self.phase_data
-            fs                = self.fs
-            fft_size          = self.fft_size
-            frame_duration_ms = self.frame_duration_ms
-
-            model_path = Path(AppConfig.BASE_DIR) / 'src' / 'ml' / 'plantleaf_svm_v5.pkl'
-            svm_model = load_svm_model(model_path)
-
-            dm = _PaudioDM(fft_data, phase_data, fs, fft_size)
-            stage1_candidates = run_stage1_v5(dm, k=1.5)
-            if not stage1_candidates:
-                self.finished.emit([])
-                return
-
-            candidates_with_features = []
-            for cand in stage1_candidates:
-                fi = cand['frame_idx']
-                try:
-                    fd = reconstruct_frame_v5(fft_data[fi], phase_data[fi], fs, fft_size, normalize=True)
-                    if fd is None:
-                        continue
-                    curr_sig = fd['signal']
-
-                    prev_sig = None
-                    if fi > 0 and fi - 1 < len(phase_data):
-                        pf = reconstruct_frame_v5(fft_data[fi-1], phase_data[fi-1], fs, fft_size, normalize=True)
-                        if pf is not None:
-                            prev_sig = pf['signal']
-
-                    next_sig = None
-                    if fi + 1 < len(fft_data) and fi + 1 < len(phase_data):
-                        nf = reconstruct_frame_v5(fft_data[fi+1], phase_data[fi+1], fs, fft_size, normalize=True)
-                        if nf is not None:
-                            next_sig = nf['signal']
-
-                    ctx      = build_click_context(prev_sig, curr_sig, next_sig)
-                    resolved = resolve_click(ctx, cand['noise_floor'], cand['std_noise'])
-                    features = compute_features_v5(
-                        ctx, resolved,
-                        fd['fft_norm'], fd['freq_axis'],
-                        cand['noise_floor'], cand['std_noise'], fs,
-                    )
-                    peak_abs, canonical_frame_idx = click_event_key(ctx, resolved, fi)
-                    candidates_with_features.append({
-                        **cand, **features,
-                        'peak_amp': resolved['peak_amp'],
-                        'peak_abs': peak_abs,
-                        'canonical_frame_idx': canonical_frame_idx,
-                    })
-                except Exception as e:
-                    print(f"Warning: frame {fi} skipped: {e}")
-                    continue
-
-            stage2_survivors, _ = run_stage2_v5(candidates_with_features)
-            if not stage2_survivors:
-                self.finished.emit([])
-                return
-
-            detections, _ = run_stage3_v5(stage2_survivors, svm_model)
-            if not detections:
-                self.finished.emit([])
-                return
-
-            final = run_stage4_v5(detections)
-
-            result = []
-            for det in final:
-                ts = det['frame_idx'] * frame_duration_ms / 1000.0
-                result.append({
-                    'timestamp': ts,
-                    'tau_ms':   det.get('tau_ms', -1.0),
-                    'peak_amp': det.get('peak_amp', 0.0),
-                    'R2':       det.get('R2', 0.0),
-                    'frequency': '',
-                    'amplitude': str(det.get('SPR', '')),
-                    'svm_probability': det.get('svm_probability', 0.0),
-                })
-
-            print(f"✅ Click detector v5: {len(result)} clicks")
-            self.finished.emit(result)
-
         except Exception as e:
             import traceback
             self.error.emit(f"{str(e)}\n{traceback.format_exc()}")
@@ -248,7 +134,6 @@ class MainWindowChemicalSimulator(QMainWindow):
         phys_layout.setSpacing(8)
         phys_layout.setContentsMargins(0, 0, 0, 0)
 
-        # R0
         r0_row = QHBoxLayout()
         r0_lbl = QLabel("R0:")
         r0_lbl.setFixedWidth(35)
@@ -269,7 +154,6 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.r0_slider.valueChanged.connect(lambda v: self.r0_spinbox.setValue(float(v)))
         self.r0_spinbox.valueChanged.connect(lambda v: self.r0_slider.setValue(int(v)))
 
-        # P_inf
         pinf_row = QHBoxLayout()
         pinf_lbl = QLabel("P∞:")
         pinf_lbl.setFixedWidth(35)
@@ -290,7 +174,6 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.pinf_slider.valueChanged.connect(lambda v: self.pinf_spinbox.setValue(v / 100.0))
         self.pinf_spinbox.valueChanged.connect(lambda v: self.pinf_slider.setValue(int(v * 100)))
 
-        # Distance
         dist_row = QHBoxLayout()
         dist_lbl = QLabel("Dist:")
         dist_lbl.setFixedWidth(35)
@@ -535,119 +418,117 @@ class MainWindowChemicalSimulator(QMainWindow):
         if not file_path:
             return
         self.settings_manager.set_last_directory("chem_sim_paudio", file_path)
+        self._start_load(file_path)
 
+    def _start_load(self, file_path):
+        """
+        Read the recording with the app's shared loader (AudioLoadWorker).
+
+        It reads both .paudio formats (v3 continuous, v4 event) and computes, at
+        load time, the Stage-1 arrays and the Buffer-3 noise snapshots that the v6
+        detector needs. The replay window and the Data Collection export use the
+        same loader, so the clicks listed here are the clicks in the dataset.
+        """
+        from saving.audio_load_progress import AudioLoadWorker
+
+        self._discard_simulation()
+        self.real_clicks = []
+        self.click_table.setRowCount(0)
+        self.btn_run.setEnabled(False)
+        self._load_file_path = file_path
+        self.file_label.setText("Loading…")
+
+        dlg = QProgressDialog("Loading .paudio file…", None, 0, 100, self)
+        dlg.setWindowTitle("Load")
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+        dlg.show()
+        self._load_progress = dlg
+
+        worker = AudioLoadWorker(file_path)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        # Bound methods, never lambdas: see _launch_click_detector.
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_load_progress)
+        worker.finished.connect(self._on_load_finished)
+        worker.error.connect(self._on_load_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._load_thread = thread
+        self._load_worker = worker
+        thread.start()
+
+    def _on_load_progress(self, pct):
+        if getattr(self, '_load_progress', None) is not None:
+            self._load_progress.setValue(int(pct))
+
+    def _close_load_progress(self):
+        if getattr(self, '_load_progress', None) is not None:
+            self._load_progress.close()
+            self._load_progress = None
+
+    def _on_load_error(self, msg):
+        self._close_load_progress()
+        self.file_label.setText("Load failed")
+        QMessageBox.critical(self, "Load Error", f"Could not load file:\n{msg}")
+
+    def _on_load_finished(self, data):
+        self._close_load_progress()
         try:
-            import struct, zlib, json as _json
+            from types import SimpleNamespace
 
-            with open(file_path, 'rb') as f:
-                header_bytes = f.read(128)
-                remaining_data = f.read()
-
-            magic = header_bytes[:10].rstrip(b'\x00')
-            if magic != b'PLANTAUDIO':
-                QMessageBox.warning(self, "Error", "Not a valid .paudio file.")
-                return
-
-            version = struct.unpack('<f', header_bytes[10:14])[0]
-            if version >= 4.0:
-                # Event recording: frames are NOT contiguous in time, and this
-                # loader lays them out as if they were. Refusing is the only
-                # honest option - the wrong answer here would look right.
-                QMessageBox.warning(
-                    self, "Event recording",
-                    "This is an event .paudio (v4): only click candidates were "
-                    "recorded, so its frames are not continuous in time.\n\n"
-                    "The chemical simulator needs a continuous recording.")
-                return
-            fs       = struct.unpack('<I', header_bytes[34:38])[0]
-            fft_size = struct.unpack('<I', header_bytes[38:42])[0]
-            freq_min = struct.unpack('<I', header_bytes[42:46])[0]
-            freq_max = struct.unpack('<I', header_bytes[46:50])[0]
-
+            hi       = data['header_info']
+            fs       = int(hi['fs'])
+            fft_size = int(hi['fft_size'])
             bin_freq  = fs / fft_size
-            bin_start = int(freq_min / bin_freq)
-            bin_end   = int(freq_max / bin_freq)
+            bin_start = int(hi['freq_min'] / bin_freq)
+            bin_end   = int(hi['freq_max'] / bin_freq)
             num_bins  = bin_end - bin_start + 1
-            frame_duration_ms = (fft_size / fs) * 1000.0
 
-            click_start_pos = remaining_data.find(b'CLCK')
-            if click_start_pos >= 0:
-                fft_bytes = remaining_data[:click_start_pos]
-                click_section = remaining_data[click_start_pos:]
-            else:
-                fft_bytes = remaining_data
-                click_section = None
-
-            bytes_per_sample = 5 if version >= 3.0 else 4
-            bytes_per_frame  = num_bins * bytes_per_sample
-            n_frames = len(fft_bytes) // bytes_per_frame
-            raw = np.frombuffer(
-                fft_bytes[:n_frames * bytes_per_frame], dtype=np.uint8
-            ).reshape(n_frames, num_bins, bytes_per_sample)
-            # Magnitudes: first 4 bytes of each bin → float32
-            mag_raw  = np.ascontiguousarray(raw[:, :, :4])
-            fft_2d   = mag_raw.view(np.float32).reshape(n_frames, num_bins)
-            fft_data = list(fft_2d)   # list of 1-D float32 arrays
-            if version >= 3.0:
-                # Phase: 5th byte of each bin → int8
-                phase_2d   = np.ascontiguousarray(raw[:, :, 4]).view(np.int8).reshape(n_frames, num_bins)
-                phase_data = list(phase_2d)
-            else:
-                phase_data = []
-
-            # True STFT bin-center frequencies: f[k] = k * (fs/fft_size), k = bin_start..bin_end.
-            # (linspace(freq_min, freq_max, num_bins) would mislabel the top bin by ~1 bin.)
-            freq_axis = np.arange(bin_start, bin_start + num_bins) * bin_freq
+            # The v6 pipeline reads the loader's output as attributes of a data
+            # manager (fft_means, E_hat_floor_arr, p_noise_snapshots, event_*…).
+            self._dm = SimpleNamespace(**data)
 
             self.paudio_data = {
-                'fft_data':   fft_data,
-                'phase_data': phase_data,
-                'freq_axis':  freq_axis,
+                'fft_data':   data['fft_data'],
+                'phase_data': data['phase_data'],
+                # True STFT bin-center frequencies: f[k] = k * (fs/fft_size), k = bin_start..bin_end.
+                'freq_axis':  np.arange(bin_start, bin_start + num_bins) * bin_freq,
                 'fs':         fs,
                 'fft_size':   fft_size,
-                'freq_min':   freq_min,
-                'freq_max':   freq_max,
+                'freq_min':   hi['freq_min'],
+                'freq_max':   hi['freq_max'],
                 'bin_start':  bin_start,
                 'num_bins':   num_bins,
-                'version':    version,
-                'frame_duration_ms': frame_duration_ms,
+                'version':    hi['version'],
+                'frame_duration_ms': data['frame_duration_ms'],
+                'is_event_recording': bool(data.get('is_event_recording', False)),
             }
-
-            clicks_raw = []
-            if click_section and len(click_section) >= 8:
-                marker = click_section[0:4]
-                if marker == b'CLCK':
-                    click_length = struct.unpack('<I', click_section[4:8])[0]
-                    if len(click_section) >= 8 + click_length:
-                        compressed = click_section[8:8+click_length]
-                        try:
-                            clicks_raw = _json.loads(zlib.decompress(compressed).decode('utf-8'))
-                        except:
-                            clicks_raw = []
-
-            # Use embedded clicks only if they carry v5 fields (tau_ms + peak_amp).
-            # Older CLCK sections (format: timestamp/frequency/amplitude/duration_us)
-            # predate these fields — re-run the v5 detector instead.
-            has_v5_fields = bool(clicks_raw) and clicks_raw[0].get('tau_ms') is not None
-            if not has_v5_fields:
-                # Launch detection in a background thread so the UI stays responsive.
-                self._detect_file_path = file_path
-                self._launch_click_detector(fft_data, phase_data, fs, fft_size, frame_duration_ms)
-                return   # UI update happens via _on_detection_finished
-
-            self._process_click_results(clicks_raw, frame_duration_ms, file_path)
-
         except Exception as e:
             import traceback
             QMessageBox.critical(self, "Load Error", f"Could not load file:\n{str(e)}\n{traceback.format_exc()}")
+            return
 
-    def _launch_click_detector(self, fft_data, phase_data, fs, fft_size, frame_duration_ms):
-        self.file_label.setText("Running click detector v5…")
+        # Clicks embedded in the file (CLCK / EVTR) are not reused: they may come
+        # from an older detector. Re-running v6 keeps this list identical to the
+        # replay window's and to the exported dataset.
+        self._launch_click_detector(self._dm)
+
+    def _launch_click_detector(self, dm):
+        from core.click_detection_worker import ClickDetectionWorker
+
+        pd = self.paudio_data
+        self.file_label.setText("Running click detector v6…")
         self.btn_run.setEnabled(False)
 
         dlg = QProgressDialog(
-            "Detecting clicks with v5 pipeline…\n(this may take a moment for long recordings)",
-            None, 0, 0, self,
+            "Detecting clicks with the v6 pipeline…\n(this may take a moment for long recordings)",
+            None, 0, 100, self,
         )
         dlg.setWindowTitle("Click Detection")
         dlg.setWindowModality(Qt.WindowModal)
@@ -657,17 +538,21 @@ class MainWindowChemicalSimulator(QMainWindow):
         QApplication.processEvents()
         self._detect_progress = dlg
 
-        # Store frame_duration_ms so the finished callback can read it without
-        # needing a lambda — lambdas have no thread affinity in Qt and cause
-        # DirectConnection (= callback on worker thread = UI calls on wrong thread).
-        self._pending_frame_duration_ms = frame_duration_ms
-
-        worker = ClickDetectorWorker(fft_data, phase_data, fs, fft_size, frame_duration_ms)
+        worker = ClickDetectionWorker(
+            fft_data=dm.fft_data,
+            phase_data=dm.phase_data,
+            fs=pd['fs'],
+            fft_size=pd['fft_size'],
+            frame_duration_ms=pd['frame_duration_ms'],
+            dm=dm,   # Stage-1 arrays + Buffer 3 from the loader (v6 features)
+        )
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         # Both connections below are QObject→QObject across threads: Qt automatically
-        # uses QueuedConnection, ensuring the slots run on the main thread.
+        # uses QueuedConnection, ensuring the slots run on the main thread. Lambdas
+        # have no thread affinity and would run the slots on the worker thread.
+        worker.progress.connect(self._on_detection_progress)
         worker.finished.connect(self._on_detection_finished)
         worker.error.connect(self._on_detection_error)
         worker.finished.connect(thread.quit)
@@ -679,70 +564,64 @@ class MainWindowChemicalSimulator(QMainWindow):
         self._detect_worker = worker
         thread.start()
 
-    def _on_detection_finished(self, clicks_raw):
+    def _on_detection_progress(self, done, total):
+        if self._detect_progress is not None and total > 0:
+            self._detect_progress.setValue(int(100 * done / total))
+
+    def _on_detection_finished(self, rows):
         if self._detect_progress:
             self._detect_progress.close()
             self._detect_progress = None
-        frame_duration_ms = getattr(self, '_pending_frame_duration_ms', 2.56)
-        file_path         = getattr(self, '_detect_file_path', '')
-        self._process_click_results(clicks_raw, frame_duration_ms, file_path)
+        from core.click_pipeline_v5 import STAGE_OK
+        # The worker returns every Stage-1 candidate with its verdict; only the
+        # ones that survived all four stages are clicks.
+        confirmed = [r for r in (rows or []) if r.get('stage_blocked', STAGE_OK) == STAGE_OK]
+        self._process_click_results(confirmed)
 
     def _on_detection_error(self, msg):
         if self._detect_progress:
             self._detect_progress.close()
             self._detect_progress = None
-        if 'SVM model not found' in msg or 'FileNotFoundError' in msg:
-            QMessageBox.warning(self, "SVM Model Missing",
-                "Could not find plantleaf_svm_v5.pkl.\n"
-                "Train the model first (src/ml/train_svm.py) and save it to src/ml/.")
-        else:
-            QMessageBox.critical(self, "Click Detector Error",
-                f"An error occurred during click detection:\n\n{msg}")
+        QMessageBox.critical(self, "Click Detector Error",
+            f"An error occurred during click detection:\n\n{msg}")
         self.file_label.setText("Detection failed")
 
-    def _process_click_results(self, clicks_raw, frame_duration_ms, file_path):
-        fft_data = self.paudio_data['fft_data'] if self.paudio_data else []
+    def _process_click_results(self, detections):
+        file_path = getattr(self, '_load_file_path', '')
 
-        if not clicks_raw:
+        if not detections:
             QMessageBox.warning(self, "No Clicks",
-                "No ultrasonic clicks found in this file.")
+                "The v6 detector confirmed no ultrasonic clicks in this file.")
             self.file_label.setText("No clicks found")
             return
 
+        is_event = self.paudio_data.get('is_event_recording', False)
         self.real_clicks = []
-        for click in clicks_raw:
-            ts_str = str(click.get('timestamp', '0'))
-            try:
-                ts = float(ts_str.replace('s', '').strip())
-            except Exception:
-                ts = 0.0
-
-            tau_ms = float(click.get('tau_ms', -1.0))
-            if tau_ms <= 0:
-                duration_str = str(click.get('duration', ''))
-                if 'FFT' in duration_str:
-                    try:
-                        fft_count = int(duration_str.replace(' FFT', '').strip())
-                        tau_ms = fft_count * 2.56 / 3.0
-                    except Exception:
-                        pass
-
-            frame_idx = int(round(ts * 1000.0 / frame_duration_ms))
-            frame_idx = max(0, min(frame_idx, max(0, len(fft_data) - 1)))
-
+        for det in sorted(detections, key=lambda d: d.get('frame_idx', 0)):
+            fi = int(det['frame_idx'])
+            if is_event:
+                # Array rows are not frame indices in an event recording, and a
+                # neighbour the board never sent is None.
+                row, prev_row, next_row = det['row_idx'], det.get('prev_row'), det.get('next_row')
+            else:
+                row, prev_row, next_row = fi, fi - 1, fi + 1
+            fpe = det.get('FPE_hz_region')
             self.real_clicks.append({
-                'timestamp': ts,
-                'frame_idx': frame_idx,
-                'tau_ms':    tau_ms,
-                'frequency': click.get('frequency', ''),
-                'amplitude': click.get('amplitude', ''),
-                'r2':        float(click.get('R2', click.get('r2', click.get('r2_log', 0.0)))),
-                'peak_amp':  float(click.get('peak_amp', 0.0)),
+                'timestamp': float(det.get('timestamp_s', 0.0)),
+                'frame_idx': fi,
+                'row_idx':   row,
+                'prev_row':  prev_row,
+                'next_row':  next_row,
+                'tau_ms':    float(det.get('tau_ms', -1.0)),
+                'r2':        float(det.get('R2', 0.0)),
+                'peak_amp':  float(det.get('peak_amp', 0.0)),
+                'FPE_hz_region':   float(fpe) if fpe is not None else float('nan'),
+                'svm_probability': det.get('svm_probability'),
             })
 
         self._populate_click_table()
         self.file_label.setText(
-            f"{os.path.basename(file_path)}\n{len(self.real_clicks)} clicks found"
+            f"{os.path.basename(file_path)}\n{len(self.real_clicks)} clicks found (v6)"
         )
         if self.real_clicks:
             self.btn_run.setEnabled(True)
@@ -785,27 +664,50 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.correlation_label.setText("Correlation: —")
         self.btn_pdf.setEnabled(False)
 
+    def _reconstruct_row(self, row):
+        """
+        One recorded frame as reconstruct_frame_v5 returns it (mic-corrected,
+        Tukey-tapered iFFT, Gibbs-suppressed), or None when the row does not
+        exist. `row` is an ARRAY row: in a v4 event recording it differs from
+        the frame index, and a neighbour the board never sent is None.
+        """
+        from core.click_pipeline_v5 import reconstruct_frame_v5
+
+        pd = self.paudio_data
+        fft_data, phase_data = pd['fft_data'], pd['phase_data']
+        n_rows = min(len(fft_data), len(phase_data))
+        if row is None or not (0 <= row < n_rows):
+            return None
+        return reconstruct_frame_v5(fft_data[row], phase_data[row],
+                                    pd['fs'], pd['fft_size'], normalize=True)
+
+    def _click_frame_signals(self, click):
+        """[prev | current | next] frame signals of a click; silence where absent."""
+        silence = np.zeros(self.paudio_data['fft_size'], dtype=np.float32)
+        out = []
+        for row in (click['prev_row'], click['row_idx'], click['next_row']):
+            fd = self._reconstruct_row(row)
+            out.append(fd['signal'] if fd is not None else silence)
+        return out
+
+    def _real_click_signal(self, click):
+        """
+        The real click as ONE signal: the three frames stitched, exactly as the
+        Time Domain plot shows it. Every place that measures the real click
+        (frequency, fit, correlation) uses this, so they all see the same signal.
+        """
+        if not self.paudio_data:
+            return None
+        return np.concatenate(self._click_frame_signals(click))
+
     def _show_real_click(self, click):
         if not self.paudio_data:
             return
-        pd        = self.paudio_data
-        frame_idx = click['frame_idx']
-        fft_data  = pd['fft_data']
-        phase_data = pd['phase_data']
-
-        if frame_idx >= len(fft_data):
-            return
-
-        from core.click_pipeline_v5 import reconstruct_frame_v5
-
+        pd = self.paudio_data
         fs       = pd['fs']
         fft_size = pd['fft_size']
-        phases = (
-            phase_data[frame_idx]
-            if phase_data and frame_idx < len(phase_data)
-            else np.array([], dtype=np.int8)
-        )
-        fd = reconstruct_frame_v5(fft_data[frame_idx], phases, fs, fft_size, normalize=True)
+
+        fd = self._reconstruct_row(click['row_idx'])
         if fd is None:
             return
 
@@ -822,18 +724,7 @@ class MainWindowChemicalSimulator(QMainWindow):
         # Time-domain: [frame−1 | frame | frame+1] concatenated into one continuous signal
         frame_dur  = fft_size / fs                           # seconds per frame
 
-        def _recon(fi):
-            if fi < 0 or fi >= len(fft_data):
-                return np.zeros(fft_size, dtype=np.float32)  # silent padding at file edges
-            ph = (phase_data[fi]
-                  if phase_data and fi < len(phase_data)
-                  else np.array([], dtype=np.int8))
-            fd_r = reconstruct_frame_v5(fft_data[fi], ph, fs, fft_size, normalize=True)
-            return fd_r['signal'] if fd_r is not None else np.zeros(fft_size, dtype=np.float32)
-
-        sig_prev   = _recon(frame_idx - 1)
-        sig_center = fd['signal']
-        sig_next   = _recon(frame_idx + 1)
+        sig_prev, sig_center, sig_next = self._click_frame_signals(click)
 
         sig_full    = np.concatenate([sig_prev, sig_center, sig_next])
         center_peak = np.max(np.abs(sig_center)) + 1e-30
@@ -844,6 +735,81 @@ class MainWindowChemicalSimulator(QMainWindow):
 
         self.curve_real_time.setData(t_full, sig_full / center_peak)
 
+    def _find_click_envelope_bounds(self, signal, level_fraction=0.1, guard=5, max_search=300):
+        """
+        Trova inizio, picco e fine di un click reale dentro un segnale
+        grezzo, usando una soglia sull'inviluppo di Hilbert (10% del
+        picco). Restituisce (start_idx, peak_idx, end_idx), o None.
+        """
+        if signal is None or len(signal) < 10:
+            return None
+        try:
+            envelope = np.abs(hilbert(signal))
+            peak_idx = int(np.argmax(envelope))
+            peak_amp = envelope[peak_idx]
+            if peak_amp <= 0:
+                return None
+            level = peak_amp * level_fraction
+
+            start_idx = max(peak_idx - max_search, 0)
+            for i in range(peak_idx - 1, max(peak_idx - max_search, -1), -1):
+                if envelope[i] < level:
+                    start_idx = i + 1
+                    break
+
+            end_idx = min(peak_idx + max_search, len(envelope) - 1)
+            for i in range(peak_idx + 1, end_idx + 1):
+                if envelope[i] < level:
+                    end_idx = i
+                    break
+
+            return start_idx, peak_idx, end_idx
+        except Exception:
+            return None
+
+    def _extract_click_dominant_frequency(self, click):
+        """
+        Estrae la frequenza dominante dal click reale selezionato tramite
+        conteggio degli attraversamenti dello zero (zero-crossing) sulla
+        porzione isolata del click. Per segmenti così brevi la FFT
+        soffre di spectral leakage; lo zero-crossing è più diretto e
+        affidabile.
+        """
+        if not self.paudio_data:
+            return None
+        try:
+            signal = self._real_click_signal(click)
+            if signal is None or len(signal) < 10:
+                return None
+
+            bounds = self._find_click_envelope_bounds(signal)
+            if bounds is None:
+                return None
+            start_idx, peak_idx, end_idx = bounds
+
+            segment = signal[start_idx:end_idx + 1]
+            if len(segment) < 4:
+                return None
+
+            signs = np.sign(segment)
+            signs[signs == 0] = 1
+            crossings = np.where(np.diff(signs) != 0)[0]
+            if len(crossings) < 2:
+                return None
+
+            n_cycles = len(crossings) / 2.0
+            fs = self.paudio_data['fs']
+            duration_s = len(segment) / fs
+            if duration_s <= 0:
+                return None
+
+            freq = n_cycles / duration_s
+            if freq < 20000 or freq > 80000:
+                return None
+            return float(freq)
+        except Exception:
+            return None
+
     def _run_simulation(self):
         R0 = self.r0_spinbox.value() * 1e-6
         P_inf = self.pinf_spinbox.value() * 1e6
@@ -851,10 +817,15 @@ class MainWindowChemicalSimulator(QMainWindow):
 
         rows_sel = self.click_table.selectedItems()
         tau_target = None
+        freq_target = None
+        real_signal_for_fit = None
         if rows_sel:
             row = self.click_table.currentRow()
             if row >= 0 and row < len(self.real_clicks):
-                tau_target = self.real_clicks[row].get('tau_ms', None)
+                click = self.real_clicks[row]
+                tau_target = click.get('tau_ms', None)
+                freq_target = self._extract_click_dominant_frequency(click)
+                real_signal_for_fit = self._real_click_signal(click)
 
         self.progress_dialog = QProgressDialog("Running simulation...", None, 0, 100, self)
         self.progress_dialog.setWindowModality(Qt.WindowModal)
@@ -863,13 +834,14 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.progress_dialog.show()
 
         self.sim_thread = QThread(self)
-        self.sim_worker = SimulationWorker(R0, P_inf, distance_m, tau_target)
+        self.sim_worker = SimulationWorker(R0, P_inf, distance_m, tau_target, freq_target, real_signal_for_fit)
         self.sim_worker.moveToThread(self.sim_thread)
         self.sim_thread.started.connect(self.sim_worker.run)
         self.sim_worker.finished.connect(self._on_simulation_finished)
         self.sim_worker.error.connect(self._on_simulation_error)
         self.sim_worker.progress.connect(self.progress_dialog.setValue)
         self.sim_worker.finished.connect(self.sim_thread.quit)
+        self.sim_worker.error.connect(self.sim_thread.quit)
         self.sim_thread.finished.connect(self.sim_thread.deleteLater)
         self.sim_thread.start()
 
@@ -878,8 +850,27 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.sim_result = result
         self._update_plots(result)
         self._update_diagnostics(result)
+        self._handle_calibration_feedback(result)
         self.btn_pdf.setEnabled(True)
         print("Simulation completed")
+
+    def _handle_calibration_feedback(self, result):
+        calibration = result.get('calibration')
+        if calibration is None:
+            return
+
+        R0_used_um = result['bubble']['R0'] * 1e6
+
+        self.r0_spinbox.blockSignals(True)
+        self.r0_slider.blockSignals(True)
+        self.r0_spinbox.setValue(R0_used_um)
+        self.r0_slider.setValue(int(round(R0_used_um)))
+        self.r0_spinbox.blockSignals(False)
+        self.r0_slider.blockSignals(False)
+
+        note = calibration.get('note', '')
+        msg = f"R0 calibrato automaticamente a {R0_used_um:.1f} µm.\n\n{note}"
+        QMessageBox.information(self, "Calibrazione completata", msg)
 
     def _on_simulation_error(self, error_msg):
         self.progress_dialog.close()
@@ -906,14 +897,148 @@ class MainWindowChemicalSimulator(QMainWindow):
         R_um = bubble['R'] * 1e6
         self.curve_bubble.setData(t_sim, R_um)
 
+    def _compute_hilbert_envelope(self, signal):
+        """
+        Calcola l'inviluppo istantaneo del segnale usando la trasformata
+        di Hilbert. Implementazione identica a quella usata dall'algoritmo
+        di rilevamento click di PlantLeaf (replay_window_audio.py), in
+        numpy puro (no scipy) per coerenza e thread-safety.
+        """
+        N = len(signal)
+        Xf = np.fft.rfft(signal, n=N)
+        h = np.zeros(N // 2 + 1, dtype=np.float64)
+        h[0] = 1.0
+        if N % 2 == 0:
+            h[1:-1] = 2.0
+            h[-1] = 1.0
+        else:
+            h[1:] = 2.0
+        hilbert_part = np.fft.irfft(Xf * h, n=N)
+        return np.sqrt(signal ** 2 + hilbert_part ** 2)
+
+    def _compute_envelope_correlation(self, real_signal, sim_signal):
+        """
+        Confronta la FORMA DEL DECADIMENTO (inviluppo) tra click reale e
+        simulato, con una finestra di confronto proporzionale alla vera
+        durata di ciascun click (non una lunghezza fissa), individuata
+        tramite soglia sull'inviluppo — la stessa identica logica usata
+        da PlantLeaf per isolare un click dal resto del segnale. Una
+        finestra fissa troppo lunga rispetto a un click molto rapido
+        (es. τ=0.05ms) trascinerebbe dentro rumore/silenzio, diluendo
+        artificialmente la correlazione anche quando il decadimento
+        combacia bene.
+
+        Returns:
+            float: correlazione di Pearson tra i due inviluppi (-1..1)
+        """
+        try:
+            real_bounds = self._find_click_envelope_bounds(real_signal, max_search=500)
+            sim_bounds = self._find_click_envelope_bounds(sim_signal, max_search=500)
+            if real_bounds is None or sim_bounds is None:
+                return 0.0
+
+            real_start, real_peak, real_end = real_bounds
+            sim_start, sim_peak, sim_end = sim_bounds
+
+            pre = min(real_peak - real_start, sim_peak - sim_start)
+            post = min(real_end - real_peak, sim_end - sim_peak)
+            if post <= 3:
+                return 0.0
+
+            real_env = self._compute_hilbert_envelope(real_signal)
+            sim_env = self._compute_hilbert_envelope(sim_signal)
+
+            r_win = real_env[real_peak - pre: real_peak + post + 1]
+            s_win = sim_env[sim_peak - pre: sim_peak + post + 1]
+            n = min(len(r_win), len(s_win))
+            if n <= 6:
+                return 0.0
+            r_win = r_win[:n]
+            s_win = s_win[:n]
+
+            r_norm = r_win / (np.max(r_win) + 1e-30)
+            s_norm = s_win / (np.max(s_win) + 1e-30)
+
+            corr = np.corrcoef(r_norm, s_norm)[0, 1]
+            return float(corr) if np.isfinite(corr) else 0.0
+        except Exception: 
+            return 0.0
+
+
+    def _compute_best_correlation(self, real_signal, sim_signal, max_lag=60):
+        """
+        Calcola la correlazione tra il click reale e quello simulato
+        cercando lo sfasamento (lag) che la massimizza, invece di un
+        confronto a fase fissa allineata solo sui picchi.
+
+        Due oscillazioni con la stessa frequenza e lo stesso decadimento
+        possono avere una correlazione di Pearson vicina a zero se sono
+        sfasate (es. un coseno contro un seno) — la fase assoluta del
+        click reale dipende dall'istante esatto di nucleazione, che non
+        conosciamo né modelliamo. Cercare il miglior allineamento
+        temporale è la pratica standard per confrontare forme d'onda
+        oscillatorie di fase relativa sconosciuta, e riflette meglio se
+        la FORMA del click (non la fase arbitraria) combacia.
+
+        Returns:
+            float: la massima correlazione di Pearson trovata (-1..1)
+        """
+        try:
+            real_bounds = self._find_click_envelope_bounds(real_signal)
+            sim_bounds = self._find_click_envelope_bounds(sim_signal)
+            if real_bounds is None or sim_bounds is None:
+                return 0.0
+
+            _, real_peak, _ = real_bounds
+            _, sim_peak, _ = sim_bounds
+
+            pre = min(real_peak, sim_peak, 20)
+            post = min(len(real_signal) - real_peak, len(sim_signal) - sim_peak, 200) - 1
+            if post <= 5:
+                return 0.0
+
+            r_win = real_signal[real_peak - pre: real_peak + post]
+            s_win = sim_signal[sim_peak - pre: sim_peak + post]
+            n = min(len(r_win), len(s_win))
+            if n <= 10:
+                return 0.0
+            r_win = r_win[:n]
+            s_win = s_win[:n]
+
+            r_norm = r_win / (np.max(np.abs(r_win)) + 1e-30)
+            s_norm = s_win / (np.max(np.abs(s_win)) + 1e-30)
+
+            best_corr = 0.0
+            max_shift = min(max_lag, n // 2)
+            for shift in range(-max_shift, max_shift + 1):
+                if shift >= 0:
+                    a = r_norm[shift:]
+                    b = s_norm[:len(a)]
+                else:
+                    b = s_norm[-shift:]
+                    a = r_norm[:len(b)]
+                if len(a) < 10:
+                    continue
+                c = np.corrcoef(a, b)[0, 1]
+                if np.isfinite(c) and abs(c) > abs(best_corr):
+                    best_corr = c
+
+            return float(best_corr)
+        except Exception:
+            return 0.0
+
     def _update_diagnostics(self, result):
         diag   = result['diagnostics']
         bubble = result['bubble']
 
+        f0_val = bubble.get('f0', None)
+        extra_damping = bubble.get('extra_damping_rate', 0.0)
+
         rows = [
             ("R₀",         f"{bubble['R0']*1e6:.1f} µm"),
             ("P∞",         f"{bubble['P_inf']/1e6:.2f} MPa"),
-            ("Collapsed",  "Yes" if bubble['collapsed'] else "No"),
+            ("Freq. naturale (f₀)", f"{f0_val/1000:.1f} kHz" if f0_val else "N/A"),
+            ("Smorz. extra vaso (fit)", f"{extra_damping:.0f} 1/s" if extra_damping else "0 (nessun fitting)"),
             ("τ simulated", f"{diag['tau']*1000:.3f} ms" if diag['tau'] else "N/A"),
             ("SPR",        f"{diag['SPR']:.2f}" if diag['SPR'] else "N/A"),
             ("Asymmetry",  f"{diag['asymmetry']:.3f}" if diag['asymmetry'] else "N/A"),
@@ -930,33 +1055,22 @@ class MainWindowChemicalSimulator(QMainWindow):
             tau_real = click.get('tau_ms', -1.0)
             tau_sim  = diag['tau'] * 1000.0
 
-            real_signal = None
-            if self.paudio_data:
-                from core.click_pipeline_v5 import reconstruct_frame_v5
-                pd  = self.paudio_data
-                fi  = click['frame_idx']
-                ph  = (pd['phase_data'][fi]
-                       if pd['phase_data'] and fi < len(pd['phase_data'])
-                       else np.array([], dtype=np.int8))
-                fd2 = reconstruct_frame_v5(pd['fft_data'][fi], ph,
-                                           pd['fs'], pd['fft_size'], normalize=True)
-                if fd2 is not None:
-                    real_signal = fd2['signal']
+            real_signal = self._real_click_signal(click)
 
             sim_signal = result['propagation']['signal']
             corr = 0.0
+            env_corr = 0.0
             if real_signal is not None and len(real_signal) > 0 and len(sim_signal) > 0:
-                n = min(len(real_signal), len(sim_signal))
-                r_norm = real_signal[:n] / (np.max(np.abs(real_signal[:n])) + 1e-30)
-                s_norm = sim_signal[:n]  / (np.max(np.abs(sim_signal[:n]))  + 1e-30)
-                corr = float(np.corrcoef(r_norm, s_norm)[0, 1])
+                corr = self._compute_best_correlation(real_signal, sim_signal)
+                env_corr = self._compute_envelope_correlation(real_signal, sim_signal)
 
-            self.correlation_label.setText(f"Correlation: {corr:.4f}")
+            self.correlation_label.setText(f"Envelope Correlation: {env_corr:.4f}")
 
             compare_rows = [
                 ("τ real (ms)",  f"{tau_real:.3f}" if tau_real > 0 else "N/A"),
                 ("τ sim (ms)",   f"{tau_sim:.3f}"),
-                ("Correlation",  f"{corr:.4f}"),
+                ("Correlation (onda)",  f"{corr:.4f}"),
+                ("Correlation (busta)", f"{env_corr:.4f}"),
                 ("Match τ",      "Yes" if tau_real > 0 and abs(tau_sim - tau_real) / tau_real < 0.2 else "No"),
             ]
             self.table_compare.setRowCount(len(compare_rows))

@@ -12,15 +12,27 @@ Utilizzo:
     from acoustic_parameters import WaterProperties, BubbleParameters, MicrophoneResponse, PlantLeafConfig
 """
 
+import sys
+from pathlib import Path
+
 import numpy as np
-from core.click_pipeline_v5 import (
-    FS          as _PL_FS,
-    FFT_SIZE    as _PL_FFT_SIZE,
-    BIN_START_HZ as _PL_BIN_START,
-    BIN_END_HZ  as _PL_BIN_END,
-    _MIC_FREQ_HZ,
-    _MIC_RESP_DB,
-)
+
+# Constants come from click_pipeline_v5 (single source of truth), loaded through
+# hybrid.pipeline_loader rather than `from core.click_pipeline_v5 import ...`:
+# importing the `core` package runs core/__init__.py, which pulls in the Qt
+# windows and makes this module unusable from a headless analysis script.
+_SRC_DIR = str(Path(__file__).resolve().parent.parent)
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+from hybrid.pipeline_loader import load_pipeline  # noqa: E402
+
+_cp = load_pipeline()
+_PL_FS         = _cp.FS
+_PL_FFT_SIZE   = _cp.FFT_SIZE
+_PL_BIN_START  = _cp.BIN_START_HZ
+_PL_BIN_END    = _cp.BIN_END_HZ
+_MIC_FREQ_HZ   = _cp._MIC_FREQ_HZ
+_MIC_RESP_DB   = _cp._MIC_RESP_DB
 
 
 # =============================================================================
@@ -88,6 +100,21 @@ class BubbleParameters:
 
     # Soglia minima del raggio per considerare il collasso completato [m]
     R_COLLAPSE_THRESHOLD = 1.0e-7  # 0.1 µm — collasso praticamente completo
+
+class BubbleResonance:
+    """
+    Parametri del modello di risonanza di bolla smorzata da irraggiamento
+    acustico (Minnaert + smorzamento radiativo/viscoso).
+
+    A differenza del precedente modello con guscio elastico arbitrario,
+    qui frequenza e tempo di decadimento del click dipendono SOLO da R0,
+    tramite formule fisiche standard (letteratura: Minnaert 1933; Brennen
+    1995; validato numericamente per il caso xylematico).
+    """
+
+    # Frazione di perturbazione iniziale del raggio rispetto a R0
+    # (ampiezza dell'oscillazione, non influenza frequenza o tau)
+    PERTURBATION_FRACTION = 0.10
 
 
 # =============================================================================
