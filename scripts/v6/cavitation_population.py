@@ -32,13 +32,17 @@ Usage (from the repository root):
       --anatomy JSON      vessel radius / element length ranges per species (optional)
       --workers N         parallel processes (default: CPU count - 1)
       --limit N           analyse only the first N rows (smoke test)
+      --controls PATH     non-plant control recordings (file or folder; repeatable):
+                          events found by the v6 detector, analysed like the clicks
 
-Anatomy JSON (radii in µm, lengths in mm; ranges as found in the literature):
+Anatomy JSON — ACOUSTIC vessel radius (µm, measured with the Dutta 2022 method, not
+optically) and optional element length (mm), only for species with a direct value:
 
-    {"aloe":   {"R_um": [8, 25], "L_mm": [0.2, 1.5], "source": "..."},
-     "cactus": {"R_um": [10, 20], "L_mm": [0.1, 0.5], "source": "..."}}
+    {"tomato": {"R_um": [18.4, 22.8], "L_mm": null, "source": "Dutta 2022 Table 1"}}
 
-Without it the vessel model can only be judged on waveform, and the summary says so.
+Species without anatomy: the vessel model is reported as shape-only, does not count as
+cavitation-compatible in the verdict, and its radii are compared descriptively with the
+acoustic radii Dutta measured on 10 species (docs/physical_simulation/anatomy.json).
 
 Only continuous (v3) recordings are supported: every labelled session in the
 training set is one. Event recordings (v4) are skipped with a note.
@@ -86,6 +90,21 @@ CRITERIA = {
     # Impulse-dominated: the envelope peak is at least twice what the ring-down model
     # accounts for. Reported, not used to reject.
     'impulse_factor_high': 2.0,
+    # The vessel model turns any (f, tau) into a geometry and a damped sine fits most
+    # clicks, so WITHOUT species anatomy it cannot be falsified: it then counts in the
+    # verdict only as 'shape-compatible, geometry unverified' and NOT as cavitation-
+    # compatible. Its R is an ACOUSTIC radius (Dutta 2022: tomato 20.6 µm acoustic vs
+    # 62.8 µm optical), so anatomy ranges must be acoustic radii measured the same way.
+    'vessel_counts_in_verdict_only_with_anatomy': True,
+    # Descriptive reference (not a pass/fail): acoustic radii measured by Dutta et al.
+    # 2022 across 10 species (Table 1, min−err .. max+err), and the element lengths
+    # their Table-1 frequencies imply with E = 0.2 GPa, h = 1 µm, widened by ±30 %.
+    'dutta_reference_R_um': (10.7, 22.8),
+    'dutta_reference_L_mm': (0.91 * 0.7, 1.22 * 1.3),
+    # Descriptive instrument check: the SPU0410LR5H response peaks near 25 kHz (+10.5 dB).
+    # A click population piled up in this window may carry the microphone's frequency
+    # rather than the source's — which would contaminate every f-derived quantity.
+    'mic_resonance_window_hz': (22_000, 28_000),
     # Verdict on the clicks (label 1) that are analysable.
     'verdict_yes_min_fraction': 0.70,
     'verdict_no_max_fraction': 0.20,
@@ -98,6 +117,14 @@ LABEL_NAMES = {'1': 'click', '0': 'noise', '2': 'ambiguous'}
 
 def species_of(stem: str) -> str:
     s = stem.lower()
+    if 'pomodor' in s or 'tomato' in s or 'solanum' in s:
+        return 'tomato'
+    if 'dione' in s or 'venus' in s:
+        return 'dionaea'
+    if 'fragol' in s or 'strawberr' in s:
+        return 'strawberry'
+    if 'spathi' in s:
+        return 'spathiphyllum'
     if 'aloe' in s:
         return 'aloe'
     if 'cactus' in s:
@@ -129,6 +156,58 @@ def session_type_of(stem: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _HEADERS: dict = {}
+
+
+def analyse_controls(paths):
+    """
+    Instrument controls: non-plant recordings (e.g. pencil-lead breaks) have no labels,
+    so the v6 detector finds their events exactly as it finds clicks, and each confirmed
+    event goes through the same comparison. Runs in the main process (Qt-based loader:
+    it reads v3 and v4 files and computes the detector's noise state).
+    """
+    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    import windows  # noqa: F401  (resolves the core <-> windows import cycle)
+    from saving.audio_load_progress import AudioLoadWorker
+    from core.click_detection_worker import ClickDetectionWorker
+    import click_model_comparison as cmc
+
+    out = []
+    for path in paths:
+        loaded = {}
+        loader = AudioLoadWorker(str(path))
+        loader.finished.connect(lambda d: loaded.setdefault('d', d))
+        loader.error.connect(lambda e: loaded.setdefault('err', e))
+        loader.run()
+        if 'd' not in loaded:
+            print(f'   control {path.name}: load failed ({loaded.get("err")})')
+            continue
+        dm = SimpleNamespace(**loaded['d'])
+        hi = dm.header_info
+        rows = []
+        det = ClickDetectionWorker(dm.fft_data, dm.phase_data, hi['fs'], hi['fft_size'],
+                                   dm.frame_duration_ms, dm=dm)
+        det.finished.connect(lambda r: rows.extend(r))
+        det.run()
+        confirmed = [r for r in rows if r.get('stage_blocked', '') == '']
+        n_rows = min(len(dm.fft_data), len(dm.phase_data))
+
+        def frame(i):
+            return None if i is None or not (0 <= i < n_rows) else (dm.fft_data[i], dm.phase_data[i])
+
+        for r in confirmed:
+            fi = int(r['frame_idx'])
+            rr = ((r.get('prev_row'), r['row_idx'], r.get('next_row')) if dm.is_event_recording
+                  else (fi - 1, fi, fi + 1))
+            res = cmc.analyse_click(tuple(frame(i) for i in rr), fi, r['noise_floor'], r['std_noise'])
+            row = cmc.result_to_row(res)
+            out.append({'ds_file': path.stem, 'ds_frame_idx': fi,
+                        'ds_timestamp_s': r.get('timestamp_s'), 'ds_tau_ms': r.get('tau_ms'),
+                        'ds_svm_probability': r.get('svm_probability'), 'result': row})
+        print(f'   control {path.name}: {len(rows)} candidates, {len(confirmed)} confirmed by v6')
+    return out
 
 
 def _analyse_row(task):
@@ -190,26 +269,36 @@ def categorise(row, anatomy):
     row['bubble_compatible'] = int(analysable and lo <= ratio <= hi and r2b >= c['r2_min']) \
         if analysable else ''
 
-    geo = anatomy.get(row['species'])
+    geo = anatomy.get(row['species']) or {}
+    R, L = _f(row.get('vessel_R_um')), _f(row.get('vessel_L_mm'))
     row['vessel_waveform_ok'] = int(r2v >= c['r2_min']) if analysable else ''
-    if analysable and geo:
-        R, L = _f(row.get('vessel_R_um')), _f(row.get('vessel_L_mm'))
-        rlo, rhi = geo['R_um']
-        llo, lhi = geo['L_mm']
+    # descriptive: same-method reference range from Dutta 2022 (not species-specific)
+    rr, lr = c['dutta_reference_R_um'], c['dutta_reference_L_mm']
+    row['vessel_R_in_dutta_range'] = int(rr[0] <= R <= rr[1]) if analysable else ''
+    row['vessel_L_in_dutta_range'] = int(lr[0] <= L <= lr[1]) if analysable else ''
+
+    checks = []
+    if geo.get('R_um'):
+        checks.append(geo['R_um'][0] <= R <= geo['R_um'][1])
+    if geo.get('L_mm'):
         tol = c['vessel_L_tolerance']
-        geo_ok = rlo <= R <= rhi and llo * (1 - tol) <= L <= lhi * (1 + tol)
-        row['vessel_geometry_ok'] = int(geo_ok)
-        row['vessel_compatible'] = int(geo_ok and r2v >= c['r2_min'])
+        checks.append(geo['L_mm'][0] * (1 - tol) <= L <= geo['L_mm'][1] * (1 + tol))
+    row['vessel_geometry_checked'] = int(bool(checks))
+    if analysable and checks:
+        row['vessel_geometry_ok'] = int(all(checks))
+        row['vessel_compatible'] = int(all(checks) and r2v >= c['r2_min'])
     else:
         row['vessel_geometry_ok'] = ''
-        # geometry unknown: only the waveform can be judged
-        row['vessel_compatible'] = int(r2v >= c['r2_min']) if analysable else ''
-    row['vessel_geometry_checked'] = int(bool(geo))
+        # no anatomy: shape can be judged, geometry cannot -> not a cavitation verdict
+        row['vessel_compatible'] = ''
+    row['vessel_shape_only'] = int(analysable and not checks and r2v >= c['r2_min']) if analysable else ''
 
     if analysable:
         vc, bc = row['vessel_compatible'] == 1, row['bubble_compatible'] == 1
         row['model_category'] = ('both' if vc and bc else 'vessel_only' if vc
-                                 else 'bubble_only' if bc else 'neither')
+                                 else 'bubble_only' if bc
+                                 else 'vessel_shape_only' if row['vessel_shape_only'] == 1
+                                 else 'neither')
         imp = max(_f(row.get('vessel_impulse_factor')), _f(row.get('bubble_impulse_factor')))
         row['impulse_dominated'] = int(imp >= c['impulse_factor_high'])
     else:
@@ -250,7 +339,11 @@ def summarise(rows, anatomy, out_dir, meta):
         ('R² vessel', 'vessel_r2_wave'), ('R² bubble', 'bubble_r2_wave'),
         ('impulse factor (vessel)', 'vessel_impulse_factor'),
     ]
-    fracs = [('vessel compatible', 'vessel_compatible'), ('bubble compatible', 'bubble_compatible'),
+    mw = CRITERIA['mic_resonance_window_hz']
+    fracs = [('vessel compatible (with anatomy)', 'vessel_compatible'),
+             ('vessel shape-only (no anatomy)', 'vessel_shape_only'),
+             ('vessel R in Dutta range', 'vessel_R_in_dutta_range'),
+             ('bubble compatible', 'bubble_compatible'),
              ('bubble tau consistent', 'bubble_tau_consistent'), ('impulse dominated', 'impulse_dominated')]
 
     table = []
@@ -262,6 +355,10 @@ def summarise(rows, anatomy, out_dir, meta):
         for name, key in fracs:
             f, n = _frac(ana, key)
             entry[name] = f'{f:.2f} (n={n})' if n else 'n/a'
+        fvals = [_f(r.get('real_f_hz')) for r in ana if np.isfinite(_f(r.get('real_f_hz')))]
+        entry['f in mic-resonance window'] = (f"{np.mean([mw[0] <= x <= mw[1] for x in fvals]):.2f} (n={len(fvals)})"
+                                              if fvals else 'n/a')
+        entry['_f_median'] = float(np.median(fvals)) if fvals else float('nan')
         any_comp = [int(r['vessel_compatible'] == 1 or r['bubble_compatible'] == 1) for r in ana]
         entry['compatible with ≥1 model'] = f'{np.mean(any_comp):.2f} (n={len(any_comp)})' if any_comp else 'n/a'
         entry['_any_frac'] = float(np.mean(any_comp)) if any_comp else float('nan')
@@ -282,7 +379,7 @@ def summarise(rows, anatomy, out_dir, meta):
                 return e
         return None
 
-    clicks, noise = get('all', 'click'), get('all', 'noise')
+    clicks, noise, controls = get('all', 'click'), get('all', 'noise'), get('all', 'control')
     c = CRITERIA
     verdict = 'not computable (no analysable clicks)'
     if clicks and np.isfinite(clicks['_any_frac']):
@@ -290,28 +387,72 @@ def summarise(rows, anatomy, out_dir, meta):
         p_null = noise['_any_frac'] if noise and np.isfinite(noise['_any_frac']) else float('nan')
         discriminates = np.isfinite(p_null) and p_null <= c['null_max_ratio'] * p_click
         if p_click >= c['verdict_yes_min_fraction'] and discriminates:
-            verdict = 'YES — the clicks are consistent with the cavitation models'
-        elif p_click <= c['verdict_no_max_fraction'] or not discriminates:
-            verdict = ('NO — the clicks are not consistent with the cavitation models'
-                       if p_click <= c['verdict_no_max_fraction'] else
-                       'NOT DISCRIMINATING — noise candidates are about as compatible as clicks')
+            verdict = ('CONSISTENT — most clicks match at least one tested physical description of '
+                       'cavitation acoustics, and noise candidates clearly do not. This SUPPORTS, '
+                       'but does not prove, a cavitation origin')
+        elif p_click <= c['verdict_no_max_fraction']:
+            verdict = ('NOT CONSISTENT — the tested descriptions (free bubble; vessel where anatomy '
+                       'exists) do not explain the clicks. This rejects THESE MODELS, not cavitation '
+                       'as the trigger of the event')
+        elif not discriminates:
+            verdict = ('NOT DISCRIMINATING — noise candidates match the models about as often as clicks, '
+                       'so the waveform test cannot separate clicks from noise')
         else:
-            verdict = 'MIX — only part of the clicks is consistent (see the per-group table)'
+            verdict = ('PARTLY CONSISTENT — only part of the clicks matches a tested description; '
+                       'see which species / session types in the table')
         verdict += f'  [clicks compatible: {p_click:.2f}; noise null: {p_null:.2f}]'
+
+    control_lines = []
+    if controls:
+        control_lines = [
+            '## Instrument control (non-plant impulsive sources)', '',
+            'Recordings with no plant (e.g. pencil-lead breaks), analysed exactly like the clicks. '
+            'If controls look like the clicks — same frequency, same compatibility — the click '
+            'signature is not specific to the plant and the models describe the instrument/structure '
+            'rather than the source.', '',
+            '| group | n analysable | f median (Hz) | f in mic-resonance window | tau calibrated (ms) | '
+            'impulse factor | compatible with ≥1 model | vessel shape-only |',
+            '|---|---|---|---|---|---|---|---|',
+        ]
+        for name, e in (('clicks', clicks), ('noise', noise), ('controls', controls)):
+            if e:
+                control_lines.append(
+                    f"| {name} | {e['n_analysable']} | {e['_f_median']:.0f} | {e['f in mic-resonance window']} | "
+                    f"{e['tau calibrated (ms)']} | {e['impulse factor (vessel)']} | "
+                    f"{e['compatible with ≥1 model']} | {e['vessel shape-only (no anatomy)']} |")
+        control_lines.append('')
 
     lines = [
         '# Cavitation models vs labelled clicks — population summary', '',
         f"Generated {time.strftime('%Y-%m-%d %H:%M')} by scripts/v6/cavitation_population.py", '',
         f"Dataset: `{meta['dataset']}`  ", f"Rows analysed: {meta['n_done']} of {meta['n_rows']} "
-        f"(missing .paudio: {meta['n_missing']}, errors: {meta['n_errors']})", '',
+        f"(missing .paudio: {meta['n_missing']}, errors: {meta['n_errors']}); "
+        f"control events: {meta['n_controls']}", '',
         '## Pre-registered criteria', '', '```', json.dumps(CRITERIA, indent=2), '```', '',
-        'Vessel geometry checked for: ' + (', '.join(sorted(anatomy)) if anatomy else
-                                            '**none — no anatomy file given; the vessel model is judged on waveform only**'),
-        '', '## Verdict', '', f'**{verdict}**', '',
+        'Vessel geometry checked for: ' + (', '.join(sorted(k for k, v in anatomy.items()
+                                                       if isinstance(v, dict) and (v.get('R_um') or v.get('L_mm'))))
+                                            or '**none**') + '.  ',
+        'For species without anatomy the vessel model is reported as *shape-only* and does **not** count as '
+        'cavitation-compatible in the verdict; its radii are compared descriptively with the acoustic radii '
+        f"Dutta et al. 2022 measured with the same method ({CRITERIA['dutta_reference_R_um'][0]}–"
+        f"{CRITERIA['dutta_reference_R_um'][1]} µm, 10 species).",
+        '', '## What this analysis can and cannot say', '',
+        '- The question answered is: *are the clicks consistent with the physical descriptions of '
+        'cavitation acoustics proposed in the literature?* — not "is it cavitation".',
+        '- **Free bubble** (Minnaert + thermal damping): a real test with no free parameter — the decay '
+        'time a bubble must have at the click frequency.',
+        '- **Xylem vessel** (Dutta 2022): falsifiable only where acoustic anatomy exists; elsewhere it is a '
+        'description (equivalent acoustic radius), not evidence.',
+        '- **Calibrated tau and impulse factor** are measurements, valid whatever the mechanism.',
+        '- A recording in air carries tissue, air and microphone: the waveform alone cannot establish the '
+        'mechanism (Vergeynst et al. 2015; Nolf et al. 2015; Khait et al. 2023).',
+        '', '## Verdict', '', f'**{verdict}**', '', *control_lines,
         '## Per group (analysable rows; medians [IQR])', '',
     ]
     keys = ['species', 'label', 'session_type', 'n', 'n_analysable', 'compatible with ≥1 model',
-            'vessel compatible', 'bubble compatible', 'bubble tau consistent', 'impulse dominated'] \
+            'bubble compatible', 'bubble tau consistent', 'vessel compatible (with anatomy)',
+            'vessel shape-only (no anatomy)', 'vessel R in Dutta range', 'impulse dominated',
+            'f in mic-resonance window'] \
         + [m[0] for m in metrics]
     lines.append('| ' + ' | '.join(keys) + ' |')
     lines.append('|' + '---|' * len(keys))
@@ -339,7 +480,8 @@ def figures(rows, anatomy, out_dir):
     ana = [r for r in rows if r['analysable'] == 1]
     style = {'click': dict(c='#e53935', s=18, label='clicks'),
              'ambiguous': dict(c='#fb8c00', s=12, label='ambiguous'),
-             'noise': dict(c='#9e9e9e', s=8, label='noise (null)')}
+             'noise': dict(c='#9e9e9e', s=8, label='noise (null)'),
+             'control': dict(c='#1e88e5', s=22, label='instrument controls', marker='^')}
 
     # tau–f map
     fig, ax = plt.subplots(figsize=(8, 5.5))
@@ -353,7 +495,7 @@ def figures(rows, anatomy, out_dir):
         t = vr.settling_time(R * 1e-6) * 1e3
         ax.axhline(t, color='#8d6e63', ls='--', lw=0.8)
         ax.text(18_500, t * 1.03, f'vessel R={R} µm', color='#6d4c41', fontsize=7)
-    for lab in ('noise', 'ambiguous', 'click'):
+    for lab in ('noise', 'ambiguous', 'control', 'click'):
         pts = [(_f(r['vessel_f_true_hz']), _f(r['vessel_tau_true_ms'])) for r in ana if r['label_name'] == lab]
         if pts:
             ax.scatter(*zip(*pts), alpha=0.7, **style[lab])
@@ -368,14 +510,20 @@ def figures(rows, anatomy, out_dir):
 
     # R–L map per species
     fig, ax = plt.subplots(figsize=(7, 5))
-    for sp, col in (('aloe', '#43a047'), ('cactus', '#8e24aa'), ('kalanchoe', '#fb8c00'), ('other', '#757575')):
+    (r0, r1), (l0, l1) = CRITERIA['dutta_reference_R_um'], CRITERIA['dutta_reference_L_mm']
+    ax.add_patch(plt.Rectangle((r0, l0), r1 - r0, l1 - l0, color='#2196F3', alpha=0.10,
+                               label='Dutta 2022 reference (10 species, same method)'))
+    for sp, col in (('aloe', '#43a047'), ('cactus', '#8e24aa'), ('kalanchoe', '#fb8c00'),
+                    ('tomato', '#d81b60'), ('dionaea', '#00897b'), ('strawberry', '#f4511e'),
+                    ('alocasia', '#6d4c41'), ('spathiphyllum', '#3949ab'), ('other', '#757575')):
         pts = [(_f(r['vessel_R_um']), _f(r['vessel_L_mm'])) for r in ana
                if r['label_name'] == 'click' and r['species'] == sp]
         if pts:
             ax.scatter(*zip(*pts), s=18, color=col, alpha=0.7, label=f'{sp} clicks')
-        if sp in anatomy:
-            (r0, r1), (l0, l1) = anatomy[sp]['R_um'], anatomy[sp]['L_mm']
-            ax.add_patch(plt.Rectangle((r0, l0), r1 - r0, l1 - l0, fill=False, ec=col, lw=1.5, ls='--'))
+        if anatomy.get(sp, {}).get('R_um'):
+            ra, rb = anatomy[sp]['R_um']
+            la, lb = anatomy[sp].get('L_mm') or ax.get_ylim()
+            ax.add_patch(plt.Rectangle((ra, la), rb - ra, lb - la, fill=False, ec=col, lw=1.5, ls='--'))
     ax.set_xlabel('vessel radius R (µm) — from τ')
     ax.set_ylabel('element length L (mm) — from f')
     ax.set_title('Vessel geometry implied by each click (dashed: anatomy, if given)')
@@ -387,8 +535,10 @@ def figures(rows, anatomy, out_dir):
     # distributions
     fig, axes = plt.subplots(1, 3, figsize=(14, 4))
     bins_ratio = np.logspace(-1, 1.3, 30)
-    for lab in ('noise', 'click'):
+    for lab in ('noise', 'control', 'click'):
         sel = [r for r in ana if r['label_name'] == lab]
+        if not sel:
+            continue
         kw = dict(alpha=0.55, color=style[lab]['c'], label=style[lab]['label'], density=True)
         vals = [_f(r['bubble_tau_ratio_true_over_pred']) for r in sel]
         axes[0].hist([v for v in vals if np.isfinite(v) and v > 0], bins=bins_ratio, **kw)
@@ -421,10 +571,13 @@ def main():
     ap.add_argument('--anatomy', type=Path)
     ap.add_argument('--workers', type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument('--limit', type=int)
+    ap.add_argument('--controls', type=Path, action='append', default=[],
+                    help='non-plant control recording(s): a .paudio file or a folder; repeatable')
     args = ap.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
-    anatomy = json.loads(args.anatomy.read_text()) if args.anatomy else {}
+    anatomy = {k: v for k, v in (json.loads(args.anatomy.read_text()) if args.anatomy else {}).items()
+               if not k.startswith('_') and isinstance(v, dict)}
     wanted = set(args.labels.split(','))
 
     with open(args.dataset, newline='') as fh:
@@ -480,6 +633,20 @@ def main():
         out_rows.append(categorise(base, anatomy) if i in results else
                         {**base, 'analysable': 0, 'model_category': 'not_analysable'})
 
+    control_files = []
+    for cpath in args.controls:
+        cpath = cpath.expanduser()
+        control_files += sorted(cpath.rglob('*.paudio')) if cpath.is_dir() else [cpath]
+    if control_files:
+        print(f'\nInstrument controls: {len(control_files)} recording(s)')
+        for crow in analyse_controls(control_files):
+            base = {k: v for k, v in crow.items() if k != 'result'}
+            base.update({'label_name': 'control', 'species': 'control', 'session_type': 'control',
+                         'error': ''})
+            base.update({k: v for k, v in crow['result'].items()
+                         if k not in ('file', 'frame_idx', 'timestamp_s')})
+            out_rows.append(categorise(base, anatomy))
+
     cols = []
     for r in out_rows:
         for k in r:
@@ -492,6 +659,7 @@ def main():
 
     done = [r for r in out_rows if not r.get('error')]
     meta = {'dataset': str(args.dataset), 'n_rows': len(rows), 'n_done': len(done),
+            'n_controls': sum(1 for r in done if r['label_name'] == 'control'),
             'n_missing': sum(missing.values()), 'n_errors': len(errors)}
     verdict = summarise(done, anatomy, args.out, meta) if done else 'no rows analysed'
     if done:
