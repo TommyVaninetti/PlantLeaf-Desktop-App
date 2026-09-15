@@ -11,13 +11,12 @@ if _SIM_DIR not in sys.path:
     sys.path.insert(0, _SIM_DIR)
 
 import numpy as np
-from scipy.signal import hilbert
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QLabel, QPushButton, QDoubleSpinBox, QSlider, QGroupBox,
     QFileDialog, QMessageBox, QProgressDialog, QTabWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QFrame,
-    QApplication
+    QApplication, QComboBox, QScrollArea
 )
 from PySide6.QtCore import Qt, QThread, Signal, QObject
 from PySide6.QtGui import QIcon, QAction, QFont
@@ -28,6 +27,7 @@ from core.layout_manager import LayoutManager
 from core.theme_manager import ThemeManager
 from config.app_config import AppConfig
 from plotting.plot_manager import BasePlotWidget
+import pyqtgraph as pg
 
 
 SLIDER_CSS = (
@@ -39,34 +39,34 @@ SLIDER_CSS = (
 )
 
 
-class SimulationWorker(QObject):
-    finished = Signal(dict)
-    error = Signal(str)
-    progress = Signal(int)
+class ModelComparisonWorker(QObject):
+    """
+    Runs click_model_comparison.analyse_click on one or more clicks, off the
+    GUI thread. Each job is (index, frames, frame_idx, noise_floor, std_noise).
+    """
+    result   = Signal(int, object)   # (click index, analyse_click result)
+    progress = Signal(int, int)      # (done, total)
+    finished = Signal()
+    error    = Signal(str)
 
-    def __init__(self, R0, P_inf, distance_m, tau_target_ms=None, freq_target_hz=None, real_signal_for_fit=None):
+    def __init__(self, jobs):
         super().__init__()
-        self.R0 = R0
-        self.P_inf = P_inf
-        self.distance_m = distance_m
-        self.tau_target_ms = tau_target_ms
-        self.freq_target_hz = freq_target_hz
-        self.real_signal_for_fit = real_signal_for_fit
+        self.jobs = jobs
+        self._stop_requested = False
+
+    def request_stop(self):
+        self._stop_requested = True
 
     def run(self):
         try:
-            from chemical_simulators.run_acoustic_simulation import run_simulation
-            self.progress.emit(30)
-            result = run_simulation(
-                R0=self.R0,
-                P_inf=self.P_inf,
-                distance_m=self.distance_m,
-                tau_target_ms=self.tau_target_ms,
-                freq_target_hz=self.freq_target_hz,
-                real_signal_for_fit=self.real_signal_for_fit
-            )
-            self.progress.emit(100)
-            self.finished.emit(result)
+            import click_model_comparison as cmc
+            total = len(self.jobs)
+            for n, (idx, frames, frame_idx, noise_floor, std_noise) in enumerate(self.jobs):
+                if self._stop_requested:
+                    break
+                self.result.emit(idx, cmc.analyse_click(frames, frame_idx, noise_floor, std_noise))
+                self.progress.emit(n + 1, total)
+            self.finished.emit()
         except Exception as e:
             import traceback
             self.error.emit(f"{str(e)}\n{traceback.format_exc()}")
@@ -87,6 +87,9 @@ class MainWindowChemicalSimulator(QMainWindow):
 
         self.sim_result = None
         self.real_clicks = []
+        self.model_results = {}     # click index -> analyse_click result
+        self._compare_thread = None
+        self._compare_worker = None
         self.sim_thread = None
         self.sim_worker = None
         self.paudio_data = None
@@ -113,10 +116,29 @@ class MainWindowChemicalSimulator(QMainWindow):
         main_layout.setSpacing(8)
         splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(splitter)
-        splitter.addWidget(self._build_controls_panel())
+        # Scrollable: with the model selector and the batch buttons the controls
+        # no longer fit a laptop-height window, and a squeezed QVBoxLayout
+        # draws its rows on top of each other instead of shrinking them.
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setFrameShape(QFrame.NoFrame)
+        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        controls_panel = self._build_controls_panel()
+        controls_panel.setObjectName("chemSimControls")
+        controls_scroll.setObjectName("chemSimControlsScroll")
+        # The scroll area's viewport paints the SYSTEM palette (black in macOS dark
+        # mode), which the app themes do not style. Make both see-through so the
+        # themed window background shows, as it did before the scroll area existed.
+        controls_scroll.setStyleSheet(
+            "QScrollArea#chemSimControlsScroll { background: transparent; border: none; }"
+            "QWidget#chemSimControls { background: transparent; }")
+        controls_scroll.viewport().setAutoFillBackground(False)
+        controls_panel.setAutoFillBackground(False)
+        controls_scroll.setWidget(controls_panel)
+        splitter.addWidget(controls_scroll)
         splitter.addWidget(self._build_plots_panel())
         splitter.addWidget(self._build_results_panel())
-        splitter.setSizes([280, 620, 260])
+        splitter.setSizes([340, 620, 280])
 
     def _build_controls_panel(self):
         panel = QWidget()
@@ -138,10 +160,10 @@ class MainWindowChemicalSimulator(QMainWindow):
         r0_lbl = QLabel("R0:")
         r0_lbl.setFixedWidth(35)
         self.r0_slider = QSlider(Qt.Horizontal)
-        self.r0_slider.setRange(20, 100)
+        self.r0_slider.setRange(1, 500)
         self.r0_slider.setValue(50)
         self.r0_spinbox = QDoubleSpinBox()
-        self.r0_spinbox.setRange(20.0, 100.0)
+        self.r0_spinbox.setRange(1.0, 500.0)
         self.r0_spinbox.setValue(50.0)
         self.r0_spinbox.setSuffix(" µm")
         self.r0_spinbox.setDecimals(1)
@@ -194,6 +216,51 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.dist_slider.valueChanged.connect(lambda v: self.dist_spinbox.setValue(v / 10.0))
         self.dist_spinbox.valueChanged.connect(lambda v: self.dist_slider.setValue(int(v * 10)))
 
+        # Physical model the real click is compared with. Both are computed on
+        # every run; the selector only chooses which one the plots and tables show.
+        model_row = QHBoxLayout()
+        model_lbl = QLabel("Model:")
+        model_lbl.setFixedWidth(50)
+        self.model_combo = QComboBox()
+        self.model_combo.addItem("Xylem vessel — Dutta 2022", 'vessel')
+        self.model_combo.addItem("Free bubble — Minnaert (+thermal)", 'bubble')
+        self.model_combo.currentIndexChanged.connect(self._on_model_changed)
+        model_row.addWidget(model_lbl)
+        model_row.addWidget(self.model_combo)
+        phys_layout.addLayout(model_row)
+
+        # Vessel wall (Dutta 2022, Eq. 2): only the vessel LENGTH depends on them.
+        wall_row = QHBoxLayout()
+        wall_row.addWidget(QLabel("E:"))
+        self.young_spinbox = QDoubleSpinBox()
+        self.young_spinbox.setRange(0.05, 2.0)
+        self.young_spinbox.setDecimals(2)
+        self.young_spinbox.setSingleStep(0.05)
+        self.young_spinbox.setValue(0.20)
+        self.young_spinbox.setSuffix(" GPa")
+        self.young_spinbox.setToolTip("Young's modulus of the vessel wall (Dutta 2022: 0.2 ± 0.1 GPa, fresh stems)")
+        wall_row.addWidget(self.young_spinbox)
+        wall_row.addWidget(QLabel("h:"))
+        self.wall_spinbox = QDoubleSpinBox()
+        self.wall_spinbox.setRange(0.1, 10.0)
+        self.wall_spinbox.setDecimals(1)
+        self.wall_spinbox.setSingleStep(0.1)
+        self.wall_spinbox.setValue(1.0)
+        self.wall_spinbox.setSuffix(" µm")
+        self.wall_spinbox.setToolTip("Vessel wall thickness (Dutta 2022: ~1 µm)")
+        wall_row.addWidget(self.wall_spinbox)
+        phys_layout.addLayout(wall_row)
+        self.young_spinbox.valueChanged.connect(self._on_model_changed)
+        self.wall_spinbox.valueChanged.connect(self._on_model_changed)
+
+        # R0 is no longer an input: each model derives its geometry from the
+        # selected click (bubble: R0 from f; vessel: R from τ, L from f).
+        for w in (self.r0_slider, self.r0_spinbox):
+            w.setEnabled(False)
+            w.setToolTip("Free-bubble R₀, derived from the selected click's frequency (read-only)")
+        for w in (self.pinf_slider, self.pinf_spinbox, self.dist_slider, self.dist_spinbox):
+            w.setToolTip("Used only by the PDF report; not part of the model comparison")
+
         layout.addWidget(phys_widget)
 
         sep = QFrame()
@@ -210,9 +277,10 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.click_selector_label = QLabel("Select click to analyze:")
         layout.addWidget(self.click_selector_label)
 
-        self.click_table = QTableWidget(0, 4)
-        self.click_table.setHorizontalHeaderLabels(["Time (s)", "τ (ms)", "Peak", "R²"])
-        self.click_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.click_table = QTableWidget(0, 7)
+        self.click_table.setHorizontalHeaderLabels(
+            ["Time (s)", "τ (ms)", "Peak", "R²", "R (µm)", "L (mm)", "τ/τ bubble"])
+        self.click_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.click_table.verticalHeader().setVisible(False)
         self.click_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.click_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -226,6 +294,24 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.btn_run.setEnabled(False)
         self.btn_run.clicked.connect(self._run_simulation)
         layout.addWidget(self.btn_run)
+
+        batch_row = QHBoxLayout()
+        self.btn_run_all = QPushButton("Analyze All")
+        self.btn_run_all.setMinimumHeight(38)
+        self.btn_run_all.setObjectName("mainButton")
+        self.btn_run_all.setEnabled(False)
+        self.btn_run_all.setToolTip("Compare every click in this recording with both models")
+        self.btn_run_all.clicked.connect(self._analyze_all_clicks)
+        batch_row.addWidget(self.btn_run_all)
+
+        self.btn_export = QPushButton("Export CSV")
+        self.btn_export.setMinimumHeight(38)
+        self.btn_export.setObjectName("mainButton")
+        self.btn_export.setEnabled(False)
+        self.btn_export.setToolTip("One row per analysed click: real τ/f, vessel R/L, bubble τ ratio, R²")
+        self.btn_export.clicked.connect(self._export_results_csv)
+        batch_row.addWidget(self.btn_export)
+        layout.addLayout(batch_row)
 
         self.btn_pdf = QPushButton("Generate PDF Report")
         self.btn_pdf.setMinimumHeight(38)
@@ -267,6 +353,10 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.curve_sim_time  = self.plot_time.plot_widget.plot(name="Simulated",  pen={'color': '#689f67', 'width': 3.5})
         self.curve_real_time = self.plot_time.plot_widget.plot(name="Real click", pen={'color': 'r',       'width': 2})
         self.plot_time.plot_widget.showGrid(x=True, y=True)
+        self.region_time = pg.LinearRegionItem(brush=(104, 159, 103, 40), movable=False)
+        self.region_time.setZValue(-10)
+        self.region_time.hide()
+        self.plot_time.plot_widget.addItem(self.region_time)
         time_layout.addWidget(self.plot_time)
         tab.addTab(time_widget, "Time Domain")
 
@@ -291,7 +381,7 @@ class MainWindowChemicalSimulator(QMainWindow):
 
         bubble_widget = QWidget()
         bubble_layout = QVBoxLayout(bubble_widget)
-        bubble_layout.addWidget(QLabel("Bubble radius R(t) during collapse"))
+        bubble_layout.addWidget(QLabel("Bubble radius R(t) of the free-bubble model at the R₀ that rings at the click frequency\n(10 % initial perturbation; the amplitude is arbitrary, the ring-down time is the prediction)"))
         self.plot_bubble = BasePlotWidget(
             x_label="Time", y_label="Radius",
             x_range=(0, 0.00256), y_range=(0, 100),
@@ -304,6 +394,31 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.plot_bubble.plot_widget.showGrid(x=True, y=True)
         bubble_layout.addWidget(self.plot_bubble)
         tab.addTab(bubble_widget, "Bubble Dynamics")
+
+        # τ–f map: every analysed click (chain-calibrated f, τ) against the two
+        # models — the free bubble fixes τ for each f, the vessel model maps τ to a
+        # vessel radius (horizontal lines).
+        map_widget = QWidget()
+        map_layout = QVBoxLayout(map_widget)
+        map_caption = QLabel(
+            "Each red dot is one analysed click: its frequency and its decay time τ, both "
+            "corrected for the measurement chain.\n"
+            "Blue curve — the τ a FREE air bubble ringing at that frequency must have "
+            "(Minnaert + radiation/viscous/thermal damping): a click on the curve is "
+            "consistent with a free bubble, far above it rings too long for one.\n"
+            "Dashed lines — Dutta 2022 vessel model: a click on the line 'R = 30 µm' would "
+            "come from a xylem vessel of 30 µm radius (compare with the plant's anatomy).")
+        map_caption.setWordWrap(True)
+        map_layout.addWidget(map_caption)
+        self.plot_map = pg.PlotWidget()
+        self.plot_map.setLogMode(x=False, y=True)
+        self.plot_map.setLabel('bottom', 'Frequency', units='Hz')
+        self.plot_map.setLabel('left', 'τ (ms)')
+        self.plot_map.showGrid(x=True, y=True)
+        self.plot_map.addLegend()
+        map_layout.addWidget(self.plot_map)
+        tab.addTab(map_widget, "τ–f Map")
+        self._draw_map_models()
 
         return panel
 
@@ -350,7 +465,7 @@ class MainWindowChemicalSimulator(QMainWindow):
         self.table_compare.setStyleSheet("QTableWidget { border: none; }")
         layout.addWidget(self.table_compare)
 
-        self.correlation_label = QLabel("Correlation: —")
+        self.correlation_label = QLabel("Waveform R²: —")
         self.correlation_label.setAlignment(Qt.AlignCenter)
         self.correlation_label.setStyleSheet("font-weight: bold; font-size: 14px; padding: 6px;")
         layout.addWidget(self.correlation_label)
@@ -615,16 +730,22 @@ class MainWindowChemicalSimulator(QMainWindow):
                 'tau_ms':    float(det.get('tau_ms', -1.0)),
                 'r2':        float(det.get('R2', 0.0)),
                 'peak_amp':  float(det.get('peak_amp', 0.0)),
+                'noise_floor': float(det['noise_floor']),
+                'std_noise':   float(det['std_noise']),
                 'FPE_hz_region':   float(fpe) if fpe is not None else float('nan'),
                 'svm_probability': det.get('svm_probability'),
             })
 
+        self.model_results = {}
+        self.btn_export.setEnabled(False)
         self._populate_click_table()
+        self._refresh_map()
         self.file_label.setText(
             f"{os.path.basename(file_path)}\n{len(self.real_clicks)} clicks found (v6)"
         )
         if self.real_clicks:
             self.btn_run.setEnabled(True)
+            self.btn_run_all.setEnabled(True)
 
     def _populate_click_table(self):
         self.click_table.setRowCount(len(self.real_clicks))
@@ -636,32 +757,53 @@ class MainWindowChemicalSimulator(QMainWindow):
             self.click_table.setItem(i, 2, QTableWidgetItem(f"{peak_uv:.0f}"))
             r2_val = click.get('r2', click.get('r2_log', 0.0))
             self.click_table.setItem(i, 3, QTableWidgetItem(f"{r2_val:.3f}"))
+            self._update_click_row(i)
+
+    def _update_click_row(self, i):
+        """Model columns of one click-table row (empty until the click is analysed)."""
+        res = self.model_results.get(i) or {}
+        v = res.get('vessel') or {}
+        b = res.get('bubble') or {}
+        vals = ["", "", ""]
+        if v.get('ok'):
+            vals[0] = f"{v['R_um']:.1f}"
+            vals[1] = f"{self._vessel_length_mm(v):.2f}"
+        if b.get('ok') and np.isfinite(b.get('tau_ratio_true_over_pred', np.nan)):
+            vals[2] = f"{b['tau_ratio_true_over_pred']:.2f}"
+        for k, text in enumerate(vals):
+            self.click_table.setItem(i, 4 + k, QTableWidgetItem(text))
+
+    def _selected_click_index(self):
+        row = self.click_table.currentRow()
+        if not self.click_table.selectedItems() or row < 0 or row >= len(self.real_clicks):
+            return None
+        return row
 
     def _on_click_selected(self):
-        rows = self.click_table.selectedItems()
-        if not rows:
+        idx = self._selected_click_index()
+        if idx is None:
             return
-        row = self.click_table.currentRow()
-        if row < 0 or row >= len(self.real_clicks):
-            return
-        # Selecting a different click invalidates any existing simulation
         self._discard_simulation()
-        click = self.real_clicks[row]
-        self._show_real_click(click)
+        self._show_real_click(self.real_clicks[idx])
+        if idx in self.model_results:
+            self._display_result(idx)
+        self._refresh_map()
 
     def _discard_simulation(self):
         """Clear the simulated (green) overlay and its result tables.
 
-        Called whenever the selected click changes: the previous simulation no
-        longer corresponds to the newly selected click, so it must be discarded.
+        Called whenever the selected click changes: the overlay belongs to the
+        previous click. Results already computed stay cached in model_results
+        and are shown again when their click is selected.
         """
         self.sim_result = None
+        self.region_time.hide()
         self.curve_sim_time.setData([], [])
         self.curve_sim_freq.setData([], [])
         self.curve_bubble.setData([], [])
         self.table_sim.setRowCount(0)
         self.table_compare.setRowCount(0)
-        self.correlation_label.setText("Correlation: —")
+        self.correlation_label.setText("Waveform R²: —")
         self.btn_pdf.setEnabled(False)
 
     def _reconstruct_row(self, row):
@@ -727,360 +869,338 @@ class MainWindowChemicalSimulator(QMainWindow):
         sig_prev, sig_center, sig_next = self._click_frame_signals(click)
 
         sig_full    = np.concatenate([sig_prev, sig_center, sig_next])
-        center_peak = np.max(np.abs(sig_center)) + 1e-30
-        t_full      = np.linspace(0, 3 * frame_dur, 3 * fft_size)
+        t_full      = np.arange(3 * fft_size) / fs
 
-        # Peak position inside the full 3-frame axis (for sim alignment)
-        self._real_click_peak_t = frame_dur + np.argmax(np.abs(sig_center)) / fs
+        # Normalised to the click's envelope peak as v6 measures it (peak_amp), so
+        # the click reads 1. The simulated click is drawn with the amplitude the
+        # waveform fit gives it (least squares in the v6 region), so a click whose
+        # peak is an initial impulse above its ring-down shows the model BELOW the
+        # peak — that gap is the 'Impulse factor'. Absolute pressure is not
+        # comparable (unknown source-to-mic coupling), so only shape is plotted.
+        # (Before: the centre frame's |max|, which is not the click when the click
+        # straddles two frames, and made the two curves' peaks disagree.)
+        norm = click.get('peak_amp', 0.0)
+        if not norm or norm <= 0:
+            norm = np.max(np.abs(sig_full)) + 1e-30
+        self._real_norm = norm
+        self.curve_real_time.setData(t_full, sig_full / norm)
+        self.plot_time.plot_widget.setXRange(0, 3 * frame_dur, padding=0)
 
-        self.curve_real_time.setData(t_full, sig_full / center_peak)
+    # =========================================================================
+    # Model comparison (click_model_comparison) — single click and batch
+    # =========================================================================
 
-    def _find_click_envelope_bounds(self, signal, level_fraction=0.1, guard=5, max_search=300):
-        """
-        Trova inizio, picco e fine di un click reale dentro un segnale
-        grezzo, usando una soglia sull'inviluppo di Hilbert (10% del
-        picco). Restituisce (start_idx, peak_idx, end_idx), o None.
-        """
-        if signal is None or len(signal) < 10:
-            return None
-        try:
-            envelope = np.abs(hilbert(signal))
-            peak_idx = int(np.argmax(envelope))
-            peak_amp = envelope[peak_idx]
-            if peak_amp <= 0:
+    def _click_job(self, idx):
+        """(index, frames, frame_idx, noise_floor, std_noise) for one click."""
+        click = self.real_clicks[idx]
+        pd = self.paudio_data
+        n_rows = min(len(pd['fft_data']), len(pd['phase_data']))
+
+        def frame(row):
+            if row is None or not (0 <= row < n_rows):
                 return None
-            level = peak_amp * level_fraction
+            return (pd['fft_data'][row], pd['phase_data'][row])
 
-            start_idx = max(peak_idx - max_search, 0)
-            for i in range(peak_idx - 1, max(peak_idx - max_search, -1), -1):
-                if envelope[i] < level:
-                    start_idx = i + 1
-                    break
-
-            end_idx = min(peak_idx + max_search, len(envelope) - 1)
-            for i in range(peak_idx + 1, end_idx + 1):
-                if envelope[i] < level:
-                    end_idx = i
-                    break
-
-            return start_idx, peak_idx, end_idx
-        except Exception:
-            return None
-
-    def _extract_click_dominant_frequency(self, click):
-        """
-        Estrae la frequenza dominante dal click reale selezionato tramite
-        conteggio degli attraversamenti dello zero (zero-crossing) sulla
-        porzione isolata del click. Per segmenti così brevi la FFT
-        soffre di spectral leakage; lo zero-crossing è più diretto e
-        affidabile.
-        """
-        if not self.paudio_data:
-            return None
-        try:
-            signal = self._real_click_signal(click)
-            if signal is None or len(signal) < 10:
-                return None
-
-            bounds = self._find_click_envelope_bounds(signal)
-            if bounds is None:
-                return None
-            start_idx, peak_idx, end_idx = bounds
-
-            segment = signal[start_idx:end_idx + 1]
-            if len(segment) < 4:
-                return None
-
-            signs = np.sign(segment)
-            signs[signs == 0] = 1
-            crossings = np.where(np.diff(signs) != 0)[0]
-            if len(crossings) < 2:
-                return None
-
-            n_cycles = len(crossings) / 2.0
-            fs = self.paudio_data['fs']
-            duration_s = len(segment) / fs
-            if duration_s <= 0:
-                return None
-
-            freq = n_cycles / duration_s
-            if freq < 20000 or freq > 80000:
-                return None
-            return float(freq)
-        except Exception:
-            return None
+        frames = (frame(click['prev_row']), frame(click['row_idx']), frame(click['next_row']))
+        return (idx, frames, click['frame_idx'], click['noise_floor'], click['std_noise'])
 
     def _run_simulation(self):
-        R0 = self.r0_spinbox.value() * 1e-6
-        P_inf = self.pinf_spinbox.value() * 1e6
-        distance_m = self.dist_spinbox.value() * 0.01
+        idx = self._selected_click_index()
+        if idx is None or not self.paudio_data:
+            QMessageBox.information(self, "Select a click",
+                                    "Load a recording and select a click to compare with the models.")
+            return
+        self._launch_comparison([self._click_job(idx)], batch=False)
 
-        rows_sel = self.click_table.selectedItems()
-        tau_target = None
-        freq_target = None
-        real_signal_for_fit = None
-        if rows_sel:
-            row = self.click_table.currentRow()
-            if row >= 0 and row < len(self.real_clicks):
-                click = self.real_clicks[row]
-                tau_target = click.get('tau_ms', None)
-                freq_target = self._extract_click_dominant_frequency(click)
-                real_signal_for_fit = self._real_click_signal(click)
+    def _analyze_all_clicks(self):
+        if not self.real_clicks:
+            return
+        self._launch_comparison([self._click_job(i) for i in range(len(self.real_clicks))], batch=True)
 
-        self.progress_dialog = QProgressDialog("Running simulation...", None, 0, 100, self)
+    def _launch_comparison(self, jobs, batch):
+        if self._compare_thread is not None:
+            return
+        self.btn_run.setEnabled(False)
+        self.btn_run_all.setEnabled(False)
+
+        label = (f"Comparing {len(jobs)} clicks with the physical models…" if batch
+                 else "Comparing the click with the physical models…")
+        self.progress_dialog = QProgressDialog(label, "Cancel" if batch else None, 0, len(jobs), self)
+        self.progress_dialog.setWindowTitle("Model comparison")
         self.progress_dialog.setWindowModality(Qt.WindowModal)
         self.progress_dialog.setMinimumDuration(0)
-        self.progress_dialog.setValue(10)
+        self.progress_dialog.setValue(0)
         self.progress_dialog.show()
 
-        self.sim_thread = QThread(self)
-        self.sim_worker = SimulationWorker(R0, P_inf, distance_m, tau_target, freq_target, real_signal_for_fit)
-        self.sim_worker.moveToThread(self.sim_thread)
-        self.sim_thread.started.connect(self.sim_worker.run)
-        self.sim_worker.finished.connect(self._on_simulation_finished)
-        self.sim_worker.error.connect(self._on_simulation_error)
-        self.sim_worker.progress.connect(self.progress_dialog.setValue)
-        self.sim_worker.finished.connect(self.sim_thread.quit)
-        self.sim_worker.error.connect(self.sim_thread.quit)
-        self.sim_thread.finished.connect(self.sim_thread.deleteLater)
-        self.sim_thread.start()
+        worker = ModelComparisonWorker(jobs)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        # Bound methods only (see _launch_click_detector): slots must run on the GUI thread.
+        thread.started.connect(worker.run)
+        worker.result.connect(self._on_compare_result)
+        worker.progress.connect(self._on_compare_progress)
+        worker.finished.connect(self._on_compare_finished)
+        worker.error.connect(self._on_compare_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        if batch:
+            self.progress_dialog.canceled.connect(worker.request_stop)
+        self._compare_thread = thread
+        self._compare_worker = worker
+        thread.start()
 
-    def _on_simulation_finished(self, result):
-        self.progress_dialog.close()
-        self.sim_result = result
-        self._update_plots(result)
-        self._update_diagnostics(result)
-        self._handle_calibration_feedback(result)
-        self.btn_pdf.setEnabled(True)
-        print("Simulation completed")
+    def _on_compare_result(self, idx, res):
+        self.model_results[idx] = res
+        self._update_click_row(idx)
+        if idx == self._selected_click_index():
+            self._display_result(idx)
 
-    def _handle_calibration_feedback(self, result):
-        calibration = result.get('calibration')
-        if calibration is None:
+    def _on_compare_progress(self, done, total):
+        if getattr(self, 'progress_dialog', None) is not None:
+            self.progress_dialog.setValue(done)
+
+    def _end_comparison(self):
+        if getattr(self, 'progress_dialog', None) is not None:
+            self.progress_dialog.close()
+        self._compare_thread = None
+        self._compare_worker = None
+        self.btn_run.setEnabled(bool(self.real_clicks))
+        self.btn_run_all.setEnabled(bool(self.real_clicks))
+        self.btn_export.setEnabled(bool(self.model_results))
+        self._refresh_map()
+
+    def _on_compare_finished(self):
+        self._end_comparison()
+
+    def _on_compare_error(self, error_msg):
+        self._end_comparison()
+        QMessageBox.critical(self, "Model comparison error", f"An error occurred:\n{error_msg}")
+
+    def _on_model_changed(self, *_):
+        for i in range(len(self.real_clicks)):
+            self._update_click_row(i)
+        idx = self._selected_click_index()
+        if idx is not None and idx in self.model_results:
+            self._display_result(idx)
+        self._refresh_map()
+
+    def _vessel_length_mm(self, v):
+        """L for the current wall parameters (E, h) — the only model output they change."""
+        import vessel_resonance as vr
+        return vr.length_from_frequency(v['f_true_hz'], v['R_um'] * 1e-6,
+                                        h=self.wall_spinbox.value() * 1e-6,
+                                        E=self.young_spinbox.value() * 1e9) * 1e3
+
+    @staticmethod
+    def _fill_table(table, rows):
+        table.setRowCount(len(rows))
+        for i, (name, value) in enumerate(rows):
+            table.setItem(i, 0, QTableWidgetItem(name))
+            table.setItem(i, 1, QTableWidgetItem(value))
+
+    def _display_result(self, idx):
+        """Plots and tables for one analysed click, for the selected model."""
+        res = self.model_results.get(idx) or {}
+        model = self.model_combo.currentData()
+        real = res.get('real')
+        r = res.get(model) or {}
+        if real is None or not r.get('ok'):
+            reason = r.get('reason', 'the click could not be reconstructed') if real else \
+                'the click could not be reconstructed'
+            self._fill_table(self.table_sim, [("Model", self.model_combo.currentText()),
+                                              ("Not available", reason)])
+            self.table_compare.setRowCount(0)
+            self.curve_sim_time.setData([], [])
+            self.curve_sim_freq.setData([], [])
+            self.correlation_label.setText("Waveform R²: —")
             return
 
-        R0_used_um = result['bubble']['R0'] * 1e6
+        pd = self.paudio_data
+        fs = pd['fs']
 
-        self.r0_spinbox.blockSignals(True)
-        self.r0_slider.blockSignals(True)
-        self.r0_spinbox.setValue(R0_used_um)
-        self.r0_slider.setValue(int(round(R0_used_um)))
-        self.r0_spinbox.blockSignals(False)
-        self.r0_slider.blockSignals(False)
+        # Time domain: the simulated click after the SAME chain, on the real click's axis.
+        sim = r['sim_signal']
+        t = (np.arange(len(sim)) + real['layout_offset']) / fs
+        norm = getattr(self, '_real_norm', None) or real['peak_amp']
+        self.curve_sim_time.setData(t, sim / norm)
+        # Zoom on the click: it lasts ~0.1–1 ms inside a 7.68 ms, 3-frame axis.
+        # The shaded band is the v6 click region, where the waveform R² is computed.
+        lo, hi = r['window']
+        self.region_time.setRegion(((lo + real['layout_offset']) / fs,
+                                    (hi - 1 + real['layout_offset']) / fs))
+        self.region_time.show()
+        self.plot_time.plot_widget.setXRange((lo + real['layout_offset']) / fs - 0.3e-3,
+                                             (hi + real['layout_offset']) / fs + 0.6e-3, padding=0)
 
-        note = calibration.get('note', '')
-        msg = f"R0 calibrato automaticamente a {R0_used_um:.1f} µm.\n\n{note}"
-        QMessageBox.information(self, "Calibrazione completata", msg)
+        band = r['sim_fft_norm'][pd['bin_start']:pd['bin_start'] + pd['num_bins']]
+        peak = np.max(band) if len(band) else 0.0
+        self.curve_sim_freq.setData(pd['freq_axis'], band / peak if peak > 0 else band)
 
-    def _on_simulation_error(self, error_msg):
-        self.progress_dialog.close()
-        QMessageBox.critical(self, "Simulation Error", f"An error occurred:\n{error_msg}")
-
-    def _update_plots(self, result):
-        bubble      = result['bubble']
-        propagation = result['propagation']
-        plantleaf   = result['plantleaf']
-
-        t_sim    = bubble['t']                                      # seconds
-        signal   = propagation['signal']
-        sim_norm = signal / (np.max(np.abs(signal)) + 1e-30)
-        t_peak_sim  = t_sim[np.argmax(np.abs(signal))]
-        t_peak_real = getattr(self, '_real_click_peak_t', 0.0)
-        self.curve_sim_time.setData(t_sim - t_peak_sim + t_peak_real, sim_norm)
-
-        freq      = plantleaf['freq']
-        spec      = plantleaf['spectrum']
-        spec_peak = np.max(spec)
-        spec_norm = spec / spec_peak if spec_peak > 0 else spec
-        self.curve_sim_freq.setData(freq, spec_norm)
-
-        R_um = bubble['R'] * 1e6
-        self.curve_bubble.setData(t_sim, R_um)
-
-    def _compute_hilbert_envelope(self, signal):
-        """
-        Calcola l'inviluppo istantaneo del segnale usando la trasformata
-        di Hilbert. Implementazione identica a quella usata dall'algoritmo
-        di rilevamento click di PlantLeaf (replay_window_audio.py), in
-        numpy puro (no scipy) per coerenza e thread-safety.
-        """
-        N = len(signal)
-        Xf = np.fft.rfft(signal, n=N)
-        h = np.zeros(N // 2 + 1, dtype=np.float64)
-        h[0] = 1.0
-        if N % 2 == 0:
-            h[1:-1] = 2.0
-            h[-1] = 1.0
+        b = res.get('bubble') or {}
+        if b.get('ok'):
+            R_um = b['bubble_R'] * 1e6
+            self.curve_bubble.setData(b['bubble_t'], R_um)
+            # R0 is ~40–165 µm and the ring-down lasts ~6τ ≈ 0.2–1.5 ms: fixed axes
+            # (0–100 µm, 0–2.56 ms) put the curve off-screen or squash it flat.
+            pw = self.plot_bubble.plot_widget
+            span = max(np.max(np.abs(R_um - b['R0_um'])), 1e-3) * 1.3
+            pw.setLimits(xMin=0, xMax=float(b['bubble_t'][-1]),
+                         yMin=b['R0_um'] - 5 * span, yMax=b['R0_um'] + 5 * span)
+            pw.setXRange(0, float(b['bubble_t'][-1]), padding=0)
+            pw.setYRange(b['R0_um'] - span, b['R0_um'] + span, padding=0)
+            # Show the derived R0 in the (read-only) R0 control.
+            for w_ in (self.r0_spinbox, self.r0_slider):
+                w_.blockSignals(True)
+            self.r0_spinbox.setValue(b['R0_um'])
+            self.r0_slider.setValue(int(round(b['R0_um'])))
+            for w_ in (self.r0_spinbox, self.r0_slider):
+                w_.blockSignals(False)
         else:
-            h[1:] = 2.0
-        hilbert_part = np.fft.irfft(Xf * h, n=N)
-        return np.sqrt(signal ** 2 + hilbert_part ** 2)
+            self.curve_bubble.setData([], [])
 
-    def _compute_envelope_correlation(self, real_signal, sim_signal):
-        """
-        Confronta la FORMA DEL DECADIMENTO (inviluppo) tra click reale e
-        simulato, con una finestra di confronto proporzionale alla vera
-        durata di ciascun click (non una lunghezza fissa), individuata
-        tramite soglia sull'inviluppo — la stessa identica logica usata
-        da PlantLeaf per isolare un click dal resto del segnale. Una
-        finestra fissa troppo lunga rispetto a un click molto rapido
-        (es. τ=0.05ms) trascinerebbe dentro rumore/silenzio, diluendo
-        artificialmente la correlazione anche quando il decadimento
-        combacia bene.
+        def ms(x):
+            return f"{x:.3f} ms" if x is not None and np.isfinite(x) and x > 0 else "N/A"
 
-        Returns:
-            float: correlazione di Pearson tra i due inviluppi (-1..1)
-        """
-        try:
-            real_bounds = self._find_click_envelope_bounds(real_signal, max_search=500)
-            sim_bounds = self._find_click_envelope_bounds(sim_signal, max_search=500)
-            if real_bounds is None or sim_bounds is None:
-                return 0.0
+        def khz(x):
+            return f"{x / 1000:.1f} kHz" if x is not None and np.isfinite(x) else "N/A"
 
-            real_start, real_peak, real_end = real_bounds
-            sim_start, sim_peak, sim_end = sim_bounds
-
-            pre = min(real_peak - real_start, sim_peak - sim_start)
-            post = min(real_end - real_peak, sim_end - sim_peak)
-            if post <= 3:
-                return 0.0
-
-            real_env = self._compute_hilbert_envelope(real_signal)
-            sim_env = self._compute_hilbert_envelope(sim_signal)
-
-            r_win = real_env[real_peak - pre: real_peak + post + 1]
-            s_win = sim_env[sim_peak - pre: sim_peak + post + 1]
-            n = min(len(r_win), len(s_win))
-            if n <= 6:
-                return 0.0
-            r_win = r_win[:n]
-            s_win = s_win[:n]
-
-            r_norm = r_win / (np.max(r_win) + 1e-30)
-            s_norm = s_win / (np.max(s_win) + 1e-30)
-
-            corr = np.corrcoef(r_norm, s_norm)[0, 1]
-            return float(corr) if np.isfinite(corr) else 0.0
-        except Exception: 
-            return 0.0
-
-
-    def _compute_best_correlation(self, real_signal, sim_signal, max_lag=60):
-        """
-        Calcola la correlazione tra il click reale e quello simulato
-        cercando lo sfasamento (lag) che la massimizza, invece di un
-        confronto a fase fissa allineata solo sui picchi.
-
-        Due oscillazioni con la stessa frequenza e lo stesso decadimento
-        possono avere una correlazione di Pearson vicina a zero se sono
-        sfasate (es. un coseno contro un seno) — la fase assoluta del
-        click reale dipende dall'istante esatto di nucleazione, che non
-        conosciamo né modelliamo. Cercare il miglior allineamento
-        temporale è la pratica standard per confrontare forme d'onda
-        oscillatorie di fase relativa sconosciuta, e riflette meglio se
-        la FORMA del click (non la fase arbitraria) combacia.
-
-        Returns:
-            float: la massima correlazione di Pearson trovata (-1..1)
-        """
-        try:
-            real_bounds = self._find_click_envelope_bounds(real_signal)
-            sim_bounds = self._find_click_envelope_bounds(sim_signal)
-            if real_bounds is None or sim_bounds is None:
-                return 0.0
-
-            _, real_peak, _ = real_bounds
-            _, sim_peak, _ = sim_bounds
-
-            pre = min(real_peak, sim_peak, 20)
-            post = min(len(real_signal) - real_peak, len(sim_signal) - sim_peak, 200) - 1
-            if post <= 5:
-                return 0.0
-
-            r_win = real_signal[real_peak - pre: real_peak + post]
-            s_win = sim_signal[sim_peak - pre: sim_peak + post]
-            n = min(len(r_win), len(s_win))
-            if n <= 10:
-                return 0.0
-            r_win = r_win[:n]
-            s_win = s_win[:n]
-
-            r_norm = r_win / (np.max(np.abs(r_win)) + 1e-30)
-            s_norm = s_win / (np.max(np.abs(s_win)) + 1e-30)
-
-            best_corr = 0.0
-            max_shift = min(max_lag, n // 2)
-            for shift in range(-max_shift, max_shift + 1):
-                if shift >= 0:
-                    a = r_norm[shift:]
-                    b = s_norm[:len(a)]
-                else:
-                    b = s_norm[-shift:]
-                    a = r_norm[:len(b)]
-                if len(a) < 10:
-                    continue
-                c = np.corrcoef(a, b)[0, 1]
-                if np.isfinite(c) and abs(c) > abs(best_corr):
-                    best_corr = c
-
-            return float(best_corr)
-        except Exception:
-            return 0.0
-
-    def _update_diagnostics(self, result):
-        diag   = result['diagnostics']
-        bubble = result['bubble']
-
-        f0_val = bubble.get('f0', None)
-        extra_damping = bubble.get('extra_damping_rate', 0.0)
-
-        rows = [
-            ("R₀",         f"{bubble['R0']*1e6:.1f} µm"),
-            ("P∞",         f"{bubble['P_inf']/1e6:.2f} MPa"),
-            ("Freq. naturale (f₀)", f"{f0_val/1000:.1f} kHz" if f0_val else "N/A"),
-            ("Smorz. extra vaso (fit)", f"{extra_damping:.0f} 1/s" if extra_damping else "0 (nessun fitting)"),
-            ("τ simulated", f"{diag['tau']*1000:.3f} ms" if diag['tau'] else "N/A"),
-            ("SPR",        f"{diag['SPR']:.2f}" if diag['SPR'] else "N/A"),
-            ("Asymmetry",  f"{diag['asymmetry']:.3f}" if diag['asymmetry'] else "N/A"),
-        ]
-        self.table_sim.setRowCount(len(rows))
-        for i, (p, v) in enumerate(rows):
-            self.table_sim.setItem(i, 0, QTableWidgetItem(p))
-            self.table_sim.setItem(i, 1, QTableWidgetItem(v))
-
-        rows_sel = self.click_table.selectedItems()
-        if rows_sel and diag['tau']:
-            row = self.click_table.currentRow()
-            click = self.real_clicks[row]
-            tau_real = click.get('tau_ms', -1.0)
-            tau_sim  = diag['tau'] * 1000.0
-
-            real_signal = self._real_click_signal(click)
-
-            sim_signal = result['propagation']['signal']
-            corr = 0.0
-            env_corr = 0.0
-            if real_signal is not None and len(real_signal) > 0 and len(sim_signal) > 0:
-                corr = self._compute_best_correlation(real_signal, sim_signal)
-                env_corr = self._compute_envelope_correlation(real_signal, sim_signal)
-
-            self.correlation_label.setText(f"Envelope Correlation: {env_corr:.4f}")
-
-            compare_rows = [
-                ("τ real (ms)",  f"{tau_real:.3f}" if tau_real > 0 else "N/A"),
-                ("τ sim (ms)",   f"{tau_sim:.3f}"),
-                ("Correlation (onda)",  f"{corr:.4f}"),
-                ("Correlation (busta)", f"{env_corr:.4f}"),
-                ("Match τ",      "Yes" if tau_real > 0 and abs(tau_sim - tau_real) / tau_real < 0.2 else "No"),
+        conv = (f"converged ({r['iterations']} it.)" if r['converged']
+                else f"not converged — best of {r['iterations']} it.")
+        if model == 'vessel':
+            sim_rows = [
+                ("Model", "Xylem vessel (Dutta 2022)"),
+                ("f (calibrated)", khz(r['f_true_hz'])),
+                ("τ (calibrated)", ms(r['tau_true_ms'])),
+                ("Q = π·f·τ", f"{r['Q']:.1f}"),
+                ("Vessel radius R", f"{r['R_um']:.1f} µm"),
+                ("Element length L", f"{self._vessel_length_mm(r):.2f} mm"),
+                ("Calibration", conv),
             ]
-            self.table_compare.setRowCount(len(compare_rows))
-            for i, (m, v) in enumerate(compare_rows):
-                self.table_compare.setItem(i, 0, QTableWidgetItem(m))
-                self.table_compare.setItem(i, 1, QTableWidgetItem(v))
+        else:
+            sim_rows = [
+                ("Model", "Free bubble (Minnaert)"),
+                ("R₀ (from f)", f"{r['R0_um']:.1f} µm"),
+                ("f₀", khz(r['f_true_hz'])),
+                ("κ (polytropic)", f"{r['kappa']:.2f}"),
+                ("δ rad / vis / th", f"{r['delta_rad']:.3f} / {r['delta_vis']:.3f} / {r['delta_th']:.3f}"),
+                ("τ predicted", ms(r['tau_pred_ms'])),
+                ("Q predicted", f"{r['Q_pred']:.1f}"),
+                ("Calibration (f)", conv),
+            ]
+        if r.get('below_resolution'):
+            sim_rows.append(("⚠ Resolution", "real τ below ~0.06 ms: τ-based results unreliable"))
+        self._fill_table(self.table_sim, sim_rows)
+
+        compare_rows = [
+            ("τ real (v6)", ms(real['tau_ms'])),
+            ("τ simulated (v6)", ms(r['sim_tau_ms'])),
+            ("f real (click region)", khz(real['f_region_hz'])),
+            ("f simulated (click region)", khz(r['sim_f_hz'])),
+            ("Waveform R² (v6 region)", f"{r['r2_wave']:.3f}"),
+            ("Shape correlation r", f"{r['r_wave']:.3f}"),
+            ("Impulse factor", f"{r['impulse_factor']:.2f}"),
+            ("Envelope corr.", f"{r['env_corr']:.3f}"),
+        ]
+        if model == 'bubble':
+            ratio = r.get('tau_ratio_real_over_sim', float('nan'))
+            compare_rows.append(("τ real / τ bubble", f"{ratio:.2f}" if np.isfinite(ratio) else "N/A"))
+            if 'Q_real' in r:
+                compare_rows.append(("τ calibrated / τ predicted", f"{r['tau_ratio_true_over_pred']:.2f}"))
+                compare_rows.append(("Q real / Q bubble", f"{r['Q_real']:.1f} / {r['Q_pred']:.1f}"))
+        self._fill_table(self.table_compare, compare_rows)
+        self.correlation_label.setText(f"Waveform R²: {r['r2_wave']:.3f}   ·   r: {r['r_wave']:.3f}")
+
+        self.sim_result = res
+        self.btn_pdf.setEnabled(bool(b.get('ok')))
+
+    # ── τ–f map ────────────────────────────────────────────────────────────
+
+    def _draw_map_models(self):
+        """Static model curves: bubble τ(f) and vessel iso-radius lines."""
+        import click_model_comparison as cmc
+        import vessel_resonance as vr
+        import rayleigh_plesset as rp
+
+        f_grid = np.linspace(18_000, 90_000, 60)
+        tau_bubble = []
+        for f in f_grid:
+            R0 = cmc._bubble_R0_for_frequency(f)
+            tau_bubble.append(rp.bubble_linear_properties(R0)['tau'] * 1e3)
+        self.plot_map.plot(f_grid, np.array(tau_bubble), name="Free bubble τ(f)",
+                           pen={'color': '#2196F3', 'width': 2})
+        for R_um in (10, 20, 30, 40, 50):
+            tau_ms = vr.settling_time(R_um * 1e-6) * 1e3
+            self.plot_map.plot([18_000, 90_000], [tau_ms, tau_ms],
+                               pen=pg.mkPen('#8d6e63', width=1, style=Qt.DashLine))
+            label = pg.TextItem(f"vessel R={R_um} µm", color='#6d4c41', anchor=(0, 1))
+            label.setPos(18_500, np.log10(tau_ms))
+            self.plot_map.addItem(label)
+        self._map_scatter = self.plot_map.plot([], [], pen=None, symbol='o', symbolSize=7,
+                                               symbolBrush='#e53935', name="Clicks (calibrated)")
+        self._map_selected = self.plot_map.plot([], [], pen=None, symbol='o', symbolSize=13,
+                                                symbolBrush=None, symbolPen=pg.mkPen('k', width=2))
+
+    def _refresh_map(self):
+        xs, ys, sel = [], [], None
+        chosen = self._selected_click_index()
+        for i, res in self.model_results.items():
+            v = (res or {}).get('vessel') or {}
+            if v.get('ok') and v['tau_true_ms'] > 0:
+                xs.append(v['f_true_hz'])
+                ys.append(v['tau_true_ms'])
+                if i == chosen:
+                    sel = (v['f_true_hz'], v['tau_true_ms'])
+        self._map_scatter.setData(xs, ys)
+        self._map_selected.setData([sel[0]] if sel else [], [sel[1]] if sel else [])
+
+    # ── export ─────────────────────────────────────────────────────────────
+
+    def _export_results_csv(self):
+        if not self.model_results:
+            return
+        import csv
+        import click_model_comparison as cmc
+
+        stem = os.path.splitext(os.path.basename(getattr(self, '_load_file_path', 'recording')))[0]
+        start_dir = self.settings_manager.get_last_directory("chem_sim_export")
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export model comparison", os.path.join(start_dir, f"{stem}_model_comparison.csv"),
+            "CSV Files (*.csv)")
+        if not file_path:
+            return
+        columns = cmc.CSV_COLUMNS + ['svm_probability', 'wall_E_GPa', 'wall_h_um']
+        try:
+            with open(file_path, 'w', newline='') as fh:
+                writer = csv.DictWriter(fh, fieldnames=columns)
+                writer.writeheader()
+                for i in sorted(self.model_results):
+                    click = self.real_clicks[i]
+                    res = self.model_results[i]
+                    row = cmc.result_to_row(res, file=stem, frame_idx=click['frame_idx'],
+                                            timestamp_s=click['timestamp'])
+                    v = res.get('vessel') or {}
+                    if v.get('ok'):
+                        row['vessel_L_mm'] = self._vessel_length_mm(v)
+                    row['svm_probability'] = click.get('svm_probability')
+                    row['wall_E_GPa'] = self.young_spinbox.value()
+                    row['wall_h_um'] = self.wall_spinbox.value()
+                    writer.writerow(row)
+            self.settings_manager.set_last_directory("chem_sim_export", file_path)
+            QMessageBox.information(self, "Done", f"{len(self.model_results)} clicks exported to:\n{file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export error", f"Could not write the CSV:\n{e}")
 
     def _generate_report(self):
-        if not self.sim_result:
-            QMessageBox.warning(self, "No Data", "Run a simulation first.")
+        """
+        PDF from report_acoustic, for the free-bubble model at the R0 calibrated
+        on the selected click (the report's content is still the bubble-only one).
+        """
+        b = (self.sim_result or {}).get('bubble') or {}
+        if not b.get('ok'):
+            QMessageBox.warning(self, "No Data", "Analyse a click first.")
             return
         start_dir = self.settings_manager.get_last_directory("chem_sim_report")
         file_path, _ = QFileDialog.getSaveFileName(
@@ -1089,8 +1209,11 @@ class MainWindowChemicalSimulator(QMainWindow):
         if not file_path:
             return
         try:
+            from chemical_simulators.run_acoustic_simulation import run_simulation
             from chemical_simulators.report_acoustic import generate_report
-            generate_report(simulation_result=self.sim_result, output_path=file_path)
+            sim = run_simulation(R0=b['R0_um'] * 1e-6, P_inf=self.pinf_spinbox.value() * 1e6,
+                                 distance_m=self.dist_spinbox.value() * 0.01)
+            generate_report(simulation_result=sim, output_path=file_path)
             self.settings_manager.set_last_directory("chem_sim_report", file_path)
             QMessageBox.information(self, "Done", f"PDF saved to:\n{file_path}")
         except Exception as e:
@@ -1103,6 +1226,9 @@ class MainWindowChemicalSimulator(QMainWindow):
             plot.plot_widget.setBackground(bg)
             plot.plot_widget.getAxis("bottom").setTextPen(fg)
             plot.plot_widget.getAxis("left").setTextPen(fg)
+        self.plot_map.setBackground(bg)
+        self.plot_map.getAxis("bottom").setTextPen(fg)
+        self.plot_map.getAxis("left").setTextPen(fg)
 
     def _load_saved_settings(self):
         saved_font_scale = self.font_manager.load_font_scale()

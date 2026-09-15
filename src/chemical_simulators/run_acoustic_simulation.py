@@ -346,9 +346,10 @@ def fit_extra_damping_for_tau(R0, tau_target_s, distance_m, max_iter=5):
         (extra_damping_rate, tau_achieved_ms)
     """
     f0, omega0 = minnaert_frequency(R0)
-    b_rad, b_vis = damping_components(R0, omega0)
+    b_rad, b_vis, b_th = damping_components(R0, omega0)
+    b_phys = b_rad + b_vis + b_th
     b_target = 1.0 / tau_target_s
-    extra_damping_rate = max(0.0, b_target - (b_rad + b_vis))
+    extra_damping_rate = max(0.0, b_target - b_phys)
 
     tau_target_ms = tau_target_s * 1000.0
     tau_achieved_ms = None
@@ -360,9 +361,9 @@ def fit_extra_damping_for_tau(R0, tau_target_s, distance_m, max_iter=5):
         error_ratio = tau_achieved_ms / tau_target_ms
         if abs(error_ratio - 1.0) < 0.02:
             break
-        b_total_current = b_rad + b_vis + extra_damping_rate
+        b_total_current = b_phys + extra_damping_rate
         b_total_new = b_total_current * error_ratio
-        extra_damping_rate = max(0.0, b_total_new - (b_rad + b_vis))
+        extra_damping_rate = max(0.0, b_total_new - b_phys)
 
     return extra_damping_rate, tau_achieved_ms
 

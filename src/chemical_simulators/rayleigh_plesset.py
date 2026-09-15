@@ -1,8 +1,8 @@
 """
 rayleigh_plesset.py
 ====================
-Modello di risonanza di bolla smorzata da irraggiamento acustico, per il
-click ultrasonico di cavitazione xilematica.
+Modello di risonanza di bolla smorzata, per il click ultrasonico di
+cavitazione xilematica (teoria lineare della bolla libera in acqua).
 
 A differenza di un tentativo precedente (integrazione diretta di
 Rayleigh-Plesset sotto tensione P∞ < 0), che risulta fisicamente instabile
@@ -10,18 +10,28 @@ Rayleigh-Plesset sotto tensione P∞ < 0), che risulta fisicamente instabile
 qui si usa il modello validato in letteratura per l'evento acustico:
 un nucleo di cavitazione, una volta formatosi, oscilla ed è smorzato
 attorno a un raggio di equilibrio R0 con la frequenza naturale di
-Minnaert, smorzata principalmente per irraggiamento acustico.
+Minnaert.
 
-Frequenza:
-    f0 = (1/2πR0) · √[(3γP0 + (3γ-1)·2σ/R0) / ρ]
+Frequenza (Minnaert con tensione superficiale ed esponente politropico
+effettivo κ, Prosperetti 1977):
+    ω0² = [3κ·p_g0 − 2σ/R0] / (ρR0²),   p_g0 = p0 + 2σ/R0
+    (con κ = γ si ritrova f0 = (1/2πR0)·√[(3γp0 + (3γ−1)·2σ/R0)/ρ])
 
-Smorzamento (irraggiamento + viscoso):
-    b_rad = ω0²·R0 / (2c)      τ_rad = 1/b_rad
-    b_vis = 2µ / (ρR0²)         τ_vis = 1/b_vis
-    τ = 1 / (b_rad + b_vis)
+Smorzamento (tassi d'ampiezza, inviluppo ∝ exp(−b·t)):
+    b_rad = ω0²·R0 / (2c)                 irraggiamento acustico
+    b_vis = 2µ / (ρR0²)                    viscosità
+    b_th  = p_g0·Im(Φ) / (2ρ·ω0·R0²)       conduzione termica nel gas
+    τ = 1 / (b_rad + b_vis + b_th),   Q = ω0 / (2b) = π·f0·τ
+
+    Φ = 3γ / (1 − 3(γ−1)·iχ·[√(i/χ)·coth√(i/χ) − 1]),  χ = D/(ω·R0²),  κ = Re(Φ)/3
+    D = diffusività termica del gas alla pressione p_g0.
+
+    Nota (Step B, 2026-09): lo smorzamento termico mancava nella versione
+    precedente. Per 20–80 kHz è il termine DOMINANTE (Q ≈ 9–14 invece di ~55):
+    senza di esso τ risultava sovrastimato di ~4 volte.
 
 Il raggio oscilla quindi come:
-    R(t) = R0 + ΔR·exp(-t/τ)·cos(ω0·t)
+    R(t) = R0 + ΔR·rise(t)·exp(-t/τ)·sin(ω0·t)
 
 con ΔR = R0 · BubbleResonance.PERTURBATION_FRACTION.
 
@@ -37,7 +47,8 @@ limitato in ampiezza, non un'espansione o un collasso violento.
 Fonti:
     - Minnaert (1933)
     - Brennen (1995), Cap. 2 — Cavitation and Bubble Dynamics
-    - Plesset & Prosperetti (1977)
+    - Plesset & Prosperetti (1977); Prosperetti (1977) JASA 61:17
+    - Devin (1959) JASA 31:1654; Ainslie & Leighton (2011) JASA 130:3184
 """
 
 import numpy as np
@@ -47,7 +58,8 @@ from acoustic_parameters import (
     WaterProperties,
     BubbleParameters,
     XylemPressure,
-    BubbleResonance
+    BubbleResonance,
+    GasProperties,
 )
 
 
@@ -55,10 +67,76 @@ from acoustic_parameters import (
 # FREQUENZA DI RISONANZA E SMORZAMENTO (formule chiuse, no parametri tarati)
 # =============================================================================
 
+def _gas_pressure(R0):
+    """Pressione del gas all'equilibrio p_g0 = p0 + 2σ/R0 [Pa]."""
+    return BubbleParameters.P_ATM + 2.0 * WaterProperties.SURFACE_TENSION / R0
+
+
+def prosperetti_phi(R0, omega):
+    """
+    Funzione complessa Φ della teoria lineare di Prosperetti (1977) per il
+    gas nella bolla: Re(Φ)/3 è l'esponente politropico effettivo κ (tra 1,
+    isoterma, e γ, adiabatica), Im(Φ) dà lo smorzamento termico.
+
+        Φ = 3γ / (1 − 3(γ−1)·iχ·[√(i/χ)·coth√(i/χ) − 1]),   χ = D/(ω·R0²)
+    """
+    gamma = WaterProperties.GAMMA_GAS
+    D = GasProperties.thermal_diffusivity(_gas_pressure(R0))
+    chi = D / (omega * R0 ** 2)
+    s = np.sqrt(1j / chi)
+    return 3.0 * gamma / (1.0 - 3.0 * (gamma - 1.0) * 1j * chi * (s / np.tanh(s) - 1.0))
+
+
+def bubble_linear_properties(R0, n_iter=30):
+    """
+    Frequenza, esponente politropico e smorzamenti di una bolla d'aria
+    libera di raggio R0 in acqua a 1 atm, dalla teoria lineare.
+
+    κ dipende da ω e ω dipende da κ: si risolve per iterazione di punto
+    fisso partendo dal caso adiabatico (converge in pochi passi).
+
+    Returns:
+        dict con f0 [Hz], omega0 [rad/s], kappa, b_rad, b_vis, b_th [1/s],
+        tau [s], Q, delta_rad, delta_vis, delta_th, delta_tot
+        (δ = 2b/ω0, costanti di smorzamento adimensionali; Q = 1/δ_tot).
+    """
+    rho = WaterProperties.DENSITY
+    sigma = WaterProperties.SURFACE_TENSION
+    mu = WaterProperties.VISCOSITY
+    c = WaterProperties.SPEED_OF_SOUND
+    p_g0 = _gas_pressure(R0)
+
+    kappa = WaterProperties.GAMMA_GAS
+    omega = np.sqrt((3.0 * kappa * p_g0 - 2.0 * sigma / R0) / (rho * R0 ** 2))
+    for _ in range(n_iter):
+        phi = prosperetti_phi(R0, omega)
+        kappa = phi.real / 3.0
+        omega_new = np.sqrt((3.0 * kappa * p_g0 - 2.0 * sigma / R0) / (rho * R0 ** 2))
+        if abs(omega_new - omega) < 1e-10 * omega:
+            omega = omega_new
+            break
+        omega = omega_new
+    phi = prosperetti_phi(R0, omega)
+
+    b_rad = omega ** 2 * R0 / (2.0 * c)
+    b_vis = 2.0 * mu / (rho * R0 ** 2)
+    b_th = p_g0 * phi.imag / (2.0 * rho * omega * R0 ** 2)
+    b_tot = b_rad + b_vis + b_th
+    return {
+        'f0': omega / (2.0 * np.pi), 'omega0': omega, 'kappa': phi.real / 3.0,
+        'b_rad': b_rad, 'b_vis': b_vis, 'b_th': b_th,
+        'tau': 1.0 / b_tot, 'Q': omega / (2.0 * b_tot),
+        'delta_rad': 2 * b_rad / omega, 'delta_vis': 2 * b_vis / omega,
+        'delta_th': 2 * b_th / omega, 'delta_tot': 2 * b_tot / omega,
+    }
+
+
 def minnaert_frequency(R0):
     """
     Calcola la frequenza di risonanza di Minnaert per una bolla di raggio
-    R0 in equilibrio a pressione atmosferica.
+    R0 in equilibrio a pressione atmosferica, con tensione superficiale ed
+    esponente politropico effettivo κ (non più γ fisso: una bolla di
+    decine di µm a decine di kHz non è adiabatica).
 
     Args:
         R0 : raggio della bolla [m]
@@ -66,21 +144,14 @@ def minnaert_frequency(R0):
     Returns:
         (f0, omega0) : frequenza [Hz] e pulsazione angolare [rad/s]
     """
-    p0 = BubbleParameters.P_ATM
-    rho = WaterProperties.DENSITY
-    sigma = WaterProperties.SURFACE_TENSION
-    gamma = WaterProperties.GAMMA_GAS
-
-    omega0_sq = (3.0 * gamma * p0 + (3.0 * gamma - 1.0) * 2.0 * sigma / R0) / (rho * R0 ** 2)
-    omega0 = np.sqrt(omega0_sq)
-    f0 = omega0 / (2.0 * np.pi)
-    return f0, omega0
+    props = bubble_linear_properties(R0)
+    return props['f0'], props['omega0']
 
 
 def damping_time_constant(R0, omega0, extra_damping_rate=0.0):
     """
     Calcola il tempo di decadimento τ dovuto a smorzamento per
-    irraggiamento acustico, viscoso, e un eventuale smorzamento
+    irraggiamento acustico, viscoso, termico, e un eventuale smorzamento
     aggiuntivo (extra_damping_rate) che rappresenta l'attrito con la
     parete del vaso xilematico — un meccanismo non incluso nel modello
     "bolla libera in acqua infinita", e che varia da vaso a vaso.
@@ -96,23 +167,18 @@ def damping_time_constant(R0, omega0, extra_damping_rate=0.0):
     Returns:
         float: tau [s]
     """
-    rho = WaterProperties.DENSITY
-    mu = WaterProperties.VISCOSITY
-    c = WaterProperties.SPEED_OF_SOUND
-
-    b_rad = omega0 ** 2 * R0 / (2.0 * c)
-    b_vis = 2.0 * mu / (rho * R0 ** 2)
-    return 1.0 / (b_rad + b_vis + extra_damping_rate)
+    b_rad, b_vis, b_th = damping_components(R0, omega0)
+    return 1.0 / (b_rad + b_vis + b_th + extra_damping_rate)
 
 
 def damping_components(R0, omega0):
     """
-    Restituisce separatamente i due contributi di smorzamento fisico
-    (irraggiamento e viscoso), utile per calcolare quanto smorzamento
-    aggiuntivo serve per riprodurre un tau osservato.
+    Restituisce separatamente i tre contributi di smorzamento fisico
+    (irraggiamento, viscoso, termico), utile per calcolare quanto
+    smorzamento aggiuntivo serve per riprodurre un tau osservato.
 
     Returns:
-        (b_rad, b_vis) : tassi di smorzamento [1/s]
+        (b_rad, b_vis, b_th) : tassi di smorzamento [1/s]
     """
     rho = WaterProperties.DENSITY
     mu = WaterProperties.VISCOSITY
@@ -120,14 +186,17 @@ def damping_components(R0, omega0):
 
     b_rad = omega0 ** 2 * R0 / (2.0 * c)
     b_vis = 2.0 * mu / (rho * R0 ** 2)
-    return b_rad, b_vis
+    b_th = _gas_pressure(R0) * prosperetti_phi(R0, omega0).imag / (
+        2.0 * rho * omega0 * R0 ** 2)
+    return b_rad, b_vis, b_th
 
 
 # =============================================================================
 # SINTESI DELL'OSCILLAZIONE R(t), V(t)
 # =============================================================================
 
-def synthesize_bubble_oscillation(R0, n_points=5000, t_max=None, extra_damping_rate=0.0):
+def synthesize_bubble_oscillation(R0, n_points=5000, t_max=None, extra_damping_rate=0.0,
+                                  t=None):
     """
     Sintetizza l'oscillazione smorzata del raggio della bolla attorno a
     R0, con un'accensione graduale (velocità E accelerazione iniziali
@@ -142,6 +211,9 @@ def synthesize_bubble_oscillation(R0, n_points=5000, t_max=None, extra_damping_r
                                minimo che copre sempre la finestra
                                visibile nei grafici dell'app (150 µs).
         extra_damping_rate  : smorzamento aggiuntivo [1/s].
+        t                   : griglia temporale esplicita [s], con t = 0
+                               all'innesco (campioni con t < 0 → R = R0).
+                               Se data, n_points e t_max sono ignorati.
 
     Returns:
         dict con 't', 'R', 'V', 'f0', 'omega0', 'tau'
@@ -149,17 +221,19 @@ def synthesize_bubble_oscillation(R0, n_points=5000, t_max=None, extra_damping_r
     f0, omega0 = minnaert_frequency(R0)
     tau = damping_time_constant(R0, omega0, extra_damping_rate)
 
-    if t_max is None:
-        t_max = min(max(6.0 * tau, 150e-6), 2e-3)
-
-    t = np.linspace(0, t_max, n_points)
+    if t is None:
+        if t_max is None:
+            t_max = min(max(6.0 * tau, 150e-6), 2e-3)
+        t = np.linspace(0, t_max, n_points)
+    t = np.asarray(t, dtype=np.float64)
     deltaR = R0 * BubbleResonance.PERTURBATION_FRACTION
 
     tr = (np.pi / 2.0) / omega0
+    tp = np.clip(t, 0.0, None)
 
-    rise = (1.0 - np.exp(-t / tr)) ** 2
-    decay = np.exp(-t / tau)
-    osc = np.sin(omega0 * t)
+    rise = (1.0 - np.exp(-tp / tr)) ** 2
+    decay = np.exp(-tp / tau)
+    osc = np.sin(omega0 * tp)
 
     R = R0 + deltaR * rise * decay * osc
     V = np.gradient(R, t)

@@ -329,3 +329,61 @@ class DampedSineFitParams:
 
     F0_INIT = 25000.0
     PHI_INIT = 0.0
+
+# =============================================================================
+# GAS NELLA BOLLA — per lo smorzamento termico (aggiunto in Step B)
+# =============================================================================
+
+class GasProperties:
+    """
+    Proprietà termiche dell'aria a 20 °C e 1 atm, necessarie allo smorzamento
+    termico della bolla (teoria lineare di Prosperetti 1977).
+
+    La diffusività termica D = k / (ρ_g · c_p) scala come 1/p: alla pressione
+    interna della bolla p_g0 = p0 + 2σ/R0 va riscalata (vedi rayleigh_plesset).
+
+    Fonte: valori standard dell'aria secca a 20 °C (k = 0.0257 W/m/K,
+    ρ_g = 1.204 kg/m³, c_p = 1005 J/kg/K).
+    """
+
+    THERMAL_CONDUCTIVITY = 0.0257   # k   [W/(m·K)]
+    DENSITY_1ATM = 1.204            # ρ_g [kg/m³] a 1 atm
+    SPECIFIC_HEAT_CP = 1005.0       # c_p [J/(kg·K)]
+
+    @staticmethod
+    def thermal_diffusivity(p_gas):
+        """Diffusività termica dell'aria [m²/s] alla pressione p_gas [Pa]."""
+        d_1atm = GasProperties.THERMAL_CONDUCTIVITY / (
+            GasProperties.DENSITY_1ATM * GasProperties.SPECIFIC_HEAT_CP)
+        return d_1atm * BubbleParameters.P_ATM / p_gas
+
+
+# =============================================================================
+# VASO XILEMATICO COME RISUONATORE — Dutta et al. 2022 (aggiunto in Step B)
+# =============================================================================
+
+class VesselParameters:
+    """
+    Parametri del modello "vaso come canna d'organo" di Dutta et al. (2022),
+    Research 2022:9790438, doi:10.34133/2022/9790438 — valori COME RIPORTATI
+    nel paper, da verificare per le succulente (vedi report §7):
+
+        v_l = ~1482 m/s   velocità del suono nell'acqua a 20 °C
+        ρ_l = 996 kg/m³   densità della linfa (acqua)
+        η_l = 8.9e-4 Pa·s viscosità dinamica
+        h   = ~1 µm       spessore della parete (crio-SEM)
+        E   = 0.2 ± 0.1 GPa  modulo di Young, fusti freschi idratati
+        m   = 1           modo fondamentale
+    """
+
+    SOUND_SPEED_LIQUID = 1482.0     # v_l [m/s]
+    DENSITY_LIQUID = 996.0          # ρ_l [kg/m³]
+    VISCOSITY_LIQUID = 8.9e-4       # η_l [Pa·s]
+    WALL_THICKNESS = 1.0e-6         # h   [m]
+    YOUNG_MODULUS = 0.2e9           # E   [Pa]
+    MODE_ORDER = 1                  # m
+
+    # Valori pubblicati usati come test di validazione (Tabella 1 e testo).
+    # Hydrangea quercifolia: raggio acustico 11.2 ± 0.5 µm, f 51.2 ± 1.0 kHz,
+    # lunghezza acustica dell'elemento di vaso 0.99 ± 0.08 mm.
+    REFERENCE_HYDRANGEA = {'R_um': 11.2, 'f_khz': 51.2, 'L_mm': 0.99, 'L_err_mm': 0.08}
