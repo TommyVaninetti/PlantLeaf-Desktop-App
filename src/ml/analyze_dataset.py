@@ -802,6 +802,18 @@ def aggregate_stats(per_file: list[dict], label: str = 'ALL') -> dict:
 
 # ── Folder roll-up ────────────────────────────────────────────────────────────
 
+def group_sort_key(group: str) -> tuple:
+    """Sort folder groups as a TREE, not as strings.
+
+    A plain string sort breaks the nesting the report draws with indentation:
+    '-' (0x2D) and '+' (0x2B) sort before '/' (0x2F), so 'insects-only' lands
+    between 'insects' and 'insects/indoor', and the indented children of `insects`
+    are printed under `insects-only`. Comparing path components keeps every
+    folder's children directly beneath it.
+    """
+    return tuple(group.split('/'))
+
+
 def folder_groups(per_file: list[dict], input_roots: list[Path]) -> list[str]:
     """Every folder a recording belongs to, from its own folder up to its root.
 
@@ -846,7 +858,7 @@ def folder_groups(per_file: list[dict], input_roots: list[Path]) -> list[str]:
                 if g not in groups:
                     groups.append(g)
             break
-    return sorted(groups)
+    return sorted(groups, key=group_sort_key)
 
 
 def aggregate_by_folder(per_file: list[dict], input_roots: list[Path]) -> list[dict]:
@@ -1044,7 +1056,7 @@ def write_report_md(
         '| Ambig /h | Noise /h |',
         '|---|---|---|---|---|---|---|---|---|',
     ]
-    for r in sorted(per_folder, key=lambda x: x['group']):
+    for r in sorted(per_folder, key=lambda x: group_sort_key(x['group'])):
         indent = '&nbsp;&nbsp;&nbsp;&nbsp;' * r['depth']
         leaf   = r['group'].split('/')[-1]
         lines.append(
@@ -1069,7 +1081,7 @@ def write_report_md(
         '> so merging their timelines would manufacture clustering.',
         '',
     ]
-    for r in sorted(per_folder, key=lambda x: x['group']):
+    for r in sorted(per_folder, key=lambda x: group_sort_key(x['group'])):
         rows = aggregate_window_stats(counts_map, per_file, r['group'],
                                       opts['include_ambiguous'])
         # Nothing to say about a folder where no series has a usable window.
@@ -1589,6 +1601,16 @@ def main() -> None:
     df = load_csvs(csv_paths)
     print(f'  Total rows: {len(df)}\n')
 
+    # Repeated strings as categories. Each of these holds one value per recording
+    # (or a handful corpus-wide), but read_csv makes a separate Python str per ROW;
+    # at 2 M rows that is the largest single block of the frame. 'file' is left
+    # alone on purpose: it is a groupby key throughout, and a categorical groupby
+    # yields empty groups for categories absent from a slice.
+    for col in ('session_id', 'schema_version', 'stage2_mode', 'stage1_params',
+                '_source_csv', 'note'):
+        if col in df.columns:
+            df[col] = df[col].astype('category')
+
     df['_schema']      = df['_source_csv'].map(lambda x: caps.get(x, {}).get('schema', 'v5'))
     df['_can_predict'] = df['_source_csv'].map(
         lambda x: bool(caps.get(x, {}).get('can_predict', False)))
@@ -1604,8 +1626,17 @@ def main() -> None:
     # with a marker would work, but Stage 4's groupby and the Stage 3 feature
     # matrix would both still touch them. Splitting is the version that cannot be
     # got subtly wrong later.
-    scorable = df[df['_can_predict']].copy()
-    skipped  = df[~df['_can_predict']].copy()
+    #
+    # Memory: the split used to copy BOTH halves while `df` itself stayed alive,
+    # three frames at once — at corpus scale (2 M rows, 8.6 GB peak measured) that
+    # is what puts a 16 GB machine into jetsam. Now a fully scorable corpus is not
+    # copied at all, and the original is released before the stages run.
+    if bool(df['_can_predict'].all()):
+        scorable, skipped = df, df.iloc[0:0].copy()
+    else:
+        scorable = df[df['_can_predict']].copy()
+        skipped  = df[~df['_can_predict']].copy()
+    del df
 
     if len(scorable):
         print('Running Stages 2/3/4 on the scorable rows:')
@@ -1700,9 +1731,12 @@ def main() -> None:
         generate_click_plots(per_file, df, args.output_dir, counts_map,
                              args.include_ambiguous)
 
-    df_out = df.drop(columns=['_source_csv', '_schema', '_can_predict'], errors='ignore')
-    df_out.to_csv(rows_csv_path, index=False)
-    print(f'\n  Saved rows CSV     : {rows_csv_path}  ({len(df_out)} rows)')
+    # Column selection at write time rather than df.drop(): drop() materialises a
+    # full second copy of the frame just to serialise it.
+    internal = {'_source_csv', '_schema', '_can_predict'}
+    df.to_csv(rows_csv_path, index=False,
+              columns=[c for c in df.columns if c not in internal])
+    print(f'\n  Saved rows CSV     : {rows_csv_path}  ({len(df)} rows)')
 
     # stage_counts / groups are dicts and lists — flattened out of the flat CSVs.
     pf = pd.DataFrame([{k: v for k, v in r.items()
