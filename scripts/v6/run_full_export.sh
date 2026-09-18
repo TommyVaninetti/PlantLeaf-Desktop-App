@@ -21,7 +21,9 @@
 #
 # More lanes than that does not go faster — it gets processes killed.
 #
-# caffeinate keeps the Mac awake: the exporter's own wake lock fails under nohup.
+# caffeinate -i keeps the Mac awake (the exporter's own wake lock fails under
+# nohup); -m keeps the DISK awake — on 16-09-2026 the external drive dropped out
+# at ~21:01 mid-run, and idle disk sleep is the likeliest cause.
 # The export mode is `unfiltered` on purpose: every other mode drops
 # fit_valid == 0 before Stage 2 — a measured 9.0 % of clicks. See batch_export.py.
 set -euo pipefail
@@ -85,7 +87,7 @@ echo "[$(date +%H:%M)] finished. Still missing (should be 0):"
 EOF
 chmod +x "$DRIVER"
 
-nohup caffeinate -i "$DRIVER" > "$DRIVER_LOG" 2>&1 &
+nohup caffeinate -im "$DRIVER" > "$DRIVER_LOG" 2>&1 &
 
 cat <<EOF
 Launched (pid $!) — caffeinated and detached; you can close the terminal.

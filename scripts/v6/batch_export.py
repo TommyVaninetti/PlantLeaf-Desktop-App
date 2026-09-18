@@ -114,6 +114,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -236,6 +237,10 @@ def main() -> int:
     ap.add_argument("--order", default="name", choices=["name", "largest-first"],
                     help="processing order. largest-first front-loads the long "
                          "recordings, which must run one at a time anyway.")
+    ap.add_argument("--timeout-min-per-gb", type=float, default=20.0,
+                    help="abandon a recording that runs longer than this many "
+                         "minutes per GB (floor 10 min). Measured normal is ~6, the "
+                         "densest outdoor/noise files ~12. Default 20.")
     ap.add_argument("--limit", type=int, default=None,
                     help="stop after N recordings (for a timed trial run)")
     ap.add_argument("--dry-run", action="store_true",
@@ -321,7 +326,18 @@ def main() -> int:
 
     t_start = time.time()
     for i, p in enumerate(todo, 1):
-        gb = p.stat().st_size / 1e9
+        # A USB drive can drop out mid-run (16-09-2026, ~21:01: the file just
+        # exported was gone by the time the manifest row was written, and the
+        # uncaught FileNotFoundError abandoned the other 13 recordings of that
+        # lane). Size is read once, here, and a missing file is skipped, not fatal.
+        try:
+            size = p.stat().st_size
+        except OSError as e:
+            print(f"[{i}/{len(todo)}] {p.stem[:58]:<60} SKIPPED — {e.strerror} "
+                  f"(drive disconnected?)")
+            _append_manifest(manifest, [p.stem, str(p), "", 0, 0, "FAILED: unreadable"])
+            continue
+        gb = size / 1e9
         print(f"[{i}/{len(todo)}] {p.stem[:58]:<60} {gb:5.2f} GB ", end="", flush=True)
         result = {"rows": 0, "err": None}
         w = DataCollectionWorkerV5(
@@ -353,17 +369,31 @@ def main() -> int:
             result["shots"] = shots
         w.file_complete.connect(lambda f, n, path: result.update({"rows": n}))
         t0 = time.time()
+        # Per-file timeout. ?solopianta_fragole1_misurazione7 (0.60 GB, ~4 min of
+        # work) hung the export on 15-09 AND 16-09 for >1.5 h each time, and a hung
+        # file blocks its lane — and therefore the whole driver — indefinitely.
+        # SIGALRM interrupts a blocked read (PEP 475: the handler's exception
+        # propagates out of the retried syscall) as well as Python-level loops.
+        limit_s = max(600.0, a.timeout_min_per_gb * 60.0 * gb)
+
+        def _timeout(_sig, _frm, _limit=limit_s):
+            raise TimeoutError(f"exceeded {_limit/60:.0f} min")
+        signal.signal(signal.SIGALRM, _timeout)
+        signal.alarm(int(limit_s))
         try:
             w.run()
-            status = "ok"
+            out_csv = a.output_dir / CSVS_FOLDER / p.stem / f"{p.stem}_candidates.csv"
+            status = "ok" if out_csv.exists() else "FAILED: no CSV written (load failed)"
         except Exception as e:                                  # noqa: BLE001
             status, result["err"] = "FAILED", f"{type(e).__name__}: {e}"
+        finally:
+            signal.alarm(0)
         el = time.time() - t0
         n_shots = result.get("shots", {}).get("n", 0)
         print(f" {result['rows']:>7} rows  {el/60:5.1f} min  {status}"
               + (f"  {n_shots} png" if a.screenshots != "none" else "")
               + (f"  {result['err']}" if result["err"] else ""))
-        _append_manifest(manifest, [p.stem, str(p), p.stat().st_size,
+        _append_manifest(manifest, [p.stem, str(p), size,
                                     result["rows"], round(el, 1), status])
 
         elapsed = time.time() - t_start

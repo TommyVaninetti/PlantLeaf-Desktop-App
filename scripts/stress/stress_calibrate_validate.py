@@ -471,6 +471,23 @@ def main() -> int:
     return 0
 
 
+def continuous_score(t: np.ndarray, W: float, T: float) -> tuple[np.ndarray, np.ndarray]:
+    """Hard-mode Score(t) as a step function over [0, T], for plots only.
+
+    The detector evaluates Score only on arrival (§4.1), which is exact for onsets
+    but, drawn as a step plot, holds the value flat until the next event. Here each
+    event also steps DOWN at t_i + W — at that instant it is already outside the
+    half-open window (t - W, t], so departures sort before arrivals at equal times.
+    """
+    ts = np.concatenate([t, t + W])
+    dy = np.concatenate([np.ones(t.size), -np.ones(t.size)])
+    o = np.lexsort((dy, ts))                   # -1 before +1 at equal times
+    x = np.concatenate([[0.0], ts[o], [max(T, ts.max() if ts.size else T)]])
+    y = np.concatenate([[0.0], np.cumsum(dy[o]), [0.0]])
+    y[-1] = y[-2]
+    return x, y
+
+
 def plots(out, res, headline, others, op, h_op, phi, sweeps):
     import matplotlib
     matplotlib.use('Agg')
@@ -487,9 +504,10 @@ def plots(out, res, headline, others, op, h_op, phi, sweeps):
     ax.axhline(phi, color=GROUP_COLOR[STIMULUS], linewidth=1)
     ax.annotate(f'phi = {phi:g}/h', (c['h'].iloc[-1], phi), xytext=(0, 3), textcoords='offset points',
                 ha='right', fontsize=7, color=INK_2)
-    ax.axvline(h_op, color=GRID, linewidth=1)
+    ax.axvline(h_op, color=INK_2, linewidth=0.8, linestyle=':')
     ax.set_yscale('log')
-    ax.set_xscale('symlog', linthresh=10)
+    ax.set_xscale('log')            # h >= one grid step, never 0
+    ax.set_xlim(c['h'].iloc[0] * 0.9, c['h'].iloc[-1] * 1.1)
     ax.set_xlabel('h_high')
     ax.set_ylabel('false alarms per hour')
     ax.set_title(f'Calibration on {len(res["base"])} baseline sessions ({res["T_base_h"]:.1f} h), '
@@ -523,7 +541,9 @@ def plots(out, res, headline, others, op, h_op, phi, sweeps):
                    color=GROUP_COLOR[g['group'].iloc[0]], edgecolors='white', linewidths=0.8, zorder=3)
     ax.set_yticks(range(len(cats)))
     ax.set_yticklabels(cats, fontsize=7, color=INK_2)
-    ax.set_xscale('symlog', linthresh=10)
+    # symlog with linthresh=1 keeps the many 0-count sessions visible at x = 0
+    ax.set_xscale('symlog', linthresh=1, linscale=0.5)
+    ax.set_xlim(-0.4, df['m'].max() * 1.5)
     ax.set_xlabel(f'max events in any {op.W:g} s window (per session)')
     ax.set_title(f'Per-session max Score; line = h_high at phi = {phi:g}/h, band = LOSO fold range',
                  fontsize=8, loc='left')
@@ -563,18 +583,15 @@ def plots(out, res, headline, others, op, h_op, phi, sweeps):
             ax.axis('off')
         for ax, s in zip(axs.flat, sessions):
             style_axes(ax)
-            tr = score_trace(s.t, op.W)
-            if tr:
-                x = np.array([v[0] for v in tr]) / 60
-                y = np.array([v[1] for v in tr])
-                ax.step(x, y, where='post', color=GROUP_COLOR[s.group], linewidth=1.2)
+            x, y = continuous_score(s.t, op.W, s.T)
+            ax.step(x / 60, y, where='post', color=GROUP_COLOR[s.group], linewidth=1.2)
             r = replay_session(s.t, op.params(h_op), t_end=s.T)
             for e in r.onsets:
                 ax.axvline(e.t / 60, color=INK, linewidth=0.8)
             ax.axhline(h_op, color=INK_2, linewidth=0.8, linestyle='--')
             ax.axhline(op.rho * h_op, color=GRID, linewidth=0.8, linestyle=':')
             ax.set_xlim(0, s.T / 60)
-            ax.set_ylim(0, max(h_op * 1.3, (max((v[1] for v in tr), default=0)) * 1.1))
+            ax.set_ylim(0, max(h_op * 1.3, y.max() * 1.1))
             ax.set_title(f'{s.file[:42]}  ({s.condition}, {r.n_onsets} onset)', fontsize=6, loc='left')
             ax.tick_params(labelsize=6)
         fig.suptitle(title, fontsize=9, x=0.01, ha='left', color=INK)
