@@ -56,6 +56,9 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt                     # noqa: E402
 from matplotlib.lines import Line2D                 # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from timing_curves import cumulative_curves                     # noqa: E402
+
 SURFACE = '#1a1a19'
 INK = '#ffffff'
 INK_2 = '#c3c2b7'
@@ -147,7 +150,10 @@ def fig_rates(sr: pd.DataFrame, out: Path):
             t.set_fontweight('bold')
             t.set_fontsize(10.5)
     ax.set_xscale('log')
-    ax.set_xlim(FLOOR * 0.8, 1400)
+    # Upper limit from the data, never a constant: a fixed 1400 silently clipped a
+    # recording at 1605 /h off the plot entirely (20-09-2026).
+    hi = sr.loc[sr.series.isin(('algo', 'human_click')), 'rate_first15'].max()
+    ax.set_xlim(FLOOR * 0.8, max(hi * 1.6, 100))
     ax.set_xticks([1, 10, 100, 1000])
     ax.set_xticklabels(['1', '10', '100', '1000'])
     ax.xaxis.grid(True, color=GRID, linewidth=0.9)
@@ -166,33 +172,25 @@ def fig_rates(sr: pd.DataFrame, out: Path):
     print(f'  {out.name}')
 
 
-def fig_timing(tc: pd.DataFrame, out: Path, minutes: int = 10, min_events: int = 3):
-    cats = [('after a stimulus', [('mechanical', 'stimulus'), ('water', 'stimulus')], S1),
-            ('unstressed plants', [('plant-only', 'baseline')], S3)]
-    grid = np.arange(0, minutes * 60 + 1, 30) / 60.0
-    fig, ax = plt.subplots(figsize=(11, 4.6))
-    for label, keys, c in cats:
-        curves = []
-        for cond, grp in keys:
-            d = tc[(tc.series == 'algo') & (tc.group == grp) & (tc.condition == cond)
-                   & (tc.bin_start_s < minutes * 60)]
-            for f, g in d.groupby('file'):
-                tot = g['count'].sum()
-                if tot < min_events:
-                    continue
-                g = g.sort_values('bin_start_s')
-                cum = np.cumsum(g['count'].to_numpy()) / tot
-                curves.append(np.interp(grid, g['bin_start_s'].to_numpy() / 60 + 0.5, cum,
-                                        left=0.0, right=1.0))
-        if not curves:
+def fig_timing(tc: pd.DataFrame, sr: pd.DataFrame, out: Path, minutes: float = 30.0):
+    """Cumulative arrival, as a share of ALL the clicks in each recording.
+
+    See timing_curves.py for why the denominator is the whole recording and not
+    the plotted window: normalising inside the window made unstressed plants look
+    as concentrated as stressed ones, which is the opposite of what they are.
+    """
+    cats = [('mechanical stress', 'stimulus', 'mechanical', S1),
+            ('watering', 'stimulus', 'water', S2),
+            ('unstressed plants', 'baseline', 'plant-only', S3)]
+    fig, ax = plt.subplots(figsize=(11, 4.8))
+    for label, grp, cond, c in cats:
+        grid, med, q1, q3, n = cumulative_curves(tc, sr, grp, cond, minutes=minutes)
+        if med is None:
             continue
-        M = np.vstack(curves) * 100
-        ax.fill_between(grid, np.percentile(M, 25, axis=0), np.percentile(M, 75, axis=0),
-                        color=c, alpha=0.18, linewidth=0, zorder=2)
-        med = np.median(M, axis=0)
-        ax.plot(grid, med, color=c, linewidth=2.6, zorder=3, label=f'{label}  ({len(curves)} rec.)')
-        j = int(np.argmax(med >= 55)) if (med >= 55).any() else len(med) - 1
-        ax.annotate(label, (grid[j], med[j]), xytext=(10, -8), textcoords='offset points',
+        ax.fill_between(grid, q1, q3, color=c, alpha=0.11, linewidth=0, zorder=2)
+        ax.plot(grid, med, color=c, linewidth=2.6, zorder=3, label=f'{label}  ({n} rec.)')
+        j = int(np.argmax(grid >= (3.0 if label != 'unstressed plants' else 20.0)))
+        ax.annotate(label, (grid[j], med[j]), xytext=(10, -6), textcoords='offset points',
                     fontsize=12, color=c, zorder=5, fontweight='bold')
     ax.axvline(2, color=INK_2, linewidth=1.2, linestyle=(0, (4, 3)), zorder=1)
     ax.annotate('2 minutes', (2, 4), xytext=(6, 0), textcoords='offset points',
@@ -202,7 +200,7 @@ def fig_timing(tc: pd.DataFrame, out: Path, minutes: int = 10, min_events: int =
     ax.yaxis.grid(True, color=GRID, linewidth=0.9)
     ax.set_axisbelow(True)
     style(ax, xlabel='minutes from the start of the recording',
-          ylabel="% of the recording's clicks")
+          ylabel="% of ALL the recording's clicks")
     ax.legend(loc='lower right', frameon=False, fontsize=11)
     fig.tight_layout()
     fig.savefig(out, dpi=DPI)
@@ -256,7 +254,7 @@ def main() -> int:
     a.out.mkdir(parents=True, exist_ok=True)
     print(f'writing web figures to {a.out}')
     fig_rates(sr, a.out / 'clicks_rates_v6.png')
-    fig_timing(tc, a.out / 'clicks_timing_v6.png')
+    fig_timing(tc, sr, a.out / 'clicks_timing_v6.png')
     fig_detection(sc, a.out / 'clicks_detection_v6.png')
     return 0
 
