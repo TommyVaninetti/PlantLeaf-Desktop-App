@@ -2261,7 +2261,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
 
         ####
 
-        # TERZA TABELLA: i click confermati dall'algoritmo v5 (stage 1 → 2 → 3 → 4).
+        # TERZA TABELLA: i click confermati dalla pipeline (stage 1 → 2 → 3 → 4).
         # Le altre due tabelle mostrano ciò che il firmware ha registrato e ciò che
         # supera una soglia: questa mostra il verdetto del modello.
         # The SAME widget the live window uses. Replay and live are meant to
@@ -2287,7 +2287,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
         # Holds the last full detection run (every Stage 1 candidate, annotated), so
         # switching between 'confirmed only' and 'all candidates' is a re-filter of
         # results already computed rather than a second pass over the recording.
-        self._v5_detections = []
+        self._detections = []
         #: Le righe lette dal footer EVTR: quello che l'operatore ha visto ED
         #: ETICHETTATO quando ha registrato. Vuoto per i file salvati prima.
         self._saved_rows = []
@@ -2295,12 +2295,12 @@ class ReplayWindowAudio(ReplayBaseWindow):
         self._detect_funnel_text = ''
         self._detection_drift = ''
 
-        # ── Control row for the v5 detector ──
+        # ── Control row for the click detector ──
         detect_layout = QHBoxLayout()
 
-        self.btn_detect_clicks = QPushButton("Detect Clicks (v5)")
+        self.btn_detect_clicks = QPushButton("Detect Clicks (v6)")
         self.btn_detect_clicks.setToolTip(
-            "Run the full v5 pipeline (stages 1-4) on this recording.\n"
+            "Run the full v6 pipeline (stages 1-4) on this recording.\n"
             "Uses the k value set below."
         )
         self.btn_detect_clicks.clicked.connect(self._on_detect_clicks)
@@ -2674,7 +2674,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
                 max(0.0, time_sec - 10.0), time_sec + 10.0)
 
     def _on_detect_clicks(self):
-        """Run the v5 pipeline over the loaded recording in a background thread."""
+        """Run the v6 pipeline over the loaded recording in a background thread."""
         if not hasattr(self, 'data_manager') or self.data_manager is None:
             QMessageBox.warning(self, "No data", "Load a recording first.")
             return
@@ -2686,9 +2686,9 @@ class ReplayWindowAudio(ReplayBaseWindow):
         self.label_detect_status.setText("Detecting…")
 
         self._detect_progress = QProgressDialog(
-            "Running v5 click detection...", "Cancel", 0, 100, self
+            "Running v6 click detection...", "Cancel", 0, 100, self
         )
-        self._detect_progress.setWindowTitle("Detect Clicks (v5)")
+        self._detect_progress.setWindowTitle("Detect Clicks (v6)")
         self._detect_progress.setWindowModality(Qt.WindowModal)
         self._detect_progress.setMinimumDuration(0)
         self._detect_progress.setValue(0)
@@ -2738,12 +2738,12 @@ class ReplayWindowAudio(ReplayBaseWindow):
             self._detect_progress.close()
             self._detect_progress = None
 
-        self._v5_detections = detections or []
+        self._detections = detections or []
         self.btn_detect_clicks.setEnabled(True)
-        self.btn_export_detections.setEnabled(bool(self._v5_detections))
+        self.btn_export_detections.setEnabled(bool(self._detections))
 
         from core.click_pipeline_v5 import STAGE_BLOCKED_STAGE2, stage_summary
-        counts = stage_summary(self._v5_detections)
+        counts = stage_summary(self._detections)
 
         # Sum every Stage-2 verdict rather than the two v5 ones: under the v6
         # gates R2 and SPR are ~always zero, so adding just those reported
@@ -2764,7 +2764,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
         # and the table snapshots each dict as it is added.
         self._compare_with_saved_rows()
         self.detection_table.set_events(
-            sorted(self._v5_detections, key=lambda d: d.get('frame_idx', 0)))
+            sorted(self._detections, key=lambda d: d.get('frame_idx', 0)))
         self._refresh_detection_table()
         self.click_tab_widget.setCurrentWidget(self.detection_table)
 
@@ -2848,7 +2848,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
         if not saved:
             return
 
-        fresh = {int(r['frame_idx']): r for r in self._v5_detections
+        fresh = {int(r['frame_idx']): r for r in self._detections
                  if r.get('frame_idx') is not None}
         common = set(saved) & set(fresh)
         if not common:
@@ -2918,7 +2918,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
 
     def _on_export_detections(self):
         """Write the detections as a CSV in the same schema as the Data Collection export."""
-        if not self._v5_detections:
+        if not self._detections:
             return
 
         default_name = f"{Path(self.file_path).stem}_detections.csv" \

@@ -1,5 +1,5 @@
 """
-Background worker that runs the full v5 click detection pipeline on a recording.
+Background worker that runs the full v6 click detection pipeline on a recording.
 
 Stage 1 → per-candidate features → Stages 2/3/4 (annotated), off the GUI thread.
 
@@ -55,7 +55,7 @@ class PaudioDataManagerAdapter:
 
 class ClickDetectionWorker(QObject):
     """
-    Run the v5 pipeline over one recording.
+    Run the v6 pipeline over one recording.
 
     Signals
     -------
