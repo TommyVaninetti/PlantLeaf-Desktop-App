@@ -37,6 +37,7 @@ from components.start_stop_button import StartStopButton
 from components.events_table import (EventsTable, FILTER_MODES, FILTER_LABELS,
                                      FILTER_SURVIVORS)
 from core.live_event_worker import LiveEventWorker
+from core.stress_detector import StressDetector, StressDetectorParams, ONSET, CLEARED
 from plotting.plot_manager import BasePlotWidget
 from components.sampling_settings import AudioSamplingSettingsPopup
 from serial_communication.audio_reader import AudioSerialWorker
@@ -72,6 +73,12 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         # Inizializza timer con tempo assoluto
         self.total_elapsed_time = 0
         self.chrono_start_time = 0
+
+        # Stage 5: stress-event detector (sliding window over accepted clicks).
+        # Calibrated params — see docs/autoclick/v6/STRESS_DETECTION_RESULTS_v1.md.
+        self.stress_detector = StressDetector(StressDetectorParams(
+            W=180.0, h_high=7, R=300.0, rho=0.5, mode='hard'))
+        self._stress_active = False
 
 
         # Sostituzione pulsanti custom START/STOP
@@ -643,6 +650,43 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
             row['note'] = note
         self.FFTClicksDetectedTableWidget.add_event(row)
         self._refresh_events_label()
+        if row.get('stage_blocked', '') == '':
+            self._feed_stress_detector(row['timestamp_s'])
+
+    # ── Stage 5: stress detector ────────────────────────────────────────────
+
+    def _feed_stress_detector(self, t: float) -> None:
+        try:
+            events = self.stress_detector.on_event(t)
+        except ValueError as e:
+            print(f"⚠️ Stress detector: ignored out-of-order timestamp ({e})")
+            return
+        if events:
+            self._on_stress_events(events)
+
+    def _tick_stress_detector(self) -> None:
+        try:
+            events = self.stress_detector.tick(self.get_acquisition_time())
+        except ValueError as e:
+            print(f"⚠️ Stress detector tick skipped ({e})")
+            return
+        if events:
+            self._on_stress_events(events)
+
+    def _on_stress_events(self, events):
+        for ev in events:
+            self._set_stress_label(active=(ev.kind == ONSET))
+
+    def _set_stress_label(self, active: bool) -> None:
+        """
+        No new widget: the info strip (FFTInfoGroupBox) is already packed edge
+        to edge, so a fixed-width label added there doesn't fit every window
+        size/screen. The events header above the table is full-width and
+        already resizes its own text, so the stress highlight rides on it
+        instead — see _refresh_events_label.
+        """
+        self._stress_active = active
+        self._refresh_events_label()
 
     @staticmethod
     def _loss_note(row):
@@ -668,15 +712,18 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
     def _refresh_events_label(self):
         """
         The table's own heading carries the counts, so no widget had to be added
-        to a generated .ui file to say what the run is doing.
+        to a generated .ui file to say what the run is doing. The stress
+        highlight (see _set_stress_label) rides on this same label for the
+        same reason: it is already full-width and text-driven, unlike the
+        fixed-width info strip below the table.
         """
         table = getattr(self, 'FFTClicksDetectedTableWidget', None)
         if table is None:
             return
         if not self.event_mode:
             table_rows = table.rowCount()
-            self.FFTClicksDetectedLabel.setText(
-                f"Events — {table_rows} (full mode, threshold crossings)")
+            text = f"Events — {table_rows} (full mode, threshold crossings)"
+            self._apply_events_label(text)
             return
 
         st = self._event_status
@@ -704,7 +751,16 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
             if drop:
                 parts.append(f"board dropped {drop} frames "
                              f"(timestamps run early)")
-        self.FFTClicksDetectedLabel.setText("  ·  ".join(parts))
+        self._apply_events_label("  ·  ".join(parts))
+
+    def _apply_events_label(self, text: str) -> None:
+        if getattr(self, '_stress_active', False):
+            text = "⚠ STRESS ACTIVE  ·  " + text
+            self.FFTClicksDetectedLabel.setStyleSheet(
+                "background-color:#d32f2f; color:white; border-radius:4px; padding:2px;")
+        else:
+            self.FFTClicksDetectedLabel.setStyleSheet("")
+        self.FFTClicksDetectedLabel.setText(text)
 
     @staticmethod
     def _parse_stats_field(line, field):
@@ -805,6 +861,7 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
                 'peak_amplitude_v': self.click_peak_amplitude,
                 'duration_us': int(self.click_fft_count * self.fft_interval_us),
             })
+            self._feed_stress_detector(self.relative_timestamp)
 
             # Reset contatore per prossimo click
             self.click_active = False
@@ -1592,6 +1649,7 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
         self.chrono_timer = QTimer(self)
         self.chrono_timer.timeout.connect(self.update_chrono_label)
         self.chrono_timer.timeout.connect(self.update_plot)  # Plot refresh a 60Hz
+        self.chrono_timer.timeout.connect(self._tick_stress_detector)
         self.FFTTimePassedLabelTime.setText("0:00:00")
 
         # La soglia non e' piu' regolabile dalla UI: con il nuovo firmware lo

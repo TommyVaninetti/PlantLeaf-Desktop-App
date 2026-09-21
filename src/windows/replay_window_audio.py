@@ -37,9 +37,10 @@ from PySide6.QtCore import Qt, QTimer, QCoreApplication, QThread
 from PySide6.QtGui import QAction, QFont, QColor
 from PySide6 import QtCore
 
-from core.replay_base_window import ReplayBaseWindow
+from core.replay_base_window import ReplayBaseWindow, ClickableLinearRegionItem
 from plotting.plot_manager import BasePlotWidget, TimeAxisItem
 from core.audio_trim_export import AudioTrimExporter
+from core.stress_detector import StressDetectorParams, replay_session
 from core.click_pipeline_v5 import (
     reconstruct_frame_v5,
     compute_hilbert_envelope,
@@ -2015,7 +2016,8 @@ class ReplayWindowAudio(ReplayBaseWindow):
         # file si vede subito quello che l'operatore ha visto ed etichettato,
         # senza dover rilanciare il rilevatore.
         self._load_saved_rows()
-        
+        self._update_stress_regions()
+
         # Mostra lo STREAMING BUFFER iniziale
         stream_x, stream_y = self.data_manager.get_streaming_data()
         if len(stream_x) > 0:
@@ -2139,7 +2141,13 @@ class ReplayWindowAudio(ReplayBaseWindow):
         self.time_info_label = QLabel("Time Domain Signal (Multi-Level)")
         self.time_info_label.setAlignment(Qt.AlignCenter)
         time_layout.addWidget(self.time_info_label)
-        
+
+        # Stage 5 stress detector summary — filled in by _update_stress_regions
+        # once the full-recording accepted-click list is available.
+        self.stress_summary_label = QLabel("Stress: —")
+        self.stress_summary_label.setAlignment(Qt.AlignCenter)
+        time_layout.addWidget(self.stress_summary_label)
+
         self.plot_widget_time = BasePlotWidget(
             x_label="Time (h:mm:ss)", y_label="Mean FFT Energy",
             x_range=(0, 20), y_range=(0.00000005, 0.0000002),
@@ -2766,6 +2774,7 @@ class ReplayWindowAudio(ReplayBaseWindow):
         self.detection_table.set_events(
             sorted(self._detections, key=lambda d: d.get('frame_idx', 0)))
         self._refresh_detection_table()
+        self._update_stress_regions()
         self.click_tab_widget.setCurrentWidget(self.detection_table)
 
     def _on_detect_error(self, msg: str):
@@ -2829,6 +2838,57 @@ class ReplayWindowAudio(ReplayBaseWindow):
             sorted(rows, key=lambda d: d.get('frame_idx', 0) or 0))
         self.btn_export_detections.setEnabled(True)
         self._refresh_detection_table()
+
+    # ── Stage 5: stress detector (offline replay over the whole recording) ──
+
+    def _update_stress_regions(self) -> None:
+        """
+        Shade every stress episode on the full-timeline plot.
+
+        Recomputed from scratch each time `detection_table` changes (a fresh
+        Detect Clicks run, or the rows loaded straight from the file) — same
+        "recompute over the whole recording, redraw as an overlay" pattern as
+        `_update_threshold_line`, just for a detector instead of a threshold.
+        """
+        for region in getattr(self, '_stress_regions', []):
+            self.plot_widget_time.plot_widget.removeItem(region)
+        self._stress_regions = []
+
+        # Bound panning to the real recording length instead of leaving it
+        # unbounded (xMax was never actually set after load until now).
+        self.plot_widget_time.set_axis_limits(
+            x_min=0, x_max=self.data_manager.total_duration_sec)
+
+        rows = self.detection_table.export_rows(include_extras=True)
+        times = sorted(r['timestamp_s'] for r in rows
+                       if r.get('stage_blocked', '') == '' and r.get('timestamp_s') is not None)
+        if not times:
+            self._set_stress_summary_label(None)
+            return
+
+        params = StressDetectorParams(W=180.0, h_high=7, R=300.0, rho=0.5, mode='hard')
+        # tick_s matters here: without it, replay_session never re-checks the
+        # clear condition after the last accepted click, so an episode that
+        # should have cleared long before t_end would be drawn all the way to
+        # the end of the recording instead.
+        result = replay_session(times, params,
+                                t_end=self.data_manager.total_duration_sec, tick_s=1.0)
+
+        for onset_t, clear_t in result.alarm_intervals:
+            region = ClickableLinearRegionItem(
+                [onset_t, clear_t], movable=False, brush=(211, 47, 47, 60))
+            region.setZValue(-10)
+            self.plot_widget_time.plot_widget.addItem(region)
+            self._stress_regions.append(region)
+
+        self._set_stress_summary_label(result)
+
+    def _set_stress_summary_label(self, result) -> None:
+        if not result or result.n_onsets == 0:
+            self.stress_summary_label.setText("Stress: none detected")
+        else:
+            self.stress_summary_label.setText(
+                f"Stress: {result.n_onsets} episode(s), {result.alarm_seconds:.0f}s total")
 
     def _compare_with_saved_rows(self):
         """

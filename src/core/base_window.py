@@ -467,6 +467,13 @@ class BaseWindow(FileHandlerMixin, QMainWindow):
             self._acquisition_count = 0
         self.total_elapsed_time = 0
 
+        # Stage 5 stress detector: a "Clear" is the one point a live window
+        # instance truly restarts a session, so old window/hysteresis state
+        # must not leak into the next one.
+        if hasattr(self, 'stress_detector'):
+            self.stress_detector.reset()
+            self._set_stress_label(active=False)
+
         # Pulisci il grafico
         if hasattr(self, 'plot_widget'):
             self.plot_widget.plot.clear()
