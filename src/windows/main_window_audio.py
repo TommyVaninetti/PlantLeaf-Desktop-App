@@ -139,7 +139,7 @@ class MainWindowAudio(BaseWindow, Ui_MainWindowAudio):
             y_label="Amplitude",
             x_range=(-1.28, 1.28),
             y_range=(-0.05, 0.05),
-            x_max=-8,x_min=8,
+            x_min=-8, x_max=8,
             y_min=-0.4,y_max=0.4,
             unit_x="ms", unit_y="V",
             parent=self
