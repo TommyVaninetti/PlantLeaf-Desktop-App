@@ -4,6 +4,8 @@
 [![Version](https://img.shields.io/badge/version-1.0.0-green.svg)]()
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)]()
 [![Award](https://img.shields.io/badge/🏆%20I%20Giovani%20e%20le%20Scienze-1st%20Place%202026-gold.svg)]()
+[![Award](https://img.shields.io/badge/🏆%20EUCYS%202026-1st%20Prize-gold.svg)]()
+[![Award](https://img.shields.io/badge/🎖%20ISEF%202027-Funded%20Participation-blue.svg)]()
 
 > *Plants respond to stress with both electrical and acoustic signals. PlantLeaf gives you the tools to detect, visualise, and analyse them — with low-cost hardware and rigorous, open-source software.*
 
@@ -244,7 +246,7 @@ If you use PlantLeaf in your research or build upon it, please cite it as:
   year         = {2026},
   license      = {AGPL-3.0},
   url          = {https://github.com/TommyVaninetti/PlantLeaf-Desktop-App},
-  note         = {overall 1st place, I Giovani e le Scienze 2026 (Italy). Competing at EUCYS 2026.}
+  note         = {Overall 1st place, I Giovani e le Scienze 2026 (Italy); First Prize, EUCYS 2026; awarded funded participation to ISEF 2027 as a special prize.}
 }
 ```
 
