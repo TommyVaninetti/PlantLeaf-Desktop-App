@@ -39,7 +39,7 @@ class AppConfig:
     # Informazioni applicazione
     APPLICATION_NAME = "PlantLeaf"
     ORGANIZATION = "Tommy Vaninetti"
-    VERSION = "1.0.0"
+    VERSION = "1.1.0"
     WEBSITE_URL = "https://www.plantleaf.it"
     DOCUMENTATION_URL = "https://github.com/TommyVaninetti/PlantLeaf---documentation"
 
@@ -93,7 +93,7 @@ class AppConfig:
     LOGO_DIR = resource_path("assets/logo.png")
     LOGO_WHITEBG_DIR = resource_path("assets/logo_whitebg.png")
     ICON_DIR = resource_path("assets/icons")
-    README_PATH = resource_path("README.txt")
+    README_PATH = resource_path("README.md")
     LICENSES_PATH = resource_path("licenses.txt")
 
     

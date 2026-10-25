@@ -1,7 +1,7 @@
 # PlantLeaf – *Let plants speak*
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)]()
+[![Version](https://img.shields.io/badge/version-1.1.0-green.svg)]()
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)]()
 [![Award](https://img.shields.io/badge/🏆%20I%20Giovani%20e%20le%20Scienze-1st%20Place%202026-gold.svg)]()
 [![Award](https://img.shields.io/badge/🏆%20EUCYS%202026-1st%20Prize-gold.svg)]()
